@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -35,6 +36,7 @@ from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipel
 from .mediashrink_adapter import prepare_compression, run_compression
 from .pipeline import build_pipeline_summary, target_compression_root
 from .plexify_adapter import build_preview, build_video_controller, scan_controller
+from .settings import load_ui_state, save_ui_state
 from .workers import FunctionWorker
 
 
@@ -50,6 +52,9 @@ class MainWindow(QMainWindow):
         self.encode_preparation: EncodePreparation | None = None
         self.encode_results: list = []
         self._active_worker_count = 0
+        self._loading_state = True
+        self._pipeline_requested = False
+        self._pipeline_should_compress_after_apply = False
 
         self.source_input = QLineEdit(str(default_source) if default_source else "")
         self.library_input = QLineEdit(str(default_library) if default_library else "")
@@ -89,10 +94,15 @@ class MainWindow(QMainWindow):
         self.duplicate_policy.addItems(["prefer-mkv", "all", "skip-title"])
 
         self.scan_button = QPushButton("Scan Organise Stage")
+        self.run_pipeline_button = QPushButton("Run Full Pipeline")
         self.preview_button = QPushButton("Preview Organisation")
         self.apply_button = QPushButton("Apply Organisation")
         self.compress_button = QPushButton("Run Compression")
         self.cancel_button = QPushButton("Cancel")
+        self.prev_item_button = QPushButton("Prev Item")
+        self.next_item_button = QPushButton("Next Item")
+        self.next_page_button = QPushButton("More Candidates")
+        self.auto_accept_button = QPushButton("Auto-Accept Safe Matches")
 
         self.review_table = QTableWidget(0, 7)
         self.review_table.setHorizontalHeaderLabels(
@@ -110,6 +120,8 @@ class MainWindow(QMainWindow):
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search query or manual title")
+        self.details_log = QPlainTextEdit()
+        self.details_log.setReadOnly(True)
         self.accept_button = QPushButton("Accept Candidate")
         self.skip_button = QPushButton("Skip Item")
         self.search_button = QPushButton("Search")
@@ -135,6 +147,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self._restore_ui_state(default_source=default_source, default_library=default_library)
+        self._loading_state = False
         self._update_stage_controls()
         self._update_action_state()
 
@@ -205,6 +219,7 @@ class MainWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.scan_button)
+        button_row.addWidget(self.run_pipeline_button)
         button_row.addWidget(self.preview_button)
         button_row.addWidget(self.apply_button)
         button_row.addWidget(self.compress_button)
@@ -220,6 +235,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.review_table, stretch=2)
         layout.addWidget(QLabel("Candidates"))
         layout.addWidget(self.candidate_table, stretch=1)
+        layout.addWidget(QLabel("Selected Item Details"))
+        layout.addWidget(self.details_log, stretch=1)
 
         action_row = QHBoxLayout()
         action_row.addWidget(self.search_input)
@@ -229,8 +246,12 @@ class MainWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         for button in [
+            self.prev_item_button,
+            self.next_item_button,
             self.accept_button,
             self.skip_button,
+            self.next_page_button,
+            self.auto_accept_button,
             self.switch_button,
             self.folder_button,
             self.title_group_button,
@@ -266,18 +287,153 @@ class MainWindow(QMainWindow):
         self.organise_enabled.toggled.connect(self._update_stage_controls)
         self.compress_enabled.toggled.connect(self._update_stage_controls)
         self.scan_button.clicked.connect(self._start_scan)
+        self.run_pipeline_button.clicked.connect(self._start_pipeline)
         self.preview_button.clicked.connect(self._preview_plan)
         self.apply_button.clicked.connect(self._apply_plan)
         self.compress_button.clicked.connect(self._start_compression)
         self.cancel_button.clicked.connect(self._cancel_requested)
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
+        self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
         self.accept_button.clicked.connect(self._accept_selected_candidate)
         self.skip_button.clicked.connect(self._skip_selected_item)
+        self.prev_item_button.clicked.connect(lambda: self._move_review_selection(-1))
+        self.next_item_button.clicked.connect(lambda: self._move_review_selection(1))
+        self.next_page_button.clicked.connect(self._load_next_candidate_page)
+        self.auto_accept_button.clicked.connect(self._auto_accept_safe_matches)
         self.search_button.clicked.connect(self._search_current_item)
         self.switch_button.clicked.connect(self._switch_current_item)
         self.manual_button.clicked.connect(self._manual_select_current_item)
         self.folder_button.clicked.connect(self._apply_choice_to_folder)
         self.title_group_button.clicked.connect(self._apply_choice_to_title_group)
+        self._connect_state_change_signals()
+
+    def _connect_state_change_signals(self) -> None:
+        for widget in [
+            self.source_input,
+            self.library_input,
+            self.extensions_input,
+        ]:
+            widget.textChanged.connect(self._on_config_edited)
+        for widget in [
+            self.organise_enabled,
+            self.compress_enabled,
+            self.apply_mode,
+            self.copy_mode,
+            self.use_cache,
+            self.offline,
+            self.overwrite,
+            self.recursive,
+            self.no_skip,
+            self.use_calibration,
+        ]:
+            widget.toggled.connect(self._on_config_edited)
+        self.min_confidence.valueChanged.connect(self._on_config_edited)
+        for widget in [self.conflict_mode, self.policy, self.on_file_failure, self.duplicate_policy]:
+            widget.currentTextChanged.connect(self._on_config_edited)
+
+    def _restore_ui_state(
+        self,
+        *,
+        default_source: Path | None,
+        default_library: Path | None,
+    ) -> None:
+        saved = load_ui_state()
+        if default_source is None and isinstance(saved.get("source"), str):
+            self.source_input.setText(saved["source"])
+        if default_library is None and isinstance(saved.get("library"), str):
+            self.library_input.setText(saved["library"])
+        if isinstance(saved.get("organise_enabled"), bool):
+            self.organise_enabled.setChecked(saved["organise_enabled"])
+        if isinstance(saved.get("compress_enabled"), bool):
+            self.compress_enabled.setChecked(saved["compress_enabled"])
+        if isinstance(saved.get("apply_mode"), bool):
+            self.apply_mode.setChecked(saved["apply_mode"])
+        if isinstance(saved.get("copy_mode"), bool):
+            self.copy_mode.setChecked(saved["copy_mode"])
+        if isinstance(saved.get("use_cache"), bool):
+            self.use_cache.setChecked(saved["use_cache"])
+        if isinstance(saved.get("offline"), bool):
+            self.offline.setChecked(saved["offline"])
+        if isinstance(saved.get("min_confidence"), (float, int)):
+            self.min_confidence.setValue(float(saved["min_confidence"]))
+        if isinstance(saved.get("extensions"), str):
+            self.extensions_input.setText(saved["extensions"])
+        if isinstance(saved.get("conflict_mode"), str):
+            self._set_combo_value(self.conflict_mode, saved["conflict_mode"])
+        if isinstance(saved.get("overwrite"), bool):
+            self.overwrite.setChecked(saved["overwrite"])
+        if isinstance(saved.get("recursive"), bool):
+            self.recursive.setChecked(saved["recursive"])
+        if isinstance(saved.get("no_skip"), bool):
+            self.no_skip.setChecked(saved["no_skip"])
+        if isinstance(saved.get("policy"), str):
+            self._set_combo_value(self.policy, saved["policy"])
+        if isinstance(saved.get("on_file_failure"), str):
+            self._set_combo_value(self.on_file_failure, saved["on_file_failure"])
+        if isinstance(saved.get("use_calibration"), bool):
+            self.use_calibration.setChecked(saved["use_calibration"])
+        if isinstance(saved.get("duplicate_policy"), str):
+            self._set_combo_value(self.duplicate_policy, saved["duplicate_policy"])
+
+    def _set_combo_value(self, combo: QComboBox, value: str) -> None:
+        index = combo.findText(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _ui_state_payload(self) -> dict[str, object]:
+        return {
+            "source": self.source_input.text().strip(),
+            "library": self.library_input.text().strip(),
+            "organise_enabled": self.organise_enabled.isChecked(),
+            "compress_enabled": self.compress_enabled.isChecked(),
+            "apply_mode": self.apply_mode.isChecked(),
+            "copy_mode": self.copy_mode.isChecked(),
+            "use_cache": self.use_cache.isChecked(),
+            "offline": self.offline.isChecked(),
+            "min_confidence": float(self.min_confidence.value()),
+            "extensions": self.extensions_input.text().strip(),
+            "conflict_mode": self.conflict_mode.currentText(),
+            "overwrite": self.overwrite.isChecked(),
+            "recursive": self.recursive.isChecked(),
+            "no_skip": self.no_skip.isChecked(),
+            "policy": self.policy.currentText(),
+            "on_file_failure": self.on_file_failure.currentText(),
+            "use_calibration": self.use_calibration.isChecked(),
+            "duplicate_policy": self.duplicate_policy.currentText(),
+        }
+
+    def _persist_ui_state(self) -> None:
+        save_ui_state(self._ui_state_payload())
+
+    def _on_config_edited(self, *_args) -> None:
+        if self._loading_state:
+            return
+        if self.controller is not None or self.preview_state is not None or self.encode_preparation is not None:
+            self._invalidate_runtime_state("Configuration changed. Cleared previous review and run state.")
+
+    def _invalidate_runtime_state(self, status_message: str | None = None) -> None:
+        self.controller = None
+        self.preview_state = None
+        self.apply_result = None
+        self.encode_preparation = None
+        self.encode_results = []
+        self._pipeline_requested = False
+        self._pipeline_should_compress_after_apply = False
+        self.review_table.setRowCount(0)
+        self.candidate_table.setRowCount(0)
+        self.compression_table.setRowCount(0)
+        self.details_log.clear()
+        self.summary_log.clear()
+        self.prepare_progress.setValue(0)
+        self.file_progress.setValue(0)
+        self.overall_progress.setValue(0)
+        if status_message:
+            self._append_status(status_message)
+        self._update_action_state()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # pragma: no cover - GUI runtime path
+        self._persist_ui_state()
+        super().closeEvent(event)
 
     def _browse_into(self, target: QLineEdit) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select directory", target.text() or str(Path.home()))
@@ -293,13 +449,24 @@ class MainWindow(QMainWindow):
         has_controller = self.controller is not None and bool(self.controller.items)
         has_review_selection = has_controller and self._current_review_index() is not None
         has_preview = self.preview_state is not None
+        has_more_candidates = False
+        if has_review_selection and self.controller is not None:
+            current = self.controller.items[self._current_review_index() or 0]
+            has_more_candidates = current.has_more
 
+        self.run_pipeline_button.setEnabled(self._active_worker_count == 0)
         self.preview_button.setEnabled(self.organise_enabled.isChecked() and has_controller)
         self.apply_button.setEnabled(
             self.organise_enabled.isChecked() and has_controller and has_preview
         )
+        self.prev_item_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
+        self.next_item_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
         self.accept_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
         self.skip_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
+        self.next_page_button.setEnabled(
+            self.organise_enabled.isChecked() and has_review_selection and has_more_candidates
+        )
+        self.auto_accept_button.setEnabled(self.organise_enabled.isChecked() and has_controller)
         self.search_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
         self.switch_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
         self.manual_button.setEnabled(self.organise_enabled.isChecked() and has_review_selection)
@@ -314,12 +481,17 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self.scan_button.setEnabled(not busy and self.organise_enabled.isChecked())
         self.compress_button.setEnabled(not busy and self.compress_enabled.isChecked())
+        self.run_pipeline_button.setEnabled(not busy)
         self.cancel_button.setEnabled(True)
         if busy:
             self.preview_button.setEnabled(False)
             self.apply_button.setEnabled(False)
+            self.prev_item_button.setEnabled(False)
+            self.next_item_button.setEnabled(False)
             self.accept_button.setEnabled(False)
             self.skip_button.setEnabled(False)
+            self.next_page_button.setEnabled(False)
+            self.auto_accept_button.setEnabled(False)
             self.search_button.setEnabled(False)
             self.switch_button.setEnabled(False)
             self.manual_button.setEnabled(False)
@@ -387,6 +559,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self._show_error(str(exc))
             return
+        self._persist_ui_state()
         if not config.plexify.enabled:
             self._show_error("Organise stage is disabled.")
             return
@@ -395,12 +568,49 @@ class MainWindow(QMainWindow):
         worker = FunctionWorker(scan_controller, controller)
         self._start_worker(worker, self._scan_complete)
 
+    def _start_pipeline(self) -> None:
+        try:
+            config = self._current_config()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._persist_ui_state()
+        self._pipeline_requested = True
+        self._pipeline_should_compress_after_apply = config.shrink.enabled
+        if config.plexify.enabled:
+            self._append_status("Starting full pipeline with organise scan.")
+            controller = build_video_controller(config)
+            worker = FunctionWorker(scan_controller, controller)
+            self._start_worker(worker, self._scan_complete)
+            return
+        self._append_status("Organise stage disabled. Starting compression stage directly.")
+        self._start_compression()
+
     def _scan_complete(self, controller: VideoUIController) -> None:
         self.controller = controller
         self.preview_state = None
         self.apply_result = None
         self._populate_review_table()
         self._append_status(f"Loaded {len(controller.items)} item(s) for review.")
+        if self._pipeline_requested:
+            accepted = self._auto_accept_safe_matches()
+            self._append_status(f"Auto-accepted {accepted} high-confidence match(es).")
+            self._preview_plan()
+            if self.preview_state is not None and self.preview_state.can_apply:
+                reply = QMessageBox.question(
+                    self,
+                    "mediaflow",
+                    "Organise preview is fully resolved. Apply it and continue the pipeline?",
+                )
+                if reply == QMessageBox.Yes:
+                    self._apply_plan()
+                else:
+                    self._pipeline_requested = False
+                    self._pipeline_should_compress_after_apply = False
+            else:
+                self._append_status(
+                    "Pipeline paused for manual review. Resolve remaining items, then apply to continue."
+                )
         self._update_action_state()
 
     def _populate_review_table(self) -> None:
@@ -438,6 +648,9 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is not None:
             self._populate_candidate_table(index)
+            self._populate_detail_view(index)
+        else:
+            self.details_log.clear()
         self._update_action_state()
 
     def _current_review_index(self) -> int | None:
@@ -468,6 +681,34 @@ class MainWindow(QMainWindow):
             self.candidate_table.selectRow(0)
         self._update_action_state()
 
+    def _populate_detail_view(self, review_index: int) -> None:
+        if self.controller is None:
+            self.details_log.clear()
+            return
+        item = self.controller.items[review_index]
+        lines = [
+            f"Path: {item.item.path}",
+            f"Media type: {item.item.media_type}",
+            f"Title: {item.item.title}",
+            f"Search query: {item.search_query}",
+            f"Status: {item.status_label}",
+            f"Cache context: {item.cache_context}",
+            f"Auto-selectable: {item.auto_selectable}",
+        ]
+        if item.item.season is not None:
+            lines.append(f"Season: {item.item.season}")
+        if item.item.episode is not None:
+            lines.append(f"Episode: {item.item.episode}")
+        if item.item.episode_title:
+            lines.append(f"Episode title: {item.item.episode_title}")
+        if item.manual_candidate is not None:
+            lines.append(f"Manual candidate: {item.manual_candidate.title}")
+        if item.warning:
+            lines.append(f"Warning: {item.warning}")
+        if item.unresolved_reason:
+            lines.append(f"Unresolved: {item.unresolved_reason}")
+        self.details_log.setPlainText("\n".join(lines))
+
     def _selected_candidate_index(self) -> int:
         indexes = self.candidate_table.selectionModel().selectedRows()
         if not indexes:
@@ -475,10 +716,10 @@ class MainWindow(QMainWindow):
         return indexes[0].row()
 
     def _refresh_review(self) -> None:
-        self._populate_review_table()
         index = self._current_review_index()
-        if index is not None:
-            self.review_table.selectRow(index)
+        self._populate_review_table()
+        if index is not None and self.review_table.rowCount() > 0:
+            self.review_table.selectRow(min(index, self.review_table.rowCount() - 1))
 
     def _accept_selected_candidate(self) -> None:
         if self.controller is None:
@@ -497,6 +738,35 @@ class MainWindow(QMainWindow):
             return
         self.controller.skip_item(index)
         self._refresh_review()
+
+    def _move_review_selection(self, delta: int) -> None:
+        if self.review_table.rowCount() == 0:
+            return
+        index = self._current_review_index()
+        current = index if index is not None else 0
+        target = max(0, min(self.review_table.rowCount() - 1, current + delta))
+        self.review_table.selectRow(target)
+
+    def _load_next_candidate_page(self) -> None:
+        if self.controller is None:
+            return
+        index = self._current_review_index()
+        if index is None:
+            return
+        self.controller.next_page(index)
+        self._refresh_review()
+
+    def _auto_accept_safe_matches(self) -> int:
+        if self.controller is None:
+            return 0
+        accepted = 0
+        for idx, item in enumerate(self.controller.items):
+            if item.resolved or not item.auto_selectable or not item.candidates:
+                continue
+            self.controller.accept_candidate(idx, 0)
+            accepted += 1
+        self._refresh_review()
+        return accepted
 
     def _search_current_item(self) -> None:
         if self.controller is None:
@@ -603,6 +873,10 @@ class MainWindow(QMainWindow):
         self._append_status("Organisation stage complete.")
         self._refresh_pipeline_summary()
         self._update_action_state()
+        if self._pipeline_requested and self._pipeline_should_compress_after_apply:
+            self._append_status("Continuing full pipeline into compression.")
+            self._start_compression()
+            self._pipeline_requested = False
 
     def _start_compression(self) -> None:
         try:
@@ -610,6 +884,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self._show_error(str(exc))
             return
+        self._persist_ui_state()
         if not config.shrink.enabled:
             self._show_error("Compress stage is disabled.")
             return
@@ -671,6 +946,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             self._append_status("Compression prepared but not started.")
             self._refresh_pipeline_summary()
+            self._pipeline_requested = False
+            self._pipeline_should_compress_after_apply = False
             return
         worker = FunctionWorker(run_compression, preparation)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
@@ -704,6 +981,8 @@ class MainWindow(QMainWindow):
                 self._append_summary(f"{result.job.source.name}: {result.error_message}")
         self._append_status("Compression stage complete.")
         self._refresh_pipeline_summary()
+        self._pipeline_requested = False
+        self._pipeline_should_compress_after_apply = False
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
         self.compression_table.setRowCount(0)
@@ -752,5 +1031,7 @@ class MainWindow(QMainWindow):
                 "Wait for the active task to finish, or stop the process externally if needed."
             )
             return
+        self._pipeline_requested = False
+        self._pipeline_should_compress_after_apply = False
         self.status_log.clear()
         self.summary_log.clear()

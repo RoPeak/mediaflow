@@ -31,10 +31,12 @@ def test_initial_action_state_is_practical() -> None:
     window = MainWindow()
 
     assert window.scan_button.isEnabled() is True
+    assert window.run_pipeline_button.isEnabled() is True
     assert window.preview_button.isEnabled() is False
     assert window.apply_button.isEnabled() is False
     assert window.accept_button.isEnabled() is False
     assert window.compress_button.isEnabled() is True
+    assert window.auto_accept_button.isEnabled() is False
 
 
 def test_disabling_compress_stage_disables_run_button() -> None:
@@ -45,6 +47,22 @@ def test_disabling_compress_stage_disables_run_button() -> None:
     window._update_stage_controls()
 
     assert window.compress_button.isEnabled() is False
+
+
+def test_cancel_clears_pending_pipeline_flags() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._pipeline_requested = True
+    window._pipeline_should_compress_after_apply = True
+    window.status_log.setPlainText("status")
+    window.summary_log.setPlainText("summary")
+
+    window._cancel_requested()
+
+    assert window._pipeline_requested is False
+    assert window._pipeline_should_compress_after_apply is False
+    assert window.status_log.toPlainText() == ""
+    assert window.summary_log.toPlainText() == ""
 
 
 def test_refresh_pipeline_summary_includes_existing_summary_text() -> None:

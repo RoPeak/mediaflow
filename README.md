@@ -8,6 +8,7 @@ Practical desktop GUI for running `plexify` and `mediashrink` as one video workf
 - review and apply plexify organisation
 - prepare and run mediashrink compression
 - inspect plain progress and summary output
+- remember the last-used UI configuration in user-level config storage
 
 This project is intentionally utility-first. The goal is a clear operator-facing desktop app, not a decorative interface.
 
@@ -37,4 +38,5 @@ mediaflow --source /path/to/incoming --library /path/to/library
 
 - `PySide6` is required to launch the desktop window.
 - FFmpeg and ffprobe must be available for the compression stage.
+- `Run Full Pipeline` scans, auto-accepts high-confidence matches, previews the organisation stage, then continues into compression once the organise stage is applied.
 - Project-local `AGENTS.md` and `CLAUDE.md` are intentionally excluded from git and must remain untracked.
