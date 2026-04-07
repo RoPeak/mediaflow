@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import traceback
 from collections.abc import Callable
 
@@ -32,17 +33,25 @@ class FunctionWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            result = self.fn(*self.args, progress_callback=self.signals.progress.emit, **self.kwargs)
-        except TypeError:
-            try:
-                result = self.fn(*self.args, **self.kwargs)
-            except Exception:  # pragma: no cover - GUI runtime behavior
-                self.signals.error.emit(traceback.format_exc())
+            if _supports_progress_callback(self.fn):
+                result = self.fn(
+                    *self.args,
+                    progress_callback=self.signals.progress.emit,
+                    **self.kwargs,
+                )
             else:
-                self.signals.result.emit(result)
+                result = self.fn(*self.args, **self.kwargs)
         except Exception:  # pragma: no cover - GUI runtime behavior
             self.signals.error.emit(traceback.format_exc())
         else:
             self.signals.result.emit(result)
         finally:
             self.signals.finished.emit()
+
+
+def _supports_progress_callback(fn: Callable[..., object]) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return "progress_callback" in signature.parameters
