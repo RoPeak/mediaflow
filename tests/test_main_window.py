@@ -45,3 +45,27 @@ def test_disabling_compress_stage_disables_run_button() -> None:
     window._update_stage_controls()
 
     assert window.compress_button.isEnabled() is False
+
+
+def test_refresh_pipeline_summary_includes_existing_summary_text() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    class ResultState:
+        planned = 2
+        errors = []
+
+    class ApplyState:
+        result = ResultState()
+        report_path = "/tmp/report.json"
+        apply_report_path = None
+
+    window.apply_result = ApplyState()
+    window.summary_log.setPlainText("Existing details")
+
+    window._refresh_pipeline_summary()
+
+    text = window.summary_log.toPlainText()
+    assert "Pipeline Summary" in text
+    assert "Organised plans: 2" in text
+    assert "Existing details" in text

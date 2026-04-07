@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from mediaflow.config import PlexifySettings, ShrinkSettings, build_pipeline_config
-from mediaflow.pipeline import should_run_mediashrink, should_run_plexify, target_compression_root
+from mediaflow.pipeline import (
+    build_pipeline_summary,
+    should_run_mediashrink,
+    should_run_plexify,
+    target_compression_root,
+)
 
 
 def test_build_pipeline_config_requires_one_stage(tmp_path: Path) -> None:
@@ -43,3 +48,37 @@ def test_build_pipeline_config_requires_existing_source_when_plexify_enabled(tmp
             source=str(tmp_path / "missing"),
             library=str(library),
         )
+
+
+def test_build_pipeline_summary_aggregates_stage_results() -> None:
+    class ResultState:
+        planned = 4
+        errors = ["one"]
+
+    class ApplyState:
+        result = ResultState()
+        report_path = "/tmp/report.json"
+        apply_report_path = "/tmp/apply-report.json"
+
+    class EncodeState:
+        def __init__(self, *, skipped: bool, success: bool, input_size: int, output_size: int) -> None:
+            self.skipped = skipped
+            self.success = success
+            self.input_size_bytes = input_size
+            self.output_size_bytes = output_size
+
+    summary = build_pipeline_summary(
+        ApplyState(),
+        [
+            EncodeState(skipped=False, success=True, input_size=1000, output_size=400),
+            EncodeState(skipped=True, success=False, input_size=1000, output_size=0),
+            EncodeState(skipped=False, success=False, input_size=500, output_size=0),
+        ],
+    )
+
+    assert summary.organised_plans == 4
+    assert summary.organised_errors == 1
+    assert summary.encoded_files == 1
+    assert summary.skipped_files == 1
+    assert summary.failed_files == 1
+    assert summary.bytes_saved == 600

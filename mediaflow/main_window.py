@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QHeaderView,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -32,7 +33,7 @@ from plexify.ui_controller import ApplyResultState, PreviewState, VideoUIControl
 
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
 from .mediashrink_adapter import prepare_compression, run_compression
-from .pipeline import target_compression_root
+from .pipeline import build_pipeline_summary, target_compression_root
 from .plexify_adapter import build_preview, build_video_controller, scan_controller
 from .workers import FunctionWorker
 
@@ -120,6 +121,13 @@ class MainWindow(QMainWindow):
         self.prepare_progress = QProgressBar()
         self.file_progress = QProgressBar()
         self.overall_progress = QProgressBar()
+        self.compression_table = QTableWidget(0, 7)
+        self.compression_table.setHorizontalHeaderLabels(
+            ["File", "Codec", "Recommendation", "Reason", "Est. Output", "Est. Saving", "Selected"]
+        )
+        self.compression_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.compression_table.setSelectionMode(QTableWidget.NoSelection)
+        self.compression_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.status_log = QPlainTextEdit()
         self.status_log.setReadOnly(True)
         self.summary_log = QPlainTextEdit()
@@ -240,6 +248,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.file_progress)
         layout.addWidget(QLabel("Overall"))
         layout.addWidget(self.overall_progress)
+        layout.addWidget(QLabel("Compression Plan"))
+        self.compression_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.compression_table)
         layout.addWidget(QLabel("Status"))
         layout.addWidget(self.status_log)
         return panel
@@ -322,6 +333,9 @@ class MainWindow(QMainWindow):
 
     def _append_summary(self, text: str) -> None:
         self.summary_log.appendPlainText(text)
+
+    def _set_summary_text(self, text: str) -> None:
+        self.summary_log.setPlainText(text)
 
     def _current_config(self) -> PipelineConfig:
         return build_pipeline_config(
@@ -585,8 +599,9 @@ class MainWindow(QMainWindow):
         if result.result.errors:
             lines.append("")
             lines.extend(f"Error: {error}" for error in result.result.errors[:10])
-        self.summary_log.setPlainText("\n".join(lines))
+        self._set_summary_text("\n".join(lines))
         self._append_status("Organisation stage complete.")
+        self._refresh_pipeline_summary()
         self._update_action_state()
 
     def _start_compression(self) -> None:
@@ -615,6 +630,7 @@ class MainWindow(QMainWindow):
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self.encode_preparation = preparation
+        self._populate_compression_table(preparation)
         if not preparation.items:
             self._append_status("No supported video files found for compression.")
             self._append_summary("Compression: no supported files found.")
@@ -628,14 +644,18 @@ class MainWindow(QMainWindow):
             f"Recommended: {preparation.recommended_count}",
             f"Maybe: {preparation.maybe_count}",
             f"Skip: {preparation.skip_count}",
+            f"Selected for encode: {preparation.selected_count}",
             (
                 f"Selected profile: {preparation.profile.name} "
                 f"({preparation.profile.encoder_key}, CRF {preparation.profile.crf})"
             ),
+            f"Total bytes scanned: {preparation.total_input_bytes}",
+            f"Selected input bytes: {preparation.selected_input_bytes}",
+            f"Selected est. output bytes: {preparation.selected_estimated_output_bytes}",
         ]
         if preparation.estimated_total_seconds:
             summary_lines.append(f"Estimated encode seconds: {int(preparation.estimated_total_seconds)}")
-        self.summary_log.setPlainText("\n".join(summary_lines))
+        self._set_summary_text("\n".join(summary_lines))
         self._append_status(
             f"Selected profile {preparation.profile.name} "
             f"({preparation.profile.encoder_key}, CRF {preparation.profile.crf})."
@@ -643,6 +663,15 @@ class MainWindow(QMainWindow):
         if preparation.duplicate_warnings:
             for warning in preparation.duplicate_warnings:
                 self._append_status(f"Duplicate policy: {warning}")
+        reply = QMessageBox.question(
+            self,
+            "mediaflow",
+            "Compression plan is ready. Start encoding now?",
+        )
+        if reply != QMessageBox.Yes:
+            self._append_status("Compression prepared but not started.")
+            self._refresh_pipeline_summary()
+            return
         worker = FunctionWorker(run_compression, preparation)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
 
@@ -674,6 +703,47 @@ class MainWindow(QMainWindow):
             if result.error_message:
                 self._append_summary(f"{result.job.source.name}: {result.error_message}")
         self._append_status("Compression stage complete.")
+        self._refresh_pipeline_summary()
+
+    def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
+        self.compression_table.setRowCount(0)
+        if preparation is None:
+            return
+        selected_sources = {job.source for job in preparation.jobs}
+        for row, item in enumerate(preparation.items):
+            self.compression_table.insertRow(row)
+            values = [
+                item.source.name,
+                item.codec or "",
+                item.recommendation,
+                item.reason_text,
+                str(item.estimated_output_bytes) if item.estimated_output_bytes else "",
+                str(item.estimated_savings_bytes) if item.estimated_savings_bytes else "",
+                "yes" if item.source in selected_sources else "no",
+            ]
+            for column, value in enumerate(values):
+                self.compression_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _refresh_pipeline_summary(self) -> None:
+        summary = build_pipeline_summary(self.apply_result, self.encode_results)
+        lines = [
+            "Pipeline Summary",
+            f"Organised plans: {summary.organised_plans}",
+            f"Organise errors: {summary.organised_errors}",
+            f"Encoded files: {summary.encoded_files}",
+            f"Skipped files: {summary.skipped_files}",
+            f"Failed files: {summary.failed_files}",
+            f"Bytes saved: {summary.bytes_saved}",
+        ]
+        if summary.organise_report_path:
+            lines.append(f"Organise report: {summary.organise_report_path}")
+        if summary.organise_apply_report_path:
+            lines.append(f"Organise apply report: {summary.organise_apply_report_path}")
+        existing = self.summary_log.toPlainText().strip()
+        if existing:
+            lines.append("")
+            lines.append(existing)
+        self._set_summary_text("\n".join(lines))
 
     def _cancel_requested(self) -> None:
         if self._active_worker_count:
