@@ -924,17 +924,48 @@ class MainWindow(QMainWindow):
                 f"Selected profile: {preparation.profile.name} "
                 f"({preparation.profile.encoder_key}, CRF {preparation.profile.crf})"
             ),
+            f"Compatibility coverage: {preparation.compatible_count} compatible / {preparation.incompatible_count} likely follow-up",
             f"Total bytes scanned: {preparation.total_input_bytes}",
             f"Selected input bytes: {preparation.selected_input_bytes}",
             f"Selected est. output bytes: {preparation.selected_estimated_output_bytes}",
         ]
         if preparation.estimated_total_seconds:
             summary_lines.append(f"Estimated encode seconds: {int(preparation.estimated_total_seconds)}")
+        if preparation.size_confidence:
+            summary_lines.append(f"Size confidence: {preparation.size_confidence}")
+        if preparation.time_confidence:
+            summary_lines.append(f"Time confidence: {preparation.time_confidence}")
+        if preparation.recommendation_reason:
+            summary_lines.append(f"Recommendation: {preparation.recommendation_reason}")
+        if preparation.grouped_incompatibilities:
+            grouped = ", ".join(
+                f"{reason} ({count})"
+                for reason, count in sorted(
+                    preparation.grouped_incompatibilities.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            )
+            summary_lines.append(f"Likely incompatibilities: {grouped}")
         self._set_summary_text("\n".join(summary_lines))
         self._append_status(
             f"Selected profile {preparation.profile.name} "
             f"({preparation.profile.encoder_key}, CRF {preparation.profile.crf})."
         )
+        for stage_message in preparation.stage_messages or []:
+            self._append_status(stage_message)
+        if preparation.recommendation_reason:
+            self._append_status(f"Recommendation: {preparation.recommendation_reason}")
+        if preparation.incompatible_count:
+            self._append_status(
+                f"Compatibility coverage: {preparation.compatible_count} compatible, "
+                f"{preparation.incompatible_count} likely follow-up."
+            )
+        if preparation.grouped_incompatibilities:
+            for reason, count in sorted(
+                preparation.grouped_incompatibilities.items(),
+                key=lambda item: (-item[1], item[0]),
+            ):
+                self._append_status(f"Likely incompatibility: {reason} ({count})")
         if preparation.duplicate_warnings:
             for warning in preparation.duplicate_warnings:
                 self._append_status(f"Duplicate policy: {warning}")
