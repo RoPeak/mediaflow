@@ -39,4 +39,3 @@ mediaflow --source /path/to/incoming --library /path/to/library
 - `PySide6` is required to launch the desktop window.
 - FFmpeg and ffprobe must be available for the compression stage.
 - `Run Full Pipeline` scans, auto-accepts high-confidence matches, previews the organisation stage, then continues into compression once the organise stage is applied.
-- Project-local `AGENTS.md` and `CLAUDE.md` are intentionally excluded from git and must remain untracked.
