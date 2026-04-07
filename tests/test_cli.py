@@ -31,3 +31,23 @@ def test_cli_forwards_optional_paths_to_launch(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     mock_launch.assert_called_once_with(source=source, library=library)
+
+
+def test_doctor_reports_success_when_runtime_compatibility_passes() -> None:
+    with patch("mediaflow.cli.check_runtime_compatibility", return_value=[]):
+        result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "Runtime compatibility check passed." in result.stdout
+
+
+def test_doctor_reports_failures_when_runtime_compatibility_fails() -> None:
+    issues = [object()]
+    with patch("mediaflow.cli.check_runtime_compatibility", return_value=issues), patch(
+        "mediaflow.cli.compatibility_error_text",
+        return_value="Runtime compatibility check failed:\n- plexify: mismatch",
+    ):
+        result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "plexify: mismatch" in result.stdout

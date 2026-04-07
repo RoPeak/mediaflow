@@ -36,17 +36,17 @@ class FunctionWorker(QRunnable):
             if _supports_progress_callback(self.fn):
                 result = self.fn(
                     *self.args,
-                    progress_callback=self.signals.progress.emit,
+                    progress_callback=lambda payload: _safe_emit(self.signals.progress, payload),
                     **self.kwargs,
                 )
             else:
                 result = self.fn(*self.args, **self.kwargs)
         except Exception:  # pragma: no cover - GUI runtime behavior
-            self.signals.error.emit(traceback.format_exc())
+            _safe_emit(self.signals.error, traceback.format_exc())
         else:
-            self.signals.result.emit(result)
+            _safe_emit(self.signals.result, result)
         finally:
-            self.signals.finished.emit()
+            _safe_emit(self.signals.finished)
 
 
 def _supports_progress_callback(fn: Callable[..., object]) -> bool:
@@ -55,3 +55,10 @@ def _supports_progress_callback(fn: Callable[..., object]) -> bool:
     except (TypeError, ValueError):
         return False
     return "progress_callback" in signature.parameters
+
+
+def _safe_emit(signal: Signal, *args) -> None:
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        return
