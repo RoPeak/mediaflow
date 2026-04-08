@@ -10,6 +10,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
 from mediaflow.main_window import MainWindow
+from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
 from mediaflow.workflow import WorkflowState
 from mediashrink.gui_api import EncodePreparation
 
@@ -155,6 +156,51 @@ def test_preparing_compression_uses_preparing_view() -> None:
 
     assert window.compress_stack.currentIndex() == 1
     assert "compression plan" in window.compress_hint_label.text().lower()
+
+
+def test_preparation_progress_updates_stage_dashboard(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    sample = tmp_path / "movie.mkv"
+    sample.write_bytes(b"x" * 64)
+
+    window._preparation_progress(
+        PreparationStageUpdate(stage="benchmarking", message="Benchmarking profiles...", completed=1, total=3)
+    )
+    window._preparation_progress(PreparationProgress(1, 1, str(sample)))
+
+    assert "Benchmarking" in window.prepare_log.toPlainText()
+    assert "1 file(s)" in window.prepare_counts_label.text()
+    assert "Analysing files" in window.prepare_stage_label.text()
+
+
+def test_summary_export_includes_headline_and_mode(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    window.summary_headline_label.setText("Compression-only run completed")
+    window.summary_mode_label.setText("Compression output mode: in-place")
+    window.summary_overview_label.setText("Encoded: 1 file(s)")
+    window.summary_log.setPlainText("Compression results\n- movie.mkv")
+
+    exported = window._build_summary_export_text()
+
+    assert "Compression-only run completed" in exported
+    assert "Compression output mode: in-place" in exported
+    assert "Compression results" in exported
+
+
+def test_encode_dashboard_toggle_hides_live_view() -> None:
+    _app()
+    window = MainWindow()
+    window.encode_preparation = SimpleNamespace(jobs=[SimpleNamespace(source=Path("/tmp/movie.mkv"))])
+    window.compress_stack.setCurrentIndex(2)
+    window._set_state(WorkflowState.READY_TO_COMPRESS)
+
+    assert window.toggle_encode_card_button.isVisible() is True
+    window.toggle_encode_card_button.setChecked(True)
+    window._on_toggle_encode_card(True)
+
+    assert window.encode_card.isVisible() is False
 
 
 def test_traceback_errors_are_summarised_for_users() -> None:

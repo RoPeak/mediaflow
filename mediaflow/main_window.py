@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer
-from PySide6.QtGui import QCloseEvent, QIcon
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QSystemTrayIcon
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -44,7 +44,7 @@ from .mediashrink_adapter import missing_job_sources, prepare_compression, run_c
 from .pipeline import build_pipeline_summary
 from .plexify_adapter import build_preview, build_video_controller, scan_controller
 from .settings import load_ui_state, save_ui_state
-from .callback_types import PreparationProgress
+from .callback_types import PreparationProgress, PreparationStageUpdate
 from .workers import FunctionWorker
 from .workflow import WorkflowState, describe_workflow_state
 
@@ -79,6 +79,16 @@ class MainWindow(QMainWindow):
         self._compression_start: float = 0.0
         self._current_overall_progress: float = 0.0
         self._preparation_start: float = 0.0
+        self._spinner_idx: int = 0
+        self._last_encode_log_key: tuple[int, str] = (-1, "")
+        self._last_encode_bucket: int = -1
+        self._last_encode_file: str = ""
+        self._prepare_seen_files: int = 0
+        self._prepare_seen_bytes: int = 0
+        self._prepare_stage_key: str = "discovering"
+        self._startup_duration: float | None = None
+        self._preparation_duration: float | None = None
+        self._first_progress_delay: float | None = None
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
@@ -92,11 +102,7 @@ class MainWindow(QMainWindow):
             self.compression_root_input.setText(target)
         self._set_state(WorkflowState.SETUP)
 
-        if QSystemTrayIcon.isSystemTrayAvailable():
-            self._tray = QSystemTrayIcon(QIcon(), self)
-            self._tray.show()
-        else:
-            self._tray = None
+        self._tray: QSystemTrayIcon | None = None
 
     def _build_widgets(self, *, default_source: Path | None, default_library: Path | None) -> None:
         self.step_label = QLabel()
@@ -233,6 +239,11 @@ class MainWindow(QMainWindow):
         self.compress_empty_label.setWordWrap(True)
         self.compress_preparing_label = QLabel("Preparing a compression plan...")
         self.compress_preparing_label.setWordWrap(True)
+        self.prepare_counts_label = QLabel("0 file(s) discovered • 0.0 B")
+        self.prepare_counts_label.setObjectName("muted-label")
+        self.prepare_timeline_label = QLabel("")
+        self.prepare_timeline_label.setWordWrap(True)
+        self.prepare_timeline_label.setObjectName("muted-label")
         self.prepare_progress = QProgressBar()
         self.file_progress = QProgressBar()
         self.overall_progress = QProgressBar()
@@ -264,11 +275,40 @@ class MainWindow(QMainWindow):
         self.elapsed_label = QLabel("Elapsed: —")
         self.eta_label = QLabel("ETA: —")
         self.run_stats_label = QLabel("Files: —")
+
+        # Encode card widgets
+        self.spinner_label = QLabel("⠋")
+        self.spinner_label.setObjectName("encode-spinner")
+        self.encode_filename_label = QLabel("")
+        self.encode_filename_label.setObjectName("encode-filename")
+        self.encode_filename_label.setWordWrap(True)
+        self.encode_speed_label = QLabel("")
+        self.encode_phase_label = QLabel("")
+        self.encode_phase_label.setObjectName("muted-label")
+        self.encode_counts_label = QLabel("")
+        self.encode_counts_label.setObjectName("muted-label")
+        self.encode_projection_label = QLabel("")
+        self.encode_projection_label.setWordWrap(True)
+        self.encode_projection_label.setObjectName("muted-label")
+        self.encode_visual_bar = QProgressBar()
+        self.encode_visual_bar.setObjectName("encode-visual")
+        self.encode_visual_bar.setRange(0, 100)
+        self.encode_visual_bar.setTextVisible(True)
+        self.encode_visual_bar.setFormat("%p%")
+        self.encode_projection_bar = QProgressBar()
+        self.encode_projection_bar.setObjectName("savings-bar")
+        self.encode_projection_bar.setRange(0, 100)
+        self.encode_projection_bar.setTextVisible(True)
+        self.toggle_encode_card_button = QPushButton("Hide live view")
+        self.toggle_encode_card_button.setCheckable(True)
+
         self._compression_timer = QTimer(self)
         self._compression_timer.setInterval(1000)
         self._compression_timer.timeout.connect(self._tick_compression)
 
         self.prepare_elapsed_label = QLabel("")
+        self.prepare_stage_label = QLabel("Analysing files...")
+        self.prepare_stage_label.setObjectName("muted-label")
         self.prepare_log = QPlainTextEdit()
         self.prepare_log.setReadOnly(True)
         self.prepare_log.document().setMaximumBlockCount(200)
@@ -276,8 +316,23 @@ class MainWindow(QMainWindow):
         self._preparation_timer.setInterval(1000)
         self._preparation_timer.timeout.connect(self._tick_preparation)
 
+        self.stat_files_label = QLabel("—")
+        self.stat_files_label.setObjectName("stat-tile")
+        self.stat_files_label.setAlignment(Qt.AlignCenter)
+        self.stat_saved_label = QLabel("—")
+        self.stat_saved_label.setObjectName("stat-tile")
+        self.stat_saved_label.setAlignment(Qt.AlignCenter)
+        self.stat_pct_label = QLabel("—")
+        self.stat_pct_label.setObjectName("stat-tile")
+        self.stat_pct_label.setAlignment(Qt.AlignCenter)
         self.summary_overview_label = QLabel()
         self.summary_overview_label.setWordWrap(True)
+        self.summary_headline_label = QLabel()
+        self.summary_headline_label.setWordWrap(True)
+        self.summary_headline_label.setObjectName("headline-label")
+        self.summary_mode_label = QLabel()
+        self.summary_mode_label.setWordWrap(True)
+        self.summary_mode_label.setObjectName("muted-label")
         self.summary_table = QTableWidget(0, 6)
         self.summary_table.setHorizontalHeaderLabels(["File", "Status", "Original", "Final", "Saved", "Location"])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
@@ -285,6 +340,11 @@ class MainWindow(QMainWindow):
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.summary_table.verticalHeader().setVisible(False)
         self.summary_table.setVisible(False)
+        self.savings_bar = QProgressBar()
+        self.savings_bar.setObjectName("savings-bar")
+        self.savings_bar.setRange(0, 100)
+        self.savings_bar.setTextVisible(True)
+        self.savings_bar.setVisible(False)
         self.summary_log = QPlainTextEdit()
         self.summary_log.setReadOnly(True)
         self.open_output_button = QPushButton("Open output folder")
@@ -382,6 +442,52 @@ class MainWindow(QMainWindow):
                 margin-right: 4px;
             }
             QTabBar::tab:selected { background: #353940; }
+            QLabel#encode-spinner {
+                font-size: 26px;
+                color: #4f9cf5;
+                min-width: 36px;
+            }
+            QLabel#encode-filename {
+                font-size: 14px;
+                font-weight: 600;
+                color: #f5f5f5;
+            }
+            QProgressBar#encode-visual {
+                min-height: 26px;
+                border-radius: 6px;
+                background: #2a2d31;
+                border: 1px solid #4c5158;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            QProgressBar#encode-visual::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1e5fa8, stop:1 #4f9cf5);
+                border-radius: 5px;
+            }
+            QProgressBar#savings-bar {
+                min-height: 22px;
+                border-radius: 6px;
+                background: #2a2d31;
+                border: 1px solid #4c5158;
+                color: #ffffff;
+                font-weight: 600;
+            }
+            QProgressBar#savings-bar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1e7a4a, stop:1 #3cbf77);
+                border-radius: 5px;
+            }
+            QLabel#stat-tile {
+                font-size: 22px;
+                font-weight: 700;
+                color: #f5f5f5;
+                background: #2a2d31;
+                border: 1px solid #4c5158;
+                border-radius: 8px;
+                padding: 14px 24px;
+                min-width: 120px;
+            }
             """
         )
         self.step_label.setObjectName("step-label")
@@ -590,9 +696,15 @@ class MainWindow(QMainWindow):
 
         preparing_page = QWidget()
         preparing_layout = QVBoxLayout(preparing_page)
-        preparing_layout.addWidget(self.compress_preparing_label)
-        preparing_layout.addWidget(self.prepare_progress)
-        preparing_layout.addWidget(self.prepare_elapsed_label)
+        preparation_card = QGroupBox("Preparation Dashboard")
+        card_layout = QVBoxLayout(preparation_card)
+        card_layout.addWidget(self.compress_preparing_label)
+        card_layout.addWidget(self.prepare_stage_label)
+        card_layout.addWidget(self.prepare_counts_label)
+        card_layout.addWidget(self.prepare_elapsed_label)
+        card_layout.addWidget(self.prepare_progress)
+        card_layout.addWidget(self.prepare_timeline_label)
+        preparing_layout.addWidget(preparation_card)
         preparing_layout.addWidget(self.prepare_log, stretch=1)
 
         ready_page = QWidget()
@@ -631,11 +743,35 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.toggle_details_button)
         right_layout.addWidget(self.compress_status_log, stretch=1)
 
+        # Encode card (animated, shown during compression)
+        self.encode_card = QGroupBox("Live Encode")
+        card_layout = QVBoxLayout(self.encode_card)
+        card_layout.setSpacing(8)
+        header_row = QHBoxLayout()
+        header_row.addWidget(self.spinner_label)
+        text_col = QVBoxLayout()
+        text_col.addWidget(self.encode_filename_label)
+        text_col.addWidget(self.encode_phase_label)
+        header_row.addLayout(text_col, stretch=1)
+        header_row.addWidget(self.encode_speed_label)
+        card_layout.addLayout(header_row)
+        card_layout.addWidget(self.encode_visual_bar)
+        card_layout.addWidget(self.encode_counts_label)
+        card_layout.addWidget(self.encode_projection_label)
+        card_layout.addWidget(self.encode_projection_bar)
+        self.encode_card.setVisible(False)
+
         compress_splitter = QSplitter(Qt.Horizontal)
         compress_splitter.addWidget(left_pane)
         compress_splitter.addWidget(right_pane)
         compress_splitter.setStretchFactor(0, 1)
         compress_splitter.setStretchFactor(1, 2)
+
+        ready_layout.addWidget(self.encode_card)
+        toggle_row = QHBoxLayout()
+        toggle_row.addStretch(1)
+        toggle_row.addWidget(self.toggle_encode_card_button)
+        ready_layout.addLayout(toggle_row)
         ready_layout.addWidget(compress_splitter, stretch=1)
 
         self.compress_stack.addWidget(empty_page)
@@ -647,7 +783,16 @@ class MainWindow(QMainWindow):
     def _build_summary_tab(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.addWidget(self.summary_headline_label)
+        layout.addWidget(self.summary_mode_label)
+        tile_row = QHBoxLayout()
+        tile_row.addWidget(self.stat_files_label)
+        tile_row.addWidget(self.stat_saved_label)
+        tile_row.addWidget(self.stat_pct_label)
+        tile_row.addStretch(1)
+        layout.addLayout(tile_row)
         layout.addWidget(self.summary_overview_label)
+        layout.addWidget(self.savings_bar)
         layout.addWidget(self.summary_table, stretch=1)
         layout.addWidget(self.summary_log, stretch=1)
         btn_row = QHBoxLayout()
@@ -708,6 +853,7 @@ class MainWindow(QMainWindow):
         self.start_compress_button.clicked.connect(self._start_compression)
         self.open_output_button.clicked.connect(self._open_output_folder)
         self.save_summary_button.clicked.connect(self._save_run_summary)
+        self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
 
     def _restore_ui_state(
         self,
@@ -857,6 +1003,79 @@ class MainWindow(QMainWindow):
             return f"{s}s"
         return f"{s // 60}m {s % 60}s"
 
+    @staticmethod
+    def _normalize_heartbeat_state(text: str) -> str:
+        clean = MainWindow._strip_rich(text).strip().lower()
+        mapping = {
+            "active": "Encoding",
+            "muxing": "Muxing",
+            "finishing": "Finishing",
+            "waiting": "Waiting",
+            "queued": "Queued",
+        }
+        return mapping.get(clean, clean.replace("_", " ").title() or "Encoding")
+
+    @staticmethod
+    def _progress_bucket(progress: float) -> int:
+        clipped = max(0.0, min(progress, 1.0))
+        return int(clipped * 20)
+
+    @staticmethod
+    def _preparation_stage_title(stage: str) -> str:
+        lowered = stage.lower()
+        mapping = {
+            "discovering": "Discovering files",
+            "analysing": "Analysing files",
+            "benchmarking": "Benchmarking profiles",
+            "building provisional profiles...": "Building profile candidates",
+            "preparing smoke probes...": "Preparing smoke probes",
+            "smoke-probing risky container/profile combinations": "Smoke probing",
+            "scoring recommendations...": "Scoring recommendations",
+            "plan-ready": "Plan ready",
+        }
+        return mapping.get(lowered, stage.replace("_", " ").replace("-", " ").title())
+
+    @staticmethod
+    def _preparation_stage_key_for(stage: str) -> str:
+        lowered = stage.lower()
+        if "discover" in lowered:
+            return "discovering"
+        if "analys" in lowered:
+            return "analysing"
+        if "benchmark" in lowered or "provisional profile" in lowered:
+            return "benchmarking"
+        if "smoke" in lowered:
+            return "smoke-probing risky container/profile combinations"
+        if "scoring" in lowered:
+            return "scoring recommendations..."
+        if "ready" in lowered:
+            return "plan-ready"
+        return lowered
+
+    def _preparation_timeline_text(self, active_stage: str) -> str:
+        stages = [
+            ("discovering", "Discovering"),
+            ("analysing", "Analysing"),
+            ("benchmarking", "Benchmarking"),
+            ("smoke-probing risky container/profile combinations", "Smoke probing"),
+            ("scoring recommendations...", "Scoring"),
+            ("plan-ready", "Plan ready"),
+        ]
+        current_index = next(
+            (idx for idx, (key, _label) in enumerate(stages) if key == active_stage),
+            0,
+        )
+        parts: list[str] = []
+        for idx, (_key, label) in enumerate(stages):
+            if idx < current_index:
+                prefix = "✓"
+            elif idx == current_index:
+                prefix = "▶"
+            else:
+                prefix = "○"
+            parts.append(f"{prefix} {label}")
+        return "  •  ".join(parts)
+
     def _refresh_compression_link_label(self) -> None:
         if self.organise_enabled.isChecked():
             self.link_compression_root.setText(
@@ -979,7 +1198,27 @@ class MainWindow(QMainWindow):
         self.elapsed_label.setText("Elapsed: —")
         self.eta_label.setText("ETA: —")
         self.run_stats_label.setText("Files: —")
+        self.savings_bar.setVisible(False)
+        self.stat_files_label.setText("—")
+        self.stat_saved_label.setText("—")
+        self.stat_pct_label.setText("—")
+        self.encode_card.setVisible(False)
+        self.encode_visual_bar.setValue(0)
+        self.encode_projection_bar.setValue(0)
+        self.encode_projection_bar.setFormat("Projected retained size")
+        self.encode_phase_label.setText("")
+        self.encode_counts_label.setText("")
+        self.encode_projection_label.setText("")
+        self._last_encode_log_key = (-1, "")
+        self._last_encode_bucket = -1
+        self._last_encode_file = ""
         self.prepare_elapsed_label.setText("")
+        self.prepare_stage_label.setText("Analysing files...")
+        self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
+        self._prepare_seen_files = 0
+        self._prepare_seen_bytes = 0
+        self._prepare_stage_key = "discovering"
         self._clear_warnings()
         self._set_current_action("Not started")
         self._complete_action("Nothing completed yet")
@@ -1094,6 +1333,13 @@ class MainWindow(QMainWindow):
         self.start_compress_button.setEnabled(can_start_compression)
         self.open_output_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
+
+        show_encode_dashboard = has_compression_plan and self.compress_stack.currentIndex() == 2
+        self.toggle_encode_card_button.setVisible(show_encode_dashboard)
+        if show_encode_dashboard:
+            self.encode_card.setVisible(not self.toggle_encode_card_button.isChecked())
+        else:
+            self.encode_card.setVisible(False)
 
         self.review_stack.setCurrentIndex(1 if has_controller else 0)
         if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
@@ -1225,23 +1471,33 @@ class MainWindow(QMainWindow):
         if self.encode_preparation is None:
             self.compress_summary_label.setText("No compression plan prepared.")
             return
-        savings = (
-            self.encode_preparation.selected_input_bytes
-            - self.encode_preparation.selected_estimated_output_bytes
-        )
+        prep = self.encode_preparation
+        savings = prep.selected_input_bytes - prep.selected_estimated_output_bytes
         lines = [
-            f"Compression Root: {self.encode_preparation.directory}",
-            f"Input:    {self._format_bytes(self.encode_preparation.selected_input_bytes)} across {self.encode_preparation.selected_count} file(s)",
-            f"Output:   {self._format_bytes(self.encode_preparation.selected_estimated_output_bytes)} estimated",
+            f"Compression Root: {prep.directory}",
+            f"Input:    {self._format_bytes(prep.selected_input_bytes)} across {prep.selected_count} file(s)",
+            f"Output:   {self._format_bytes(prep.selected_estimated_output_bytes)} estimated",
             f"Savings:  {self._format_bytes(savings)} expected",
-            f"Skipped:  {self.encode_preparation.skip_count} file(s)",
+            f"Plan:     {prep.recommended_count} recommended  |  {prep.maybe_count} maybe  |  {prep.skip_count} skipped",
         ]
-        if self.encode_preparation.profile is not None:
+        if prep.compatible_count or prep.incompatible_count:
+            lines.append(f"Compat:   {prep.compatible_count} compatible  |  {prep.incompatible_count} incompatible")
+        if prep.size_confidence or prep.time_confidence:
+            conf_parts = []
+            if prep.size_confidence:
+                conf_parts.append(f"size: {prep.size_confidence}")
+            if prep.time_confidence:
+                conf_parts.append(f"time: {prep.time_confidence}")
+            lines.append(f"Confidence: {', '.join(conf_parts)}")
+        if prep.grouped_incompatibilities:
+            top = sorted(prep.grouped_incompatibilities.items(), key=lambda x: -x[1])[:3]
+            lines.append("Incompatible codecs: " + ", ".join(f"{k}: {v}" for k, v in top))
+        if prep.profile is not None:
             lines.append(
-                f"Profile: {self.encode_preparation.profile.name} ({self.encode_preparation.profile.encoder_key}, CRF {self.encode_preparation.profile.crf})"
+                f"Profile: {prep.profile.name} ({prep.profile.encoder_key}, CRF {prep.profile.crf})"
             )
-        if self.encode_preparation.recommendation_reason:
-            lines.append(f"Reason: {self.encode_preparation.recommendation_reason}")
+        if prep.recommendation_reason:
+            lines.append(f"Reason: {prep.recommendation_reason}")
         self.compress_summary_label.setText("\n".join(lines))
 
     def _append_status(self, text: str) -> None:
@@ -1275,6 +1531,10 @@ class MainWindow(QMainWindow):
         if "compatibility check failed" in lowered:
             return "Installed plexify or mediashrink components are incompatible with this mediaflow build."
         return text
+
+    def _on_toggle_encode_card(self, checked: bool) -> None:
+        self.encode_card.setVisible(not checked)
+        self.toggle_encode_card_button.setText("Show live view" if checked else "Hide live view")
 
     def _open_output_folder(self) -> None:
         import sys
@@ -1315,8 +1575,16 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        lines = [self.summary_overview_label.text(), "", self.summary_log.toPlainText()]
-        Path(path).write_text("\n".join(lines), encoding="utf-8")
+        Path(path).write_text(self._build_summary_export_text(), encoding="utf-8")
+
+    def _build_summary_export_text(self) -> str:
+        sections = [
+            self.summary_headline_label.text().strip(),
+            self.summary_mode_label.text().strip(),
+            self.summary_overview_label.text().strip(),
+            self.summary_log.toPlainText().strip(),
+        ]
+        return "\n\n".join(section for section in sections if section)
 
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
@@ -1755,8 +2023,15 @@ class MainWindow(QMainWindow):
         self.compress_status_log.clear()
         self.compress_preparing_label.setText("Preparing a compression plan...")
         self.prepare_elapsed_label.setText("")
+        self.prepare_stage_label.setText("Discovering files...")
+        self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
+        self._prepare_seen_files = 0
+        self._prepare_seen_bytes = 0
+        self._prepare_stage_key = "discovering"
+        self._preparation_duration = None
         self.prepare_log.clear()
-        self.prepare_log.appendPlainText("Benchmarking encoders and scanning compression root...")
+        self.prepare_log.appendPlainText("Preparing compression plan...")
         self._set_current_action(f"Scanning compression root {config.compression_root}")
         self._set_state(WorkflowState.PREPARING_COMPRESSION)
         self._switch_tab("compress")
@@ -1767,24 +2042,50 @@ class MainWindow(QMainWindow):
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
     def _preparation_progress(self, payload: object) -> None:
-        if not isinstance(payload, tuple) or len(payload) != 3:
+        if isinstance(payload, PreparationStageUpdate):
+            self._prepare_stage_key = self._preparation_stage_key_for(payload.stage)
+            self.prepare_stage_label.setText(self._preparation_stage_title(payload.stage))
+            self.prepare_timeline_label.setText(self._preparation_timeline_text(self._prepare_stage_key))
+            self.compress_preparing_label.setText(payload.message)
+            self.prepare_log.appendPlainText(self._strip_rich(payload.message))
+            self._set_current_action(self._strip_rich(payload.message))
+            if payload.completed is not None and payload.total:
+                self.prepare_progress.setRange(0, 100)
+                self.prepare_progress.setValue(int((payload.completed / payload.total) * 100))
             return
-        progress = PreparationProgress(*payload)
-        completed, total, path = progress.completed, progress.total, progress.path
+        if not isinstance(payload, PreparationProgress):
+            return
+        completed, total, path = payload.completed, payload.total, payload.path
+        self._prepare_stage_key = "analysing"
+        self.prepare_stage_label.setText("Analysing files")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("analysing"))
         self.prepare_progress.setRange(0, 100)
         if total:
             self.prepare_progress.setValue(int((completed / total) * 100))
         file_name = Path(path).name
-        self.compress_preparing_label.setText(
-            f"Scanning compression root\nAnalysing {completed} of {total}: {file_name}"
+        if path:
+            try:
+                self._prepare_seen_bytes += Path(path).stat().st_size
+            except OSError:
+                pass
+        self._prepare_seen_files = max(self._prepare_seen_files, completed)
+        self.prepare_counts_label.setText(
+            f"{self._prepare_seen_files} file(s) discovered • {self._format_bytes(self._prepare_seen_bytes)}"
         )
+        self.compress_preparing_label.setText(f"Analysing {completed} of {total} file(s)")
         self._set_current_action(f"Analysing {completed}/{total}: {file_name}")
-        self._append_status(f"Analysed {completed}/{total}: {file_name}")
         self.prepare_log.appendPlainText(f"[{completed}/{total}] {file_name}")
+        if total and completed >= total:
+            self._prepare_stage_key = "benchmarking"
+            self.prepare_stage_label.setText("Benchmarking profiles")
+            self.prepare_timeline_label.setText(self._preparation_timeline_text("benchmarking"))
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self._preparation_timer.stop()
+        self._preparation_duration = time.monotonic() - self._preparation_start
         self.prepare_elapsed_label.setText("")
+        self.prepare_stage_label.setText("Plan ready.")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("plan-ready"))
         self.encode_preparation = preparation
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(100)
@@ -1806,7 +2107,9 @@ class MainWindow(QMainWindow):
         if preparation.stage_messages:
             for line in preparation.stage_messages:
                 self._append_status(line)
-                self.prepare_log.appendPlainText(self._strip_rich(line))
+                clean = self._strip_rich(line)
+                if clean not in self.prepare_log.toPlainText():
+                    self.prepare_log.appendPlainText(clean)
         if preparation.duplicate_warnings:
             for warning in preparation.duplicate_warnings[:10]:
                 self._record_warning(warning)
@@ -1815,6 +2118,7 @@ class MainWindow(QMainWindow):
         self._append_status(
             f"Prepared compression plan for {preparation.selected_count} file(s) from {preparation.directory}."
         )
+        self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
@@ -1850,6 +2154,92 @@ class MainWindow(QMainWindow):
                 cell.setToolTip(str(value))
                 self.compression_table.setItem(row, column, cell)
             self.compression_table.item(row, 0).setToolTip(str(item.source))
+
+    def _update_encode_dashboard(self, progress: EncodeProgress | None) -> None:
+        prep = self.encode_preparation
+        if prep is None:
+            self.encode_filename_label.setText("")
+            self.encode_phase_label.setText("")
+            self.encode_counts_label.setText("")
+            self.encode_projection_label.setText("")
+            self.encode_projection_bar.setValue(0)
+            self.encode_projection_bar.setFormat("Projected retained size")
+            return
+
+        profile_text = (
+            f"{prep.profile.name} ({prep.profile.encoder_key}, CRF {prep.profile.crf})"
+            if prep.profile is not None
+            else "No profile selected"
+        )
+        if progress is None:
+            filename = prep.jobs[0].source.name if prep.jobs else "Compression plan ready"
+            phase = "Ready to encode"
+            file_progress = 0.0
+            overall_progress = 0.0
+            completed = 0
+            remaining = len(prep.jobs)
+        else:
+            filename = self._strip_rich(progress.current_file)
+            phase = self._normalize_heartbeat_state(progress.heartbeat_state)
+            file_progress = progress.current_file_progress
+            overall_progress = progress.overall_progress
+            completed = progress.completed_files
+            remaining = progress.remaining_files
+
+        self.encode_filename_label.setText(filename)
+        self.encode_phase_label.setText(f"Phase: {phase} • Profile: {profile_text}")
+        self.encode_counts_label.setText(
+            f"Files done: {completed} • Remaining: {remaining} • Overall: {int(overall_progress * 100)}%"
+        )
+        self.encode_visual_bar.setValue(int(file_progress * 100))
+        self.encode_visual_bar.setFormat(f"Current file {int(file_progress * 100)}%")
+
+        if prep.selected_input_bytes > 0 and prep.selected_estimated_output_bytes > 0:
+            saved = prep.selected_input_bytes - prep.selected_estimated_output_bytes
+            retained_pct = int(100 * prep.selected_estimated_output_bytes / prep.selected_input_bytes)
+            self.encode_projection_label.setText(
+                f"Projected run size: {self._format_bytes(prep.selected_input_bytes)} → "
+                f"{self._format_bytes(prep.selected_estimated_output_bytes)} • "
+                f"save {self._format_bytes(saved)}"
+            )
+            self.encode_projection_bar.setValue(retained_pct)
+            self.encode_projection_bar.setFormat(
+                f"Projected retained size: {retained_pct}%"
+            )
+        else:
+            self.encode_projection_label.setText("Projected savings are unavailable for this plan.")
+            self.encode_projection_bar.setValue(0)
+            self.encode_projection_bar.setFormat("Projected retained size")
+
+    def _log_encode_milestones(self, progress: EncodeProgress) -> None:
+        total = progress.completed_files + progress.remaining_files
+        file_name = self._strip_rich(progress.current_file)
+        phase = self._normalize_heartbeat_state(progress.heartbeat_state)
+        bucket = self._progress_bucket(progress.current_file_progress)
+
+        if file_name != self._last_encode_file:
+            self._last_encode_file = file_name
+            self._last_encode_bucket = -1
+            self._append_status(f"Started encoding {file_name}.")
+
+        if phase != self._last_encode_log_key[1]:
+            self._append_status(f"{file_name}: {phase}.")
+
+        if bucket >= 0 and bucket != self._last_encode_bucket and bucket % 5 == 0:
+            self._last_encode_bucket = bucket
+            pct = min(100, bucket * 5)
+            if 0 < pct < 100:
+                self._append_status(f"{file_name} reached {pct}%.")
+
+        log_key = (progress.completed_files, phase)
+        if log_key != self._last_encode_log_key:
+            self._last_encode_log_key = log_key
+            self._append_status(
+                f"Progress update: {progress.completed_files} complete • {progress.remaining_files} remaining • phase {phase.lower()}."
+            )
+
+        if total and progress.completed_files >= total:
+            self._append_status("Compression complete.")
 
     def _start_compression(self) -> None:
         if self.encode_preparation is None:
@@ -1895,8 +2285,18 @@ class MainWindow(QMainWindow):
         self._append_status("Starting compression.")
         self._compression_start = time.monotonic()
         self._current_overall_progress = 0.0
+        self._last_encode_log_key = (-1, "")
+        self._last_encode_bucket = -1
+        self._last_encode_file = ""
+        self._first_progress_delay = None
         self.elapsed_label.setText("Elapsed: 0s")
         self.eta_label.setText("ETA: calculating...")
+        self.encode_speed_label.setText("")
+        self.encode_visual_bar.setValue(0)
+        self.encode_projection_bar.setValue(0)
+        self.encode_filename_label.setText("Starting...")
+        self.toggle_encode_card_button.setChecked(False)  # always show card on new run
+        self._update_encode_dashboard(None)
         self._compression_timer.start()
         worker = FunctionWorker(run_compression, self.encode_preparation)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
@@ -1904,18 +2304,20 @@ class MainWindow(QMainWindow):
     def _encode_progress(self, progress: object) -> None:
         if not isinstance(progress, EncodeProgress):
             return
+        if self._first_progress_delay is None and self._compression_start > 0:
+            self._first_progress_delay = time.monotonic() - self._compression_start
         self.file_progress.setValue(int(progress.current_file_progress * 100))
         self.overall_progress.setValue(int(progress.overall_progress * 100))
         self._current_overall_progress = progress.overall_progress
         total = progress.completed_files + progress.remaining_files
         self.run_stats_label.setText(f"Files: {progress.completed_files} done / {total} total")
         file_name = self._strip_rich(progress.current_file)
+        phase = self._normalize_heartbeat_state(progress.heartbeat_state)
         self._set_current_action(
-            f"{file_name}\nCompleted: {progress.completed_files}  |  Remaining: {progress.remaining_files}"
+            f"{file_name}\nCompleted: {progress.completed_files}  |  Remaining: {progress.remaining_files}  |  Phase: {phase}"
         )
-        self._append_status(
-            f"{file_name} | completed {progress.completed_files} | remaining {progress.remaining_files} | state {progress.heartbeat_state}"
-        )
+        self._update_encode_dashboard(progress)
+        self._log_encode_milestones(progress)
 
     def _compression_complete(self, results: list) -> None:
         self._compression_timer.stop()
@@ -1931,22 +2333,54 @@ class MainWindow(QMainWindow):
                 f"{missing_count} planned file(s) were missing when compression started. The compression root changed after planning."
             )
         self._append_status("Compression stage complete.")
+        self._update_encode_dashboard(None)
         self._refresh_pipeline_summary()
         self._switch_tab("summary")
         self._set_state(WorkflowState.COMPLETED)
         self._notify_completion("Compression complete", f"Encoded {len(self.encode_results)} file(s).")
 
     def _notify_completion(self, title: str, message: str) -> None:
-        if self._tray is not None and not self.isActiveWindow():
-            self._tray.showMessage(title, message, QSystemTrayIcon.Information, 5000)
+        if self.isActiveWindow() or not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            return
+        if self._tray is None:
+            self._tray = QSystemTrayIcon(icon, self)
+        if not self._tray.isVisible():
+            self._tray.show()
+        self._tray.showMessage(title, message, QSystemTrayIcon.Information, 5000)
+
+    def note_startup_complete(self, started_at: float) -> None:
+        self._startup_duration = max(0.0, time.monotonic() - started_at)
+
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def _tick_compression(self) -> None:
         elapsed = time.monotonic() - self._compression_start
         self.elapsed_label.setText(f"Elapsed: {self._format_elapsed(elapsed)}")
         p = self._current_overall_progress
+
+        # Animate spinner and update encode card
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
+        self.spinner_label.setText(self._SPINNER_FRAMES[self._spinner_idx])
+        self.encode_visual_bar.setValue(int(p * 100))
+
         if p > 0.02:
             eta = elapsed / p * (1 - p)
             self.eta_label.setText(f"ETA: {self._format_elapsed(eta)}")
+            # Estimate encode speed from known input size and progress
+            if self.encode_preparation and self.encode_preparation.selected_input_bytes > 0:
+                bytes_done = p * self.encode_preparation.selected_input_bytes
+                speed_mbs = bytes_done / max(elapsed, 0.1) / 1_048_576
+                self.encode_speed_label.setText(f"~{speed_mbs:.1f} MB/s")
+                self.encode_counts_label.setText(
+                    f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA {self._format_elapsed(eta)}"
+                )
+        else:
+            self.encode_counts_label.setText(
+                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)}"
+            )
 
     def _tick_preparation(self) -> None:
         elapsed = time.monotonic() - self._preparation_start
@@ -1966,6 +2400,7 @@ class MainWindow(QMainWindow):
         else:
             header = "Pipeline Summary"
 
+        self.summary_headline_label.setText(header)
         lines = [header, ""]
 
         if organise_on or self.apply_result is not None:
@@ -1990,10 +2425,20 @@ class MainWindow(QMainWindow):
 
         if compress_on:
             if self.overwrite.isChecked():
-                lines.append("Output mode:      in-place (originals replaced)")
+                output_mode = "in-place (originals replaced)"
             else:
-                lines.append("Output mode:      in-place (originals preserved)")
+                output_mode = "in-place (originals preserved)"
+            lines.append(f"Output mode:      {output_mode}")
             lines.append(f"Compression root: {self.compression_root_input.text().strip() or '(not set)'}")
+            self.summary_mode_label.setText(
+                f"Compression output mode: {output_mode} • Root: {self.compression_root_input.text().strip() or '(not set)'}"
+            )
+        elif organise_on:
+            self.summary_mode_label.setText(
+                f"Organised output is written to: {self.library_input.text().strip() or '(not set)'}"
+            )
+        else:
+            self.summary_mode_label.setText("")
 
         if organise_on:
             lines.append(f"Library:          {self.library_input.text().strip() or '(not set)'}")
@@ -2004,6 +2449,28 @@ class MainWindow(QMainWindow):
             lines.append(f"Organise apply report: {summary.organise_apply_report_path}")
 
         self.summary_overview_label.setText("\n".join(lines))
+
+        # Stat tiles
+        encoded = summary.encoded_files
+        self.stat_files_label.setText(f"{encoded}\nfile{'s' if encoded != 1 else ''} encoded")
+        if summary.bytes_saved > 0 and total_input > 0:
+            pct_val = int(100 * summary.bytes_saved / total_input)
+            self.stat_saved_label.setText(f"{self._format_bytes(summary.bytes_saved)}\nsaved")
+            self.stat_pct_label.setText(f"{pct_val}%\nreduction")
+        else:
+            self.stat_saved_label.setText("—\nsaved")
+            self.stat_pct_label.setText("—\nreduction")
+
+        # Savings bar
+        if total_input > 0 and summary.bytes_saved > 0:
+            pct = min(100, int(100 * summary.bytes_saved / total_input))
+            self.savings_bar.setValue(pct)
+            self.savings_bar.setFormat(
+                f"Space saved: {pct}%  ({self._format_bytes(summary.bytes_saved)} of {self._format_bytes(total_input)})"
+            )
+            self.savings_bar.setVisible(True)
+        else:
+            self.savings_bar.setVisible(False)
 
         # Per-file results table
         self.summary_table.setRowCount(0)
@@ -2078,4 +2545,13 @@ class MainWindow(QMainWindow):
             if any_success and self.overwrite.isChecked():
                 details.append("")
                 details.append("All encoded files replaced in-place. Originals no longer exist.")
+        timing_lines: list[str] = []
+        if self._startup_duration is not None:
+            timing_lines.append(f"Startup time: {self._format_elapsed(self._startup_duration)}")
+        if self._preparation_duration is not None:
+            timing_lines.append(f"Plan preparation time: {self._format_elapsed(self._preparation_duration)}")
+        if self._first_progress_delay is not None:
+            timing_lines.append(f"First encode progress update: {self._format_elapsed(self._first_progress_delay)}")
+        if timing_lines:
+            details.extend(["", "Timing", *timing_lines])
         self._set_summary_text("\n".join(details).strip())

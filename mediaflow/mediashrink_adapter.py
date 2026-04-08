@@ -13,9 +13,13 @@ from mediashrink.gui_api import (
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 
 from .config import PipelineConfig
+from .callback_types import PreparationProgress, PreparationStageUpdate
 
 
-def prepare_compression(config: PipelineConfig) -> EncodePreparation:
+def prepare_compression(
+    config: PipelineConfig,
+    progress_callback: Callable[[object], None] | None = None,
+) -> EncodePreparation:
     return prepare_encode_run(
         directory=config.compression_root,
         recursive=config.shrink.recursive,
@@ -25,6 +29,11 @@ def prepare_compression(config: PipelineConfig) -> EncodePreparation:
         on_file_failure=config.shrink.on_file_failure,
         use_calibration=config.shrink.use_calibration,
         duplicate_policy=config.shrink.duplicate_policy,
+        progress_callback=(
+            (lambda payload: progress_callback(_convert_preparation_payload(payload)))
+            if progress_callback is not None
+            else None
+        ),
     )
 
 
@@ -84,6 +93,20 @@ def _missing_result(job: EncodeJob) -> EncodeResult:
             )
         ],
     )
+
+
+def _convert_preparation_payload(payload: object) -> object:
+    if isinstance(payload, tuple) and len(payload) == 3:
+        return PreparationProgress(*payload)
+    if isinstance(payload, tuple) and len(payload) == 6 and payload[0] == "stage":
+        _, stage, message, completed, total, _path = payload
+        return PreparationStageUpdate(
+            stage=str(stage),
+            message=str(message),
+            completed=int(completed) if completed is not None else None,
+            total=int(total) if total is not None else None,
+        )
+    return payload
 
 
 __all__ = [

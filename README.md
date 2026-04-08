@@ -40,6 +40,17 @@ Runtime diagnostics:
 mediaflow doctor --source /path/to/incoming --library /path/to/library --compression-root /path/to/compress
 ```
 
+## Packaging
+
+For Windows test builds, the project already includes `PyInstaller` in the `dev` extra:
+
+```bash
+pip install -e .[dev]
+pyinstaller --noconfirm --windowed --name mediaflow mediaflow/cli.py
+```
+
+The current GUI also records startup, plan-preparation, and first-progress timings so packaged builds can be compared against editable runs.
+
 ## Notes
 
 - `PySide6` is required to launch the desktop window.

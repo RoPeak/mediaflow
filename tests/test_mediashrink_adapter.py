@@ -7,7 +7,12 @@ from unittest.mock import patch
 from mediashrink.gui_api import EncodePreparation
 from mediashrink.models import EncodeJob
 
-from mediaflow.mediashrink_adapter import missing_job_sources, run_compression
+from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
+from mediaflow.mediashrink_adapter import (
+    _convert_preparation_payload,
+    missing_job_sources,
+    run_compression,
+)
 
 
 def _job(tmp_path: Path, name: str) -> EncodeJob:
@@ -76,3 +81,22 @@ def test_run_compression_returns_missing_result_without_crashing(tmp_path: Path)
     missing_result = next(result for result in results if result.job.source == missing.source)
     assert missing_result.success is False
     assert "missing" in (missing_result.error_message or "").lower()
+
+
+def test_convert_preparation_payload_maps_stage_updates() -> None:
+    payload = ("stage", "benchmarking", "Benchmarking profiles...", 1, 3, "")
+
+    converted = _convert_preparation_payload(payload)
+
+    assert isinstance(converted, PreparationStageUpdate)
+    assert converted.stage == "benchmarking"
+    assert converted.completed == 1
+
+
+def test_convert_preparation_payload_maps_analysis_updates(tmp_path: Path) -> None:
+    payload = (1, 2, str(tmp_path / "movie.mkv"))
+
+    converted = _convert_preparation_payload(payload)
+
+    assert isinstance(converted, PreparationProgress)
+    assert converted.completed == 1
