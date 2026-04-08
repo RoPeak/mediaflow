@@ -73,4 +73,4 @@ def should_run_mediashrink(config: PipelineConfig) -> bool:
 
 
 def target_compression_root(config: PipelineConfig) -> str:
-    return str(config.library)
+    return str(config.compression_root)

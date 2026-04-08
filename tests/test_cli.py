@@ -34,10 +34,14 @@ def test_cli_forwards_optional_paths_to_launch(tmp_path: Path) -> None:
 
 
 def test_doctor_reports_success_when_runtime_compatibility_passes() -> None:
-    with patch("mediaflow.cli.check_runtime_compatibility", return_value=[]):
+    with patch("mediaflow.cli.check_runtime_compatibility", return_value=[]), patch(
+        "mediaflow.cli.prepare_tools",
+        return_value=(Path("/ffmpeg"), Path("/ffprobe")),
+    ):
         result = runner.invoke(app, ["doctor"])
 
     assert result.exit_code == 0
+    assert "FFmpeg:" in result.stdout
     assert "Runtime compatibility check passed." in result.stdout
 
 
@@ -46,8 +50,26 @@ def test_doctor_reports_failures_when_runtime_compatibility_fails() -> None:
     with patch("mediaflow.cli.check_runtime_compatibility", return_value=issues), patch(
         "mediaflow.cli.compatibility_error_text",
         return_value="Runtime compatibility check failed:\n- plexify: mismatch",
+    ), patch(
+        "mediaflow.cli.prepare_tools",
+        side_effect=RuntimeError("ffmpeg missing"),
     ):
         result = runner.invoke(app, ["doctor"])
 
     assert result.exit_code == 1
     assert "plexify: mismatch" in result.stdout
+    assert "ffmpeg missing" in result.stdout
+
+
+def test_doctor_reports_missing_paths_when_requested(tmp_path: Path) -> None:
+    with patch("mediaflow.cli.check_runtime_compatibility", return_value=[]), patch(
+        "mediaflow.cli.prepare_tools",
+        return_value=(Path("/ffmpeg"), Path("/ffprobe")),
+    ):
+        result = runner.invoke(
+            app,
+            ["doctor", "--compression-root", str(tmp_path / "missing-root")],
+        )
+
+    assert result.exit_code == 1
+    assert "Compression Root does not exist" in result.stdout

@@ -4,7 +4,7 @@ Practical desktop GUI for running `plexify` and `mediashrink` as one video workf
 
 ## Current scope
 
-- configure source and library folders
+- configure source, library/output, and compression root folders
 - review and apply plexify organisation
 - prepare and run mediashrink compression
 - inspect plain progress and summary output
@@ -34,8 +34,16 @@ Optional defaults:
 mediaflow --source /path/to/incoming --library /path/to/library
 ```
 
+Runtime diagnostics:
+
+```bash
+mediaflow doctor --source /path/to/incoming --library /path/to/library --compression-root /path/to/compress
+```
+
 ## Notes
 
 - `PySide6` is required to launch the desktop window.
 - FFmpeg and ffprobe must be available for the compression stage.
-- `Run Full Pipeline` scans, auto-accepts high-confidence matches, previews the organisation stage, then continues into compression once the organise stage is applied.
+- `Library / Output Folder` is where organised files are written by `plexify`.
+- `Compression Root` defaults to the library/output folder, but you can point compression at a different folder if needed.
+- `Start Guided Pipeline` scans, auto-accepts high-confidence matches, previews the organisation stage, then continues into compression once the organise stage is applied.

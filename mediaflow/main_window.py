@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool, Qt
+from PySide6.QtCore import QThreadPool
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -17,15 +19,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QPushButton,
     QHeaderView,
-    QScrollArea,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QToolBox,
     QVBoxLayout,
     QWidget,
 )
@@ -35,7 +36,7 @@ from plexify.ui_controller import ApplyResultState, PreviewState, VideoUIControl
 
 from .compat import check_runtime_compatibility, compatibility_error_text
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
-from .mediashrink_adapter import prepare_compression, run_compression
+from .mediashrink_adapter import missing_job_sources, prepare_compression, run_compression
 from .pipeline import build_pipeline_summary
 from .plexify_adapter import build_preview, build_video_controller, scan_controller
 from .settings import load_ui_state, save_ui_state
@@ -47,7 +48,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *, default_source: Path | None = None, default_library: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("mediaflow")
-        self.resize(1480, 940)
+        self.resize(1420, 920)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.workflow_state = WorkflowState.SETUP
@@ -65,9 +66,14 @@ class MainWindow(QMainWindow):
         self._config_dirty = False
         self._shutting_down = False
         self._compatibility_checked = False
+        self._compression_root_linked = True
+        self._current_action = "Not started"
+        self._last_completed_action = "Nothing completed yet"
+        self._custom_warnings: list[str] = []
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
+        self._apply_styles()
         self._connect_signals()
         self._restore_ui_state(default_source=default_source, default_library=default_library)
         self._loading_state = False
@@ -75,20 +81,23 @@ class MainWindow(QMainWindow):
 
     def _build_widgets(self, *, default_source: Path | None, default_library: Path | None) -> None:
         self.step_label = QLabel()
-        self.step_label.setObjectName("step-label")
         self.headline_label = QLabel()
         self.headline_label.setWordWrap(True)
         self.guidance_label = QLabel()
         self.guidance_label.setWordWrap(True)
-        self.guidance_label.setObjectName("guidance-label")
         self.warning_label = QLabel()
         self.warning_label.setWordWrap(True)
-        self.warning_label.setObjectName("warning-label")
+        self.step_checklist_label = QLabel()
+        self.step_checklist_label.setWordWrap(True)
 
         self.tabs = QTabWidget()
 
         self.source_input = QLineEdit(str(default_source) if default_source else "")
         self.library_input = QLineEdit(str(default_library) if default_library else "")
+        self.compression_root_input = QLineEdit(str(default_library) if default_library else "")
+        self.link_compression_root = QCheckBox("Use the library / output folder as the compression root")
+        self.link_compression_root.setChecked(True)
+
         self.organise_enabled = QCheckBox("Enable organise stage")
         self.organise_enabled.setChecked(True)
         self.compress_enabled = QCheckBox("Enable compress stage")
@@ -111,7 +120,7 @@ class MainWindow(QMainWindow):
 
         self.overwrite = QCheckBox("Overwrite originals after successful encode")
         self.overwrite.setChecked(True)
-        self.recursive = QCheckBox("Scan library recursively")
+        self.recursive = QCheckBox("Scan compression root recursively")
         self.recursive.setChecked(True)
         self.no_skip = QCheckBox("Encode files even if already HEVC")
         self.policy = QComboBox()
@@ -125,15 +134,26 @@ class MainWindow(QMainWindow):
         self.duplicate_policy = QComboBox()
         self.duplicate_policy.addItems(["prefer-mkv", "all", "skip-title"])
 
+        self.show_organise_advanced_button = QPushButton("Show organise options")
+        self.show_organise_advanced_button.setCheckable(True)
+        self.show_compress_advanced_button = QPushButton("Show compression options")
+        self.show_compress_advanced_button.setCheckable(True)
+        self.organise_advanced_panel = self._build_organise_settings_page()
+        self.organise_advanced_panel.setVisible(False)
+        self.compress_advanced_panel = self._build_compress_settings_page()
+        self.compress_advanced_panel.setVisible(False)
+
         self.setup_summary_label = QLabel()
         self.setup_summary_label.setWordWrap(True)
         self.setup_hint_label = QLabel()
         self.setup_hint_label.setWordWrap(True)
         self.overwrite_warning_label = QLabel()
         self.overwrite_warning_label.setWordWrap(True)
+        self.next_action_label = QLabel()
+        self.next_action_label.setWordWrap(True)
 
-        self.scan_button = QPushButton("Start Organise Review")
         self.guided_button = QPushButton("Start Guided Pipeline")
+        self.scan_button = QPushButton("Review Organise Matches")
         self.prepare_compress_button = QPushButton("Prepare Compression Plan")
         self.reset_button = QPushButton("Reset Runtime State")
 
@@ -141,6 +161,9 @@ class MainWindow(QMainWindow):
         self.review_summary_label.setWordWrap(True)
         self.review_hint_label = QLabel()
         self.review_hint_label.setWordWrap(True)
+        self.review_placeholder_label = QLabel()
+        self.review_placeholder_label.setWordWrap(True)
+        self.review_stack = QStackedWidget()
         self.review_table = QTableWidget(0, 7)
         self.review_table.setHorizontalHeaderLabels(
             ["Source", "Type", "Title", "Season/Episode", "Selected", "Status", "Warning"]
@@ -162,14 +185,14 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search query or manual title")
 
-        self.prev_item_button = QPushButton("Prev")
+        self.prev_item_button = QPushButton("Previous")
         self.next_item_button = QPushButton("Next")
         self.accept_button = QPushButton("Accept")
         self.skip_button = QPushButton("Skip")
         self.search_button = QPushButton("Search Again")
         self.manual_button = QPushButton("Manual Match")
         self.next_page_button = QPushButton("More Candidates")
-        self.auto_accept_button = QPushButton("Auto-Accept Safe")
+        self.auto_accept_button = QPushButton("Auto-Accept Safe Matches")
         self.switch_button = QPushButton("Switch TV/Movie")
         self.folder_button = QPushButton("Apply To Folder")
         self.title_group_button = QPushButton("Apply To Title Group")
@@ -180,9 +203,23 @@ class MainWindow(QMainWindow):
         self.compress_summary_label.setWordWrap(True)
         self.compress_hint_label = QLabel()
         self.compress_hint_label.setWordWrap(True)
+        self.compress_stack = QStackedWidget()
+        self.compress_empty_label = QLabel()
+        self.compress_empty_label.setWordWrap(True)
+        self.compress_preparing_label = QLabel("Preparing a compression plan...")
+        self.compress_preparing_label.setWordWrap(True)
         self.prepare_progress = QProgressBar()
         self.file_progress = QProgressBar()
         self.overall_progress = QProgressBar()
+        self.start_compress_button = QPushButton("Start Compression")
+        self.current_action_label = QLabel()
+        self.current_action_label.setWordWrap(True)
+        self.last_completed_label = QLabel()
+        self.last_completed_label.setWordWrap(True)
+        self.runtime_warnings_label = QLabel()
+        self.runtime_warnings_label.setWordWrap(True)
+        self.toggle_details_button = QPushButton("Show Details")
+        self.toggle_details_button.setCheckable(True)
         self.compression_table = QTableWidget(0, 7)
         self.compression_table.setHorizontalHeaderLabels(
             ["File", "Codec", "Recommendation", "Reason", "Est. Output", "Est. Saving", "Selected"]
@@ -191,10 +228,10 @@ class MainWindow(QMainWindow):
         self.compression_table.setSelectionMode(QTableWidget.NoSelection)
         self.compression_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.compression_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.start_compress_button = QPushButton("Start Compression")
         self.compress_status_log = QPlainTextEdit()
         self.compress_status_log.setReadOnly(True)
-        self.compress_status_log.document().setMaximumBlockCount(200)
+        self.compress_status_log.document().setMaximumBlockCount(300)
+        self.compress_status_log.setVisible(False)
 
         self.summary_overview_label = QLabel()
         self.summary_overview_label.setWordWrap(True)
@@ -205,15 +242,17 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
         banner = QGroupBox("Current Step")
         banner_layout = QVBoxLayout(banner)
+        banner_layout.setSpacing(6)
         banner_layout.addWidget(self.step_label)
         banner_layout.addWidget(self.headline_label)
         banner_layout.addWidget(self.guidance_label)
         banner_layout.addWidget(self.warning_label)
+        banner_layout.addWidget(self.step_checklist_label)
         layout.addWidget(banner)
 
         self.tabs.addTab(self._build_setup_tab(), "Setup")
@@ -222,54 +261,147 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_summary_tab(), "Summary")
         layout.addWidget(self.tabs, stretch=1)
 
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget { font-size: 13px; }
+            QMainWindow, QWidget { background: #1e1f22; color: #f2f2f2; }
+            QGroupBox {
+                border: 1px solid #555;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding: 12px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+                color: #f5f5f5;
+            }
+            QLabel#helper-label {
+                color: #b7bcc4;
+                font-size: 12px;
+            }
+            QLabel#step-label {
+                font-size: 18px;
+                font-weight: 700;
+                color: #ffffff;
+            }
+            QLabel#headline-label {
+                font-size: 15px;
+                font-weight: 600;
+                color: #f5f5f5;
+            }
+            QLabel#muted-label {
+                color: #c5cad1;
+            }
+            QLabel#warning-label {
+                color: #ffcf99;
+            }
+            QLineEdit, QComboBox, QPlainTextEdit, QTableWidget, QDoubleSpinBox {
+                background: #2a2d31;
+                border: 1px solid #4c5158;
+                border-radius: 6px;
+                padding: 6px;
+            }
+            QPushButton {
+                background: #343840;
+                border: 1px solid #555c66;
+                border-radius: 6px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover { background: #3c424c; }
+            QPushButton:disabled { color: #838993; background: #2a2d31; }
+            QPushButton#primary-button {
+                background: #3267c8;
+                border-color: #4f86ea;
+                font-weight: 700;
+            }
+            QPushButton#primary-button:hover { background: #3d73d5; }
+            QCheckBox, QRadioButton { spacing: 8px; }
+            QTabBar::tab {
+                background: #2a2d31;
+                padding: 8px 14px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected { background: #353940; }
+            """
+        )
+        self.step_label.setObjectName("step-label")
+        self.headline_label.setObjectName("headline-label")
+        self.guidance_label.setObjectName("muted-label")
+        self.warning_label.setObjectName("warning-label")
+        self.next_action_label.setObjectName("muted-label")
+        self.setup_hint_label.setObjectName("muted-label")
+        self.review_hint_label.setObjectName("muted-label")
+        self.compress_hint_label.setObjectName("muted-label")
+        self.guided_button.setObjectName("primary-button")
+
     def _build_setup_tab(self) -> QWidget:
         panel = QWidget()
-        outer = QVBoxLayout(panel)
-        outer.setSpacing(12)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        outer.addWidget(scroll)
-
-        content = QWidget()
-        scroll.setWidget(content)
-        layout = QVBoxLayout(content)
+        layout = QVBoxLayout(panel)
         layout.setSpacing(12)
 
-        path_group = QGroupBox("Paths")
-        path_form = QGridLayout(path_group)
-        path_form.setHorizontalSpacing(10)
+        path_group = QGroupBox("Folders")
+        path_layout = QGridLayout(path_group)
+        path_layout.setVerticalSpacing(8)
         source_browse = QPushButton("Browse")
-        library_browse = QPushButton("Browse")
         source_browse.clicked.connect(lambda: self._browse_into(self.source_input))
+        library_browse = QPushButton("Browse")
         library_browse.clicked.connect(lambda: self._browse_into(self.library_input))
-        path_form.addWidget(QLabel("Source"), 0, 0)
-        path_form.addWidget(self.source_input, 0, 1)
-        path_form.addWidget(source_browse, 0, 2)
-        path_form.addWidget(QLabel("Library"), 1, 0)
-        path_form.addWidget(self.library_input, 1, 1)
-        path_form.addWidget(library_browse, 1, 2)
+        compression_browse = QPushButton("Browse")
+        compression_browse.clicked.connect(lambda: self._browse_into(self.compression_root_input))
+        source_help = QLabel("Incoming folder scanned by plexify for new media.")
+        source_help.setObjectName("helper-label")
+        library_help = QLabel("Organised output is written here by the organise stage.")
+        library_help.setObjectName("helper-label")
+        compression_help = QLabel("Mediashrink scans and encodes files from this folder.")
+        compression_help.setObjectName("helper-label")
+        path_layout.addWidget(QLabel("Source"), 0, 0)
+        path_layout.addWidget(self.source_input, 0, 1)
+        path_layout.addWidget(source_browse, 0, 2)
+        path_layout.addWidget(source_help, 1, 1, 1, 2)
+        path_layout.addWidget(QLabel("Library / Output Folder"), 2, 0)
+        path_layout.addWidget(self.library_input, 2, 1)
+        path_layout.addWidget(library_browse, 2, 2)
+        path_layout.addWidget(library_help, 3, 1, 1, 2)
+        path_layout.addWidget(QLabel("Compression Root"), 4, 0)
+        path_layout.addWidget(self.compression_root_input, 4, 1)
+        path_layout.addWidget(compression_browse, 4, 2)
+        path_layout.addWidget(self.link_compression_root, 5, 1, 1, 2)
+        path_layout.addWidget(compression_help, 6, 1, 1, 2)
         layout.addWidget(path_group)
 
-        stage_group = QGroupBox("Stages")
+        stage_group = QGroupBox("Pipeline Mode")
         stage_layout = QVBoxLayout(stage_group)
         stage_layout.addWidget(self.organise_enabled)
         stage_layout.addWidget(self.compress_enabled)
+        stage_layout.addWidget(self.next_action_label)
         layout.addWidget(stage_group)
 
-        advanced = QToolBox()
-        advanced.addItem(self._build_organise_settings_page(), "Advanced Organise Settings")
-        advanced.addItem(self._build_compress_settings_page(), "Advanced Compression Settings")
-        layout.addWidget(advanced)
+        organise_group = QGroupBox("Organise Options")
+        organise_layout = QVBoxLayout(organise_group)
+        organise_layout.addWidget(self.show_organise_advanced_button)
+        organise_layout.addWidget(self.organise_advanced_panel)
+        layout.addWidget(organise_group)
+
+        compress_group = QGroupBox("Compression Options")
+        compress_layout = QVBoxLayout(compress_group)
+        compress_layout.addWidget(self.show_compress_advanced_button)
+        compress_layout.addWidget(self.compress_advanced_panel)
+        layout.addWidget(compress_group)
 
         action_group = QGroupBox("Actions")
         action_layout = QVBoxLayout(action_group)
-        primary_row = QHBoxLayout()
-        primary_row.addWidget(self.guided_button)
-        primary_row.addWidget(self.scan_button)
-        primary_row.addWidget(self.prepare_compress_button)
-        primary_row.addWidget(self.reset_button)
-        action_layout.addLayout(primary_row)
+        row = QHBoxLayout()
+        row.addWidget(self.guided_button)
+        row.addWidget(self.scan_button)
+        row.addWidget(self.prepare_compress_button)
+        row.addWidget(self.reset_button)
+        action_layout.addLayout(row)
         action_layout.addWidget(self.setup_summary_label)
         action_layout.addWidget(self.setup_hint_label)
         action_layout.addWidget(self.overwrite_warning_label)
@@ -308,16 +440,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.review_summary_label)
         layout.addWidget(self.review_hint_label)
 
-        layout.addWidget(QLabel("Discovered Items"))
-        layout.addWidget(self.review_table, stretch=2)
-        layout.addWidget(QLabel("Candidate Matches"))
-        layout.addWidget(self.candidate_table, stretch=1)
+        placeholder = QWidget()
+        placeholder_layout = QVBoxLayout(placeholder)
+        placeholder_layout.addStretch(1)
+        placeholder_layout.addWidget(self.review_placeholder_label)
+        placeholder_layout.addStretch(1)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setSpacing(10)
+        content_layout.addWidget(QLabel("Discovered Items"))
+        content_layout.addWidget(self.review_table, stretch=2)
+        content_layout.addWidget(QLabel("Candidate Matches"))
+        content_layout.addWidget(self.candidate_table, stretch=1)
 
         search_row = QHBoxLayout()
         search_row.addWidget(self.search_input)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.manual_button)
-        layout.addLayout(search_row)
+        content_layout.addLayout(search_row)
 
         action_row = QHBoxLayout()
         for button in [
@@ -332,12 +473,12 @@ class MainWindow(QMainWindow):
             self.title_group_button,
         ]:
             action_row.addWidget(button)
-        layout.addLayout(action_row)
+        content_layout.addLayout(action_row)
 
         footer_row = QHBoxLayout()
         footer_row.addWidget(self.preview_button)
         footer_row.addWidget(self.apply_button)
-        layout.addLayout(footer_row)
+        content_layout.addLayout(footer_row)
 
         detail_row = QHBoxLayout()
         detail_group = QGroupBox("Selected Item Details")
@@ -348,7 +489,11 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.preview_log)
         detail_row.addWidget(detail_group, stretch=1)
         detail_row.addWidget(preview_group, stretch=1)
-        layout.addLayout(detail_row, stretch=1)
+        content_layout.addLayout(detail_row, stretch=1)
+
+        self.review_stack.addWidget(placeholder)
+        self.review_stack.addWidget(content)
+        layout.addWidget(self.review_stack, stretch=1)
         return panel
 
     def _build_compress_tab(self) -> QWidget:
@@ -357,17 +502,44 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.addWidget(self.compress_summary_label)
         layout.addWidget(self.compress_hint_label)
-        layout.addWidget(self.start_compress_button)
-        layout.addWidget(QLabel("Preparation progress"))
-        layout.addWidget(self.prepare_progress)
-        layout.addWidget(QLabel("Current file"))
-        layout.addWidget(self.file_progress)
-        layout.addWidget(QLabel("Overall encode progress"))
-        layout.addWidget(self.overall_progress)
-        layout.addWidget(QLabel("Compression Plan"))
-        layout.addWidget(self.compression_table, stretch=2)
-        layout.addWidget(QLabel("Compression Status"))
-        layout.addWidget(self.compress_status_log, stretch=1)
+
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.addStretch(1)
+        empty_layout.addWidget(self.compress_empty_label)
+        empty_layout.addStretch(1)
+
+        preparing_page = QWidget()
+        preparing_layout = QVBoxLayout(preparing_page)
+        preparing_layout.addWidget(self.compress_preparing_label)
+        preparing_layout.addWidget(self.prepare_progress)
+        preparing_layout.addStretch(1)
+
+        ready_page = QWidget()
+        ready_layout = QVBoxLayout(ready_page)
+        status_group = QGroupBox("Run Status")
+        status_layout = QVBoxLayout(status_group)
+        status_layout.addWidget(QLabel("Current action"))
+        status_layout.addWidget(self.current_action_label)
+        status_layout.addWidget(QLabel("Last completed"))
+        status_layout.addWidget(self.last_completed_label)
+        status_layout.addWidget(QLabel("Warnings"))
+        status_layout.addWidget(self.runtime_warnings_label)
+        ready_layout.addWidget(status_group)
+        ready_layout.addWidget(self.start_compress_button)
+        ready_layout.addWidget(QLabel("Current file progress"))
+        ready_layout.addWidget(self.file_progress)
+        ready_layout.addWidget(QLabel("Overall encode progress"))
+        ready_layout.addWidget(self.overall_progress)
+        ready_layout.addWidget(QLabel("Compression Plan"))
+        ready_layout.addWidget(self.compression_table, stretch=1)
+        ready_layout.addWidget(self.toggle_details_button)
+        ready_layout.addWidget(self.compress_status_log, stretch=1)
+
+        self.compress_stack.addWidget(empty_page)
+        self.compress_stack.addWidget(preparing_page)
+        self.compress_stack.addWidget(ready_page)
+        layout.addWidget(self.compress_stack, stretch=1)
         return panel
 
     def _build_summary_tab(self) -> QWidget:
@@ -378,29 +550,37 @@ class MainWindow(QMainWindow):
         return panel
 
     def _connect_signals(self) -> None:
-        self.organise_enabled.toggled.connect(self._on_config_edited)
-        self.compress_enabled.toggled.connect(self._on_config_edited)
-        self.apply_mode.toggled.connect(self._on_config_edited)
-        self.copy_mode.toggled.connect(self._on_config_edited)
-        self.use_cache.toggled.connect(self._on_config_edited)
-        self.offline.toggled.connect(self._on_config_edited)
-        self.overwrite.toggled.connect(self._on_config_edited)
-        self.recursive.toggled.connect(self._on_config_edited)
-        self.no_skip.toggled.connect(self._on_config_edited)
-        self.use_calibration.toggled.connect(self._on_config_edited)
-        self.min_confidence.valueChanged.connect(self._on_config_edited)
-        self.source_input.textChanged.connect(self._on_config_edited)
-        self.library_input.textChanged.connect(self._on_config_edited)
-        self.extensions_input.textChanged.connect(self._on_config_edited)
-        self.conflict_mode.currentTextChanged.connect(self._on_config_edited)
-        self.policy.currentTextChanged.connect(self._on_config_edited)
-        self.on_file_failure.currentTextChanged.connect(self._on_config_edited)
-        self.duplicate_policy.currentTextChanged.connect(self._on_config_edited)
+        for signal in [
+            self.organise_enabled.toggled,
+            self.compress_enabled.toggled,
+            self.apply_mode.toggled,
+            self.copy_mode.toggled,
+            self.use_cache.toggled,
+            self.offline.toggled,
+            self.overwrite.toggled,
+            self.recursive.toggled,
+            self.no_skip.toggled,
+            self.use_calibration.toggled,
+            self.min_confidence.valueChanged,
+            self.source_input.textChanged,
+            self.extensions_input.textChanged,
+            self.conflict_mode.currentTextChanged,
+            self.policy.currentTextChanged,
+            self.on_file_failure.currentTextChanged,
+            self.duplicate_policy.currentTextChanged,
+        ]:
+            signal.connect(self._on_config_edited)
 
-        self.scan_button.clicked.connect(self._start_scan)
+        self.library_input.textChanged.connect(self._library_path_changed)
+        self.compression_root_input.textEdited.connect(self._compression_root_manually_edited)
+        self.link_compression_root.toggled.connect(self._compression_root_link_toggled)
+        self.show_organise_advanced_button.toggled.connect(self.organise_advanced_panel.setVisible)
+        self.show_compress_advanced_button.toggled.connect(self.compress_advanced_panel.setVisible)
         self.guided_button.clicked.connect(self._start_guided_pipeline)
+        self.scan_button.clicked.connect(self._start_scan)
         self.prepare_compress_button.clicked.connect(self._prepare_compression_from_setup)
         self.reset_button.clicked.connect(lambda: self._reset_runtime_state("Cleared runtime state."))
+        self.toggle_details_button.toggled.connect(self._toggle_details)
 
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
@@ -417,7 +597,6 @@ class MainWindow(QMainWindow):
         self.title_group_button.clicked.connect(self._apply_choice_to_title_group)
         self.preview_button.clicked.connect(self._preview_plan)
         self.apply_button.clicked.connect(self._apply_plan)
-
         self.start_compress_button.clicked.connect(self._start_compression)
 
     def _restore_ui_state(
@@ -431,6 +610,13 @@ class MainWindow(QMainWindow):
             self.source_input.setText(saved["source"])
         if default_library is None and isinstance(saved.get("library"), str):
             self.library_input.setText(saved["library"])
+        if isinstance(saved.get("compression_root_linked"), bool):
+            self._compression_root_linked = saved["compression_root_linked"]
+            self.link_compression_root.setChecked(self._compression_root_linked)
+        if isinstance(saved.get("compression_root"), str) and not self._compression_root_linked:
+            self.compression_root_input.setText(saved["compression_root"])
+        elif self._compression_root_linked:
+            self.compression_root_input.setText(self.library_input.text())
         if isinstance(saved.get("organise_enabled"), bool):
             self.organise_enabled.setChecked(saved["organise_enabled"])
         if isinstance(saved.get("compress_enabled"), bool):
@@ -473,6 +659,8 @@ class MainWindow(QMainWindow):
         return {
             "source": self.source_input.text().strip(),
             "library": self.library_input.text().strip(),
+            "compression_root": self.compression_root_input.text().strip(),
+            "compression_root_linked": self.link_compression_root.isChecked(),
             "organise_enabled": self.organise_enabled.isChecked(),
             "compress_enabled": self.compress_enabled.isChecked(),
             "apply_mode": self.apply_mode.isChecked(),
@@ -516,10 +704,41 @@ class MainWindow(QMainWindow):
         if selected:
             target.setText(selected)
 
+    def _library_path_changed(self, text: str) -> None:
+        if self._compression_root_linked:
+            self.compression_root_input.blockSignals(True)
+            self.compression_root_input.setText(text)
+            self.compression_root_input.blockSignals(False)
+        self._on_config_edited()
+
+    def _compression_root_link_toggled(self, checked: bool) -> None:
+        self._compression_root_linked = checked
+        if checked:
+            self.compression_root_input.blockSignals(True)
+            self.compression_root_input.setText(self.library_input.text())
+            self.compression_root_input.blockSignals(False)
+        self._on_config_edited()
+
+    def _compression_root_manually_edited(self, text: str) -> None:
+        if self._compression_root_linked and text.strip() != self.library_input.text().strip():
+            self.link_compression_root.setChecked(False)
+            self._compression_root_linked = False
+        self._on_config_edited()
+
+    def _toggle_details(self, checked: bool) -> None:
+        self.compress_status_log.setVisible(checked)
+        self.toggle_details_button.setText("Hide Details" if checked else "Show Details")
+
     def _on_config_edited(self, *_args) -> None:
         if self._loading_state:
             return
-        if self.controller is not None or self.preview_state is not None or self.apply_result is not None or self.encode_preparation is not None or self.encode_results:
+        if (
+            self.controller is not None
+            or self.preview_state is not None
+            or self.apply_result is not None
+            or self.encode_preparation is not None
+            or self.encode_results
+        ):
             self._config_dirty = True
         self._set_state(self.workflow_state)
 
@@ -527,6 +746,7 @@ class MainWindow(QMainWindow):
         return build_pipeline_config(
             source=self.source_input.text().strip(),
             library=self.library_input.text().strip(),
+            compression_root=self.compression_root_input.text().strip(),
             plexify=PlexifySettings(
                 enabled=self.organise_enabled.isChecked(),
                 apply=self.apply_mode.isChecked(),
@@ -554,11 +774,25 @@ class MainWindow(QMainWindow):
             return True
         issues = check_runtime_compatibility()
         if issues:
-            self._set_state(WorkflowState.FAILED)
             self._show_error(compatibility_error_text(issues))
             return False
         self._compatibility_checked = True
         return True
+
+    def _clear_warnings(self) -> None:
+        self._custom_warnings.clear()
+
+    def _record_warning(self, text: str) -> None:
+        if text not in self._custom_warnings:
+            self._custom_warnings.append(text)
+
+    def _set_current_action(self, text: str) -> None:
+        self._current_action = text
+        self.current_action_label.setText(text)
+
+    def _complete_action(self, text: str) -> None:
+        self._last_completed_action = text
+        self.last_completed_label.setText(text)
 
     def _reset_runtime_state(self, status_message: str | None = None) -> None:
         self.controller = None
@@ -574,17 +808,19 @@ class MainWindow(QMainWindow):
         self.compression_table.setRowCount(0)
         self.details_log.clear()
         self.preview_log.clear()
-        self.compress_status_log.clear()
         self.summary_log.clear()
+        self.compress_status_log.clear()
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(0)
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
-        self._update_review_summary()
-        self._update_compress_summary()
+        self._clear_warnings()
+        self._set_current_action("Not started")
+        self._complete_action("Nothing completed yet")
         self._refresh_pipeline_summary()
         if status_message:
             self._append_status(status_message)
+            self._complete_action(status_message)
         self._set_state(WorkflowState.SETUP)
 
     def _set_state(self, state: WorkflowState) -> None:
@@ -593,17 +829,30 @@ class MainWindow(QMainWindow):
         self.step_label.setText(presentation.step_title)
         self.headline_label.setText(presentation.headline)
         guidance = presentation.guidance
-        if self._config_dirty and state not in {WorkflowState.SCANNING, WorkflowState.APPLYING, WorkflowState.PREPARING_COMPRESSION, WorkflowState.COMPRESSING}:
-            guidance += "\nSettings have changed since the last scan or compression plan. Start that stage again before continuing."
+        if self._config_dirty and state not in {
+            WorkflowState.SCANNING,
+            WorkflowState.APPLYING,
+            WorkflowState.PREPARING_COMPRESSION,
+            WorkflowState.COMPRESSING,
+        }:
+            guidance += "\nSettings have changed since the last scan or compression plan."
         self.guidance_label.setText(guidance)
-
-        warnings: list[str] = []
-        if self.overwrite.isChecked() and self.compress_enabled.isChecked():
-            warnings.append("Overwrite is enabled. Successful compression will replace originals.")
-        if self._active_worker_count > 0:
-            warnings.append("A background task is currently running.")
-        self.warning_label.setText("\n".join(warnings))
+        self.step_checklist_label.setText(self._workflow_checklist_text())
         self._update_ui()
+
+    def _workflow_checklist_text(self) -> str:
+        steps = [
+            ("Setup", self.workflow_state == WorkflowState.SETUP, self.source_input.text().strip() and self.library_input.text().strip()),
+            ("Review", self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED}, self.preview_state is not None or self.apply_result is not None),
+            ("Apply", self.workflow_state in {WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING}, self.apply_result is not None),
+            ("Compress", self.workflow_state in {WorkflowState.PREPARING_COMPRESSION, WorkflowState.READY_TO_COMPRESS, WorkflowState.COMPRESSING}, self.encode_preparation is not None or self.encode_results),
+            ("Summary", self.workflow_state in {WorkflowState.COMPLETED, WorkflowState.FAILED}, self.workflow_state in {WorkflowState.COMPLETED, WorkflowState.FAILED}),
+        ]
+        lines = []
+        for name, current, done in steps:
+            prefix = "Current" if current else "Done" if done else "Pending"
+            lines.append(f"{prefix}: {name}")
+        return " | ".join(lines)
 
     def _switch_tab(self, name: str) -> None:
         mapping = {"setup": 0, "review": 1, "compress": 2, "summary": 3}
@@ -614,16 +863,12 @@ class MainWindow(QMainWindow):
         has_controller = self.controller is not None and bool(self.controller.items)
         review_index = self._current_review_index()
         has_review_selection = has_controller and review_index is not None
+        has_compression_plan = self.encode_preparation is not None
         can_preview = has_controller and not busy and not self._config_dirty
-        can_apply = (
-            self.preview_state is not None
-            and self.preview_state.can_apply
-            and not busy
-            and not self._config_dirty
-        )
-        can_start_compression = (
-            self.encode_preparation is not None
-            and bool(self.encode_preparation.jobs)
+        can_apply = bool(self.preview_state and self.preview_state.can_apply and not busy and not self._config_dirty)
+        can_start_compression = bool(
+            has_compression_plan
+            and self.encode_preparation.jobs
             and self.workflow_state == WorkflowState.READY_TO_COMPRESS
             and not busy
             and not self._config_dirty
@@ -633,22 +878,18 @@ class MainWindow(QMainWindow):
             current_has_more = self.controller.items[review_index or 0].has_more
 
         self.tabs.setTabEnabled(0, True)
-        self.tabs.setTabEnabled(1, has_controller or busy or self.workflow_state in {WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED, WorkflowState.READY_TO_APPLY, WorkflowState.SCANNING, WorkflowState.APPLYING})
-        self.tabs.setTabEnabled(2, self.encode_preparation is not None or busy or self.workflow_state in {WorkflowState.PREPARING_COMPRESSION, WorkflowState.READY_TO_COMPRESS, WorkflowState.COMPRESSING})
+        self.tabs.setTabEnabled(1, has_controller or self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED, WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING})
+        self.tabs.setTabEnabled(2, has_compression_plan or self.workflow_state in {WorkflowState.PREPARING_COMPRESSION, WorkflowState.READY_TO_COMPRESS, WorkflowState.COMPRESSING})
         self.tabs.setTabEnabled(3, True)
 
-        self.scan_button.setEnabled(self.organise_enabled.isChecked() and not busy)
         self.guided_button.setEnabled(not busy)
+        self.scan_button.setEnabled(self.organise_enabled.isChecked() and not busy)
         self.prepare_compress_button.setEnabled(self.compress_enabled.isChecked() and not busy)
         self.reset_button.setEnabled(not busy)
 
         review_actions_enabled = has_review_selection and not busy and not self._config_dirty
         self.prev_item_button.setEnabled(review_actions_enabled and review_index not in {None, 0})
-        self.next_item_button.setEnabled(
-            review_actions_enabled
-            and review_index is not None
-            and review_index < self.review_table.rowCount() - 1
-        )
+        self.next_item_button.setEnabled(review_actions_enabled and review_index is not None and review_index < self.review_table.rowCount() - 1)
         self.accept_button.setEnabled(review_actions_enabled)
         self.skip_button.setEnabled(review_actions_enabled)
         self.search_button.setEnabled(review_actions_enabled)
@@ -663,53 +904,99 @@ class MainWindow(QMainWindow):
 
         self.start_compress_button.setEnabled(can_start_compression)
 
+        self.review_stack.setCurrentIndex(1 if has_controller else 0)
+        if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
+            self.compress_stack.setCurrentIndex(1)
+        elif self.encode_preparation is None:
+            self.compress_stack.setCurrentIndex(0)
+        else:
+            self.compress_stack.setCurrentIndex(2)
+
+        warnings = list(self._custom_warnings)
+        if self.overwrite.isChecked() and self.compress_enabled.isChecked():
+            warnings.append("Overwrite is enabled. Successful compression will replace originals.")
+        if busy:
+            warnings.append("A background task is currently running.")
+        warning_text = "\n".join(warnings)
+        self.warning_label.setText(warning_text)
+        self.runtime_warnings_label.setText(warning_text or "No active warnings.")
+
         self.setup_hint_label.setText(self._setup_hint_text())
         self.review_hint_label.setText(self._review_hint_text())
         self.compress_hint_label.setText(self._compress_hint_text())
+        self.review_placeholder_label.setText(
+            "No organise review is loaded yet.\n\nStart the guided pipeline or load organise matches from Setup."
+        )
+        self.compress_empty_label.setText(self._compress_empty_text())
+        self.next_action_label.setText(f"Recommended next action: {self._recommended_next_action()}")
         self.overwrite_warning_label.setText(
-            "Compression overwrite is currently enabled. Review the compression plan carefully before starting."
+            "Compression will replace originals after successful encodes."
             if self.overwrite.isChecked() and self.compress_enabled.isChecked()
             else ""
         )
+        self.current_action_label.setText(self._current_action)
+        self.last_completed_label.setText(self._last_completed_action)
         self._update_setup_summary()
         self._update_review_summary()
         self._update_compress_summary()
 
     def _setup_hint_text(self) -> str:
         if self._config_dirty and (self.controller is not None or self.encode_preparation is not None):
-            return "Settings have changed. Start a new organise scan or compression plan before continuing."
+            return "Settings changed after runtime data was created. Re-run the affected stage before continuing."
         if self.workflow_state == WorkflowState.SETUP:
-            return "Recommended: start with the guided pipeline, then review the suggested organise matches."
-        if self.workflow_state == WorkflowState.FAILED:
-            return "The last operation failed. Adjust settings if needed, then start the relevant stage again."
-        return "Use this tab to adjust settings, then move through the workflow one stage at a time."
+            return "Start with the guided pipeline unless you only want a manual organise review or a compression-only run."
+        return "Setup controls stay available, but later stages will ask you to rebuild stale data after changes."
 
     def _review_hint_text(self) -> str:
         if self.controller is None:
-            return "No organise scan results yet. Start an organise scan from the Setup tab."
+            return "This step loads suggested plexify matches for each discovered item."
         if self._config_dirty:
-            return "Current review data is stale because settings changed. Re-scan before applying."
+            return "Review data is stale because setup changed. Start a new organise review."
         if self.preview_state is None:
-            return "Review matches, then click Build Preview when you are satisfied."
+            return "Accept, skip, or refine each item. Then build a preview."
         if self.preview_state.can_apply:
-            return "Preview is resolved. Apply organisation to continue."
-        return "Preview found unresolved items. Accept or skip them before applying."
+            return "Organisation preview is ready to apply."
+        return "Some items still need a decision before organisation can continue."
 
     def _compress_hint_text(self) -> str:
+        if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
+            return "Scanning the compression root and assembling a compression plan."
         if self.encode_preparation is None:
-            return "No compression plan yet. Prepare one from Setup or after applying organisation."
+            return "Compression planning only starts after you prepare a plan from Setup or after organisation finishes."
         if self._config_dirty:
-            return "Compression plan is stale because settings changed. Prepare a new plan."
+            return "Compression plan is stale because setup changed. Prepare the plan again."
         if not self.encode_preparation.jobs:
-            return "No compressible files were selected for this run."
+            return "No compressible files are currently selected in the compression plan."
         if self.workflow_state == WorkflowState.COMPRESSING:
-            return "Encoding is in progress."
-        return "Review the compression plan, then click Start Compression."
+            return "Compression is in progress. Avoid moving files in the compression root until the run finishes."
+        return "Review the plan and start compression when you are ready."
+
+    def _compress_empty_text(self) -> str:
+        root = self.compression_root_input.text().strip() or "(not set)"
+        return (
+            "No compression plan is ready yet.\n\n"
+            f"Compression Root: {root}\n"
+            "Prepare a compression plan from Setup or complete the guided organise flow first."
+        )
+
+    def _recommended_next_action(self) -> str:
+        if self.workflow_state == WorkflowState.SETUP:
+            return "Start Guided Pipeline"
+        if self.workflow_state in {WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED}:
+            return "Resolve review items and build an organisation preview"
+        if self.workflow_state == WorkflowState.READY_TO_APPLY:
+            return "Apply Organisation"
+        if self.workflow_state == WorkflowState.READY_TO_COMPRESS:
+            return "Start Compression"
+        if self.workflow_state == WorkflowState.FAILED:
+            return "Read the error summary, adjust settings, and rerun the affected stage"
+        return "Wait for the current stage to finish"
 
     def _update_setup_summary(self) -> None:
         lines = [
             f"Source: {self.source_input.text().strip() or '(not set)'}",
-            f"Library: {self.library_input.text().strip() or '(not set)'}",
+            f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}",
+            f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}",
             f"Organise enabled: {'yes' if self.organise_enabled.isChecked() else 'no'}",
             f"Compress enabled: {'yes' if self.compress_enabled.isChecked() else 'no'}",
         ]
@@ -724,10 +1011,8 @@ class MainWindow(QMainWindow):
         manual = sum(1 for item in self.controller.items if item.decision_status == "manual")
         skipped = sum(1 for item in self.controller.items if item.decision_status == "skipped")
         unresolved = sum(1 for item in self.controller.items if not item.resolved and not item.skipped)
-        auto_safe = sum(1 for item in self.controller.items if item.auto_selectable)
         self.review_summary_label.setText(
-            f"Items: {total} | Accepted: {accepted} | Manual: {manual} | "
-            f"Skipped: {skipped} | Unresolved: {unresolved} | Auto-safe: {auto_safe}"
+            f"Items: {total} | Accepted: {accepted} | Manual: {manual} | Skipped: {skipped} | Unresolved: {unresolved}"
         )
 
     def _update_compress_summary(self) -> None:
@@ -735,37 +1020,70 @@ class MainWindow(QMainWindow):
             self.compress_summary_label.setText("No compression plan prepared.")
             return
         lines = [
-            f"Library root: {self.encode_preparation.directory}",
-            f"Recommended: {self.encode_preparation.recommended_count}",
-            f"Maybe: {self.encode_preparation.maybe_count}",
-            f"Skip: {self.encode_preparation.skip_count}",
+            f"Compression Root: {self.encode_preparation.directory}",
+            f"Files found: {len(self.encode_preparation.items)}",
             f"Selected: {self.encode_preparation.selected_count}",
+            f"Skipped: {self.encode_preparation.skip_count}",
+            f"Expected savings: {self.encode_preparation.selected_input_bytes - self.encode_preparation.selected_estimated_output_bytes}",
         ]
         if self.encode_preparation.profile is not None:
             lines.append(
-                f"Profile: {self.encode_preparation.profile.name} "
-                f"({self.encode_preparation.profile.encoder_key}, CRF {self.encode_preparation.profile.crf})"
+                f"Profile: {self.encode_preparation.profile.name} ({self.encode_preparation.profile.encoder_key}, CRF {self.encode_preparation.profile.crf})"
             )
+        if self.encode_preparation.recommendation_reason:
+            lines.append(f"Reason: {self.encode_preparation.recommendation_reason}")
         self.compress_summary_label.setText("\n".join(lines))
 
     def _append_status(self, text: str) -> None:
         self.compress_status_log.appendPlainText(text)
 
-    def _append_summary(self, text: str) -> None:
-        self.summary_log.appendPlainText(text)
-
     def _set_summary_text(self, text: str) -> None:
         self.summary_log.setPlainText(text)
+
+    def _summarise_error(self, message: str) -> tuple[str, str | None]:
+        text = message.strip()
+        if "Traceback (most recent call last):" in text:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            final_line = next((line for line in reversed(lines) if not line.startswith("^")), text)
+            translated = self._translate_common_error(final_line)
+            return translated, text
+        return self._translate_common_error(text), None
+
+    def _translate_common_error(self, text: str) -> str:
+        lowered = text.lower()
+        if "cannot find the file specified" in lowered:
+            match = re.search(r"'([^']+)'", text)
+            path_text = match.group(1) if match else None
+            if path_text:
+                return (
+                    "A planned compression file is missing from the compression root. "
+                    f"Expected file: {path_text}. Avoid moving files after planning starts."
+                )
+            return "A planned compression file is missing from the compression root."
+        if "ffmpeg" in lowered or "ffprobe" in lowered:
+            return "FFmpeg tools are unavailable. Run `mediaflow doctor` to confirm the compression toolchain."
+        if "compatibility check failed" in lowered:
+            return "Installed plexify or mediashrink components are incompatible with this mediaflow build."
+        return text
 
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
             return
-        self._set_state(WorkflowState.FAILED)
+        self._complete_action("Last operation failed")
         summary, technical_detail = self._summarise_error(message)
-        summary_lines = ["Last operation failed.", "", summary]
-        if technical_detail:
-            summary_lines.extend(["", "Technical details are available in the error dialog."])
-        self._set_summary_text("\n".join(summary_lines))
+        self._record_warning(summary)
+        self._set_state(WorkflowState.FAILED)
+        self._set_summary_text(
+            "\n".join(
+                [
+                    "Last operation failed.",
+                    "",
+                    summary,
+                    "",
+                    "Technical details are available in the error dialog." if technical_detail else "",
+                ]
+            ).strip()
+        )
         self._switch_tab("summary")
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Critical)
@@ -775,22 +1093,6 @@ class MainWindow(QMainWindow):
             dialog.setInformativeText("Technical details are available below.")
             dialog.setDetailedText(technical_detail)
         dialog.exec()
-
-    def _summarise_error(self, message: str) -> tuple[str, str | None]:
-        text = message.strip()
-        if "Traceback (most recent call last):" not in text:
-            return text, None
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        final_line = next(
-            (line for line in reversed(lines) if not line.startswith("^")),
-            "Unexpected error while running the selected stage.",
-        )
-        if ":" in final_line:
-            _, detail = final_line.split(":", 1)
-            summary = detail.strip() or final_line
-        else:
-            summary = final_line
-        return summary, text
 
     def _start_worker(self, worker: FunctionWorker, on_result, on_progress=None) -> None:
         self._active_worker_count += 1
@@ -826,6 +1128,7 @@ class MainWindow(QMainWindow):
         self._reset_runtime_state()
         self._guided_mode = False
         self._continue_to_compress = False
+        self._set_current_action("Scanning source with plexify")
         self._set_state(WorkflowState.SCANNING)
         self._switch_tab("review")
         self._append_status("Scanning source with plexify...")
@@ -845,13 +1148,14 @@ class MainWindow(QMainWindow):
         self._guided_mode = True
         self._continue_to_compress = config.shrink.enabled
         if config.plexify.enabled:
+            self._set_current_action("Starting guided organise review")
             self._set_state(WorkflowState.SCANNING)
             self._switch_tab("review")
             self._append_status("Starting guided pipeline with organise scan.")
             worker = FunctionWorker(scan_controller, build_video_controller(config))
             self._start_worker(worker, self._scan_complete)
         else:
-            self._append_status("Guided pipeline skipping organise stage and preparing compression.")
+            self._append_status("Guided pipeline is skipping organisation and preparing compression.")
             self._prepare_compression_from_setup()
 
     def _scan_complete(self, controller: VideoUIController) -> None:
@@ -861,8 +1165,10 @@ class MainWindow(QMainWindow):
         self._config_dirty = False
         self._populate_review_table()
         self._switch_tab("review")
+        self._complete_action("Finished organise scan")
         if not controller.items:
             self._set_state(WorkflowState.REVIEW)
+            self._set_current_action("Organise scan finished with no review items")
             self._append_status("No organise candidates were discovered in the source folder.")
             return
         if self._guided_mode:
@@ -871,10 +1177,13 @@ class MainWindow(QMainWindow):
             self._preview_plan()
             if self.preview_state is not None and self.preview_state.can_apply:
                 self._set_state(WorkflowState.READY_TO_APPLY)
+                self._set_current_action("Organisation preview is ready")
             else:
                 self._set_state(WorkflowState.REVIEW_BLOCKED)
+                self._set_current_action("Manual review is required before organisation can continue")
         else:
             self._set_state(WorkflowState.REVIEW)
+            self._set_current_action("Review organise matches")
             self._append_status(f"Loaded {len(controller.items)} item(s) for manual review.")
 
     def _populate_review_table(self) -> None:
@@ -922,7 +1231,7 @@ class MainWindow(QMainWindow):
         self._update_ui()
 
     def _current_review_index(self) -> int | None:
-        indexes = self.review_table.selectionModel().selectedRows()
+        indexes = self.review_table.selectionModel().selectedRows() if self.review_table.selectionModel() else []
         if not indexes:
             return None
         return indexes[0].row()
@@ -934,12 +1243,7 @@ class MainWindow(QMainWindow):
         item = self.controller.items[review_index]
         for row, candidate in enumerate(item.candidate_states):
             self.candidate_table.insertRow(row)
-            values = [
-                candidate.title,
-                candidate.year or "",
-                candidate.source,
-                f"{candidate.confidence:.2f}",
-            ]
+            values = [candidate.title, candidate.year or "", candidate.source, f"{candidate.confidence:.2f}"]
             for column, value in enumerate(values):
                 self.candidate_table.setItem(row, column, QTableWidgetItem(str(value)))
         if item.selected_candidate_index is not None and item.candidate_states:
@@ -961,12 +1265,6 @@ class MainWindow(QMainWindow):
             f"Cache context: {item.cache_context}",
             f"Auto-selectable: {item.auto_selectable}",
         ]
-        if item.item.season is not None:
-            lines.append(f"Season: {item.item.season}")
-        if item.item.episode is not None:
-            lines.append(f"Episode: {item.item.episode}")
-        if item.item.episode_title:
-            lines.append(f"Episode title: {item.item.episode_title}")
         if item.warning:
             lines.append(f"Warning: {item.warning}")
         if item.unresolved_reason:
@@ -974,7 +1272,7 @@ class MainWindow(QMainWindow):
         self.details_log.setPlainText("\n".join(lines))
 
     def _selected_candidate_index(self) -> int:
-        indexes = self.candidate_table.selectionModel().selectedRows()
+        indexes = self.candidate_table.selectionModel().selectedRows() if self.candidate_table.selectionModel() else []
         if not indexes:
             return 0
         return indexes[0].row()
@@ -1079,7 +1377,7 @@ class MainWindow(QMainWindow):
         if index is None:
             return
         self.controller.apply_choice_to_folder(index)
-        self._append_status(f"Applied current decision to the folder for item {index + 1}.")
+        self._append_status(f"Applied the current decision to the folder for item {index + 1}.")
         self._refresh_review()
 
     def _apply_choice_to_title_group(self) -> None:
@@ -1089,7 +1387,7 @@ class MainWindow(QMainWindow):
         if index is None:
             return
         self.controller.apply_choice_to_title_group(index)
-        self._append_status(f"Applied current decision to the title group for item {index + 1}.")
+        self._append_status(f"Applied the current decision to the title group for item {index + 1}.")
         self._refresh_review()
 
     def _render_preview_summary(self) -> None:
@@ -1098,11 +1396,10 @@ class MainWindow(QMainWindow):
             return
         lines = list(self.preview_state.summary_lines)
         if self.preview_state.unresolved_items:
-            lines.append("")
-            lines.append("Unresolved:")
+            lines.extend(["", "Unresolved:"])
             lines.extend(self.preview_state.unresolved_items[:10])
         if self.preview_state.warnings:
-            lines.append("")
+            lines.extend([""])
             lines.extend(f"Warning: {warning}" for warning in self.preview_state.warnings[:10])
         self.preview_log.setPlainText("\n".join(lines))
 
@@ -1113,30 +1410,29 @@ class MainWindow(QMainWindow):
         self._render_preview_summary()
         if self.preview_state.can_apply:
             self._set_state(WorkflowState.READY_TO_APPLY)
+            self._set_current_action("Organisation preview is ready")
         else:
             self._set_state(WorkflowState.REVIEW_BLOCKED)
+            self._set_current_action("Manual review is still required")
         if not rebuild_only:
             self._append_status("Built organisation preview.")
+            self._complete_action("Built organisation preview")
 
     def _apply_plan(self) -> None:
         if self.controller is None:
             self._show_error("No organise review is loaded.")
             return
         if self._config_dirty:
-            self._show_error("Settings changed after the scan. Start a new organise scan before applying.")
+            self._show_error("Settings changed after the organise scan. Start a new organise review before applying.")
             return
         if self.preview_state is None:
             self._preview_plan(rebuild_only=True)
         if self.preview_state is None or not self.preview_state.can_apply:
-            self._show_error("Resolve all unresolved items before applying organisation.")
+            self._show_error("Resolve or skip all unresolved items before applying organisation.")
             return
-        reply = QMessageBox.question(
-            self,
-            "mediaflow",
-            "Apply the current organisation plan to disk?",
-        )
-        if reply != QMessageBox.Yes:
+        if QMessageBox.question(self, "mediaflow", "Apply the current organisation plan to disk?") != QMessageBox.Yes:
             return
+        self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
         self._append_status("Applying organisation plan...")
         worker = FunctionWorker(self.controller.apply_preview, self.preview_state)
@@ -1144,14 +1440,35 @@ class MainWindow(QMainWindow):
 
     def _apply_complete(self, result: ApplyResultState) -> None:
         self.apply_result = result
+        self._complete_action("Organisation stage complete")
         self._append_status("Organisation stage complete.")
         self._refresh_pipeline_summary()
-        self._switch_tab("summary")
         if self._guided_mode and self._continue_to_compress:
+            if not self._guided_compression_can_continue():
+                self._set_state(WorkflowState.COMPLETED)
+                self._switch_tab("summary")
+                return
             self._append_status("Preparing compression plan after organisation.")
             self._prepare_compression_after_apply()
-        else:
-            self._set_state(WorkflowState.COMPLETED)
+            return
+        self._set_state(WorkflowState.COMPLETED)
+        self._set_current_action("Pipeline finished")
+        self._switch_tab("summary")
+
+    def _guided_compression_can_continue(self) -> bool:
+        compression_root = Path(self.compression_root_input.text().strip())
+        if not compression_root.exists():
+            self._show_error("Compression root does not exist after the organise stage completed.")
+            return False
+        if self.link_compression_root.isChecked() and self.preview_state is not None and self.preview_state.plans:
+            existing_outputs = [plan.destination for plan in self.preview_state.plans if plan.destination.exists()]
+            if not existing_outputs:
+                self._record_warning(
+                    "Organisation finished, but no planned outputs were found in the library / output folder. Compression will not start automatically."
+                )
+                self._refresh_pipeline_summary()
+                return False
+        return True
 
     def _prepare_compression_from_setup(self) -> None:
         self._guided_mode = False
@@ -1159,7 +1476,7 @@ class MainWindow(QMainWindow):
         self._start_compression_preparation("Preparing compression plan from Setup.")
 
     def _prepare_compression_after_apply(self) -> None:
-        self._start_compression_preparation("Preparing compression plan for organised output.")
+        self._start_compression_preparation("Preparing compression plan for the organised output.")
 
     def _start_compression_preparation(self, status_message: str) -> None:
         try:
@@ -1180,6 +1497,7 @@ class MainWindow(QMainWindow):
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
         self.compress_status_log.clear()
+        self._set_current_action(f"Scanning compression root {config.compression_root}")
         self._set_state(WorkflowState.PREPARING_COMPRESSION)
         self._switch_tab("compress")
         self._append_status(status_message)
@@ -1193,6 +1511,7 @@ class MainWindow(QMainWindow):
         self.prepare_progress.setRange(0, 100)
         if total:
             self.prepare_progress.setValue(int((completed / total) * 100))
+        self._set_current_action(f"Analyzing {completed}/{total}: {Path(path).name}")
         self._append_status(f"Analyzed {completed}/{total}: {Path(path).name}")
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
@@ -1200,16 +1519,18 @@ class MainWindow(QMainWindow):
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(100)
         self._populate_compression_table(preparation)
+        self._config_dirty = False
         self._refresh_pipeline_summary()
         self._switch_tab("compress")
+        self._complete_action("Compression plan prepared")
         if not preparation.items:
-            self._append_status("No supported video files found in the library.")
-            self._config_dirty = False
+            self._set_current_action("Compression root scan finished with no supported video files")
+            self._append_status("No supported video files found in the compression root.")
             self._set_state(WorkflowState.READY_TO_COMPRESS)
             return
         if not preparation.jobs:
+            self._set_current_action("Compression plan contains no selected jobs")
             self._append_status("Compression plan contains no selected jobs.")
-            self._config_dirty = False
             self._set_state(WorkflowState.READY_TO_COMPRESS)
             return
         if preparation.stage_messages:
@@ -1217,12 +1538,12 @@ class MainWindow(QMainWindow):
                 self._append_status(line)
         if preparation.duplicate_warnings:
             for warning in preparation.duplicate_warnings[:10]:
+                self._record_warning(warning)
                 self._append_status(f"Duplicate warning: {warning}")
+        self._set_current_action("Compression plan is ready to review")
         self._append_status(
-            f"Prepared compression plan for {preparation.selected_count} file(s) with "
-            f"{preparation.profile.name if preparation.profile else 'no profile'}."
+            f"Prepared compression plan for {preparation.selected_count} file(s) from {preparation.directory}."
         )
-        self._config_dirty = False
         self._set_state(WorkflowState.READY_TO_COMPRESS)
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
@@ -1232,6 +1553,9 @@ class MainWindow(QMainWindow):
         selected_sources = {job.source for job in preparation.jobs}
         for row, item in enumerate(preparation.items):
             self.compression_table.insertRow(row)
+            selected_text = "yes" if item.source in selected_sources else "no"
+            if item.source in selected_sources and not item.source.exists():
+                selected_text = "missing"
             values = [
                 item.source.name,
                 item.codec or "",
@@ -1239,7 +1563,7 @@ class MainWindow(QMainWindow):
                 item.reason_text,
                 str(item.estimated_output_bytes) if item.estimated_output_bytes else "",
                 str(item.estimated_savings_bytes) if item.estimated_savings_bytes else "",
-                "yes" if item.source in selected_sources else "no",
+                selected_text,
             ]
             for column, value in enumerate(values):
                 self.compression_table.setItem(row, column, QTableWidgetItem(value))
@@ -1249,20 +1573,29 @@ class MainWindow(QMainWindow):
             self._show_error("Prepare a compression plan before starting compression.")
             return
         if self._config_dirty:
-            self._show_error("Settings changed after preparing compression. Prepare the plan again first.")
+            self._show_error("Settings changed after the compression plan was prepared. Prepare the plan again.")
             return
         if not self.encode_preparation.jobs:
             self._show_error("There are no jobs selected in the current compression plan.")
             return
-        reply = QMessageBox.question(
-            self,
-            "mediaflow",
-            "Start compression with the current plan?",
-        )
-        if reply != QMessageBox.Yes:
+        missing_sources = missing_job_sources(self.encode_preparation)
+        if missing_sources and len(missing_sources) == len(self.encode_preparation.jobs):
+            self._show_error(
+                f"All planned compression files are missing from the compression root. First missing file: {missing_sources[0]}"
+            )
+            return
+        if missing_sources:
+            self._record_warning(
+                "Some planned files disappeared after planning. Mediaflow will skip those files and continue with the remaining jobs."
+            )
+            self._append_status(
+                f"Skipping {len(missing_sources)} missing file(s) before compression starts."
+            )
+        if QMessageBox.question(self, "mediaflow", "Start compression with the current plan?") != QMessageBox.Yes:
             return
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
+        self._set_current_action("Starting compression run")
         self._set_state(WorkflowState.COMPRESSING)
         self._append_status("Starting compression.")
         worker = FunctionWorker(run_compression, self.encode_preparation)
@@ -1273,13 +1606,25 @@ class MainWindow(QMainWindow):
             return
         self.file_progress.setValue(int(progress.current_file_progress * 100))
         self.overall_progress.setValue(int(progress.overall_progress * 100))
+        self._set_current_action(
+            f"{progress.current_file} | completed {progress.completed_files} | remaining {progress.remaining_files}"
+        )
         self._append_status(
-            f"{progress.current_file} | completed {progress.completed_files} | "
-            f"remaining {progress.remaining_files} | state {progress.heartbeat_state}"
+            f"{progress.current_file} | completed {progress.completed_files} | remaining {progress.remaining_files} | state {progress.heartbeat_state}"
         )
 
     def _compression_complete(self, results: list) -> None:
         self.encode_results = list(results)
+        self._complete_action("Compression stage complete")
+        self._set_current_action("Compression finished")
+        missing_count = 0
+        for result in self.encode_results:
+            if getattr(result, "error_message", "") and "missing" in getattr(result, "error_message", "").lower():
+                missing_count += 1
+        if missing_count:
+            self._record_warning(
+                f"{missing_count} planned file(s) were missing when compression started. The compression root changed after planning."
+            )
         self._append_status("Compression stage complete.")
         self._refresh_pipeline_summary()
         self._switch_tab("summary")
@@ -1295,6 +1640,8 @@ class MainWindow(QMainWindow):
             f"Skipped files: {summary.skipped_files}",
             f"Failed files: {summary.failed_files}",
             f"Bytes saved: {summary.bytes_saved}",
+            f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}",
+            f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}",
         ]
         if summary.organise_report_path:
             lines.append(f"Organise report: {summary.organise_report_path}")
@@ -1304,34 +1651,27 @@ class MainWindow(QMainWindow):
 
         details: list[str] = []
         if self.preview_state is not None:
-            details.append("Organisation preview")
-            details.extend(self.preview_state.summary_lines)
+            details.extend(["Organisation preview", *self.preview_state.summary_lines, ""])
         if self.apply_result is not None:
-            details.append("")
-            details.append("Organisation apply")
-            details.extend(self.apply_result.summary_lines)
+            details.extend(["Organisation apply", *self.apply_result.summary_lines, ""])
         if self.encode_preparation is not None:
+            details.extend(["Compression plan", self.compress_summary_label.text(), ""])
+        if self._custom_warnings:
+            details.append("Warnings")
+            details.extend(f"- {warning}" for warning in self._custom_warnings)
             details.append("")
-            details.append("Compression plan")
-            details.append(self.compress_summary_label.text())
-            if self.encode_preparation.recommendation_reason:
-                details.append(f"Reason: {self.encode_preparation.recommendation_reason}")
-            if self.encode_preparation.size_confidence:
-                details.append(f"Size confidence: {self.encode_preparation.size_confidence}")
-            if self.encode_preparation.time_confidence:
-                details.append(f"Time confidence: {self.encode_preparation.time_confidence}")
-            if self.encode_preparation.grouped_incompatibilities:
-                details.append("Likely follow-up incompatibilities:")
-                details.extend(
-                    f"- {name}: {count}"
-                    for name, count in sorted(self.encode_preparation.grouped_incompatibilities.items())
-                )
         if self.encode_results:
-            details.append("")
             details.append("Compression results")
             for result in self.encode_results:
-                status = "skipped" if result.skipped else "ok" if result.success else "failed"
-                details.append(f"{result.job.source.name}: {status}")
+                if result.skipped:
+                    status = "skipped"
+                elif result.success:
+                    status = "encoded"
+                elif result.error_message and "missing" in result.error_message.lower():
+                    status = "missing"
+                else:
+                    status = "failed"
+                details.append(f"- {result.job.source.name}: {status}")
                 if result.error_message:
                     details.append(f"  {result.error_message}")
         self._set_summary_text("\n".join(details).strip())

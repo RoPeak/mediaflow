@@ -10,6 +10,8 @@ def test_save_and_load_ui_state_round_trip(tmp_path: Path) -> None:
     payload = {
         "source": "/tmp/source",
         "library": "/tmp/library",
+        "compression_root": "/tmp/compress",
+        "compression_root_linked": False,
         "organise_enabled": True,
         "min_confidence": 0.9,
     }
