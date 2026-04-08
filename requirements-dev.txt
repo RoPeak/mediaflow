@@ -1,0 +1,6 @@
+# Install with: pip install -e ".[dev]"
+# Or directly: pip install -r requirements-dev.txt
+pytest==8.2.2
+ruff>=0.4
+mypy>=1.10
+pyinstaller>=6.0

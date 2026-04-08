@@ -21,6 +21,9 @@ mediaflow = "mediaflow.cli:app"
 [project.optional-dependencies]
 dev = [
   "pytest==8.2.2",
+  "ruff>=0.4",
+  "mypy>=1.10",
+  "pyinstaller>=6.0",
 ]
 
 [tool.setuptools.packages.find]

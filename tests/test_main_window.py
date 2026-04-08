@@ -141,7 +141,7 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
     assert window.start_compress_button.isEnabled() is True
     assert window.compression_table.rowCount() == 1
-    assert "Selected: 1" in window.compress_summary_label.text()
+    assert "1 file(s)" in window.compress_summary_label.text()
     assert "Fast" in window.compress_summary_label.text()
     assert "Fast profile covers the selected file." in window.compress_summary_label.text()
     assert "Benchmarking complete." in window.compress_status_log.toPlainText()
