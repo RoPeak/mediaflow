@@ -81,6 +81,9 @@ class MainWindow(QMainWindow):
         self._restore_ui_state(default_source=default_source, default_library=default_library)
         self._loading_state = False
         self._refresh_compression_link_label()
+        if self._compression_root_linked:
+            target = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
+            self.compression_root_input.setText(target)
         self._set_state(WorkflowState.SETUP)
 
     def _build_widgets(self, *, default_source: Path | None, default_library: Path | None) -> None:
@@ -102,6 +105,8 @@ class MainWindow(QMainWindow):
         self.library_browse = QPushButton("Browse")
         self.library_help = QLabel("Organised output is written here by the organise stage.")
         self.library_help.setObjectName("helper-label")
+        self.source_help_label = QLabel("Incoming folder scanned by plexify for new media.")
+        self.source_help_label.setObjectName("helper-label")
         self.compression_root_input = QLineEdit(str(default_library) if default_library else "")
         self.link_compression_root = QCheckBox("Use the library / output folder as the compression root")
         self.link_compression_root.setChecked(True)
@@ -366,14 +371,12 @@ class MainWindow(QMainWindow):
         self.library_browse.clicked.connect(lambda: self._browse_into(self.library_input))
         compression_browse = QPushButton("Browse")
         compression_browse.clicked.connect(lambda: self._browse_into(self.compression_root_input))
-        source_help = QLabel("Incoming folder scanned by plexify for new media.")
-        source_help.setObjectName("helper-label")
         compression_help = QLabel("Mediashrink scans and encodes files from this folder.")
         compression_help.setObjectName("helper-label")
         path_layout.addWidget(QLabel("Source"), 0, 0)
         path_layout.addWidget(self.source_input, 0, 1)
         path_layout.addWidget(source_browse, 0, 2)
-        path_layout.addWidget(source_help, 1, 1, 1, 2)
+        path_layout.addWidget(self.source_help_label, 1, 1, 1, 2)
         path_layout.addWidget(self.library_label, 2, 0)
         path_layout.addWidget(self.library_input, 2, 1)
         path_layout.addWidget(self.library_browse, 2, 2)
@@ -781,6 +784,14 @@ class MainWindow(QMainWindow):
         self._refresh_compression_link_label()
         self._on_config_edited()
 
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
     def _refresh_compression_link_label(self) -> None:
         if self.organise_enabled.isChecked():
             self.link_compression_root.setText(
@@ -974,6 +985,12 @@ class MainWindow(QMainWindow):
         self.library_input.setVisible(organise_on)
         self.library_browse.setVisible(organise_on)
         self.library_help.setVisible(organise_on)
+        self.source_help_label.setText(
+            "Incoming folder scanned by plexify for new media."
+            if organise_on
+            else "Folder containing video files to compress."
+        )
+        self.tabs.tabBar().setTabVisible(1, organise_on)
 
         self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, has_controller or self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED, WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING})
@@ -1072,7 +1089,9 @@ class MainWindow(QMainWindow):
             return "No compressible files are currently selected in the compression plan."
         if self.workflow_state == WorkflowState.COMPRESSING:
             return "Compression is in progress. Avoid moving files in the compression root until the run finishes."
-        return "Review the plan and start compression when you are ready."
+        if self.overwrite.isChecked():
+            return "Review the plan and start compression. Originals will be replaced in-place after a successful encode."
+        return "Review the compression plan and start encoding when you are ready."
 
     def _compress_empty_text(self) -> str:
         root = self.compression_root_input.text().strip() or "(not set)"
@@ -1109,6 +1128,8 @@ class MainWindow(QMainWindow):
             f"Organise enabled: {'yes' if self.organise_enabled.isChecked() else 'no'}",
             f"Compress enabled: {'yes' if self.compress_enabled.isChecked() else 'no'}",
         ]
+        if self.compress_enabled.isChecked() and self.overwrite.isChecked() and not self.organise_enabled.isChecked():
+            lines.append("Output mode: files will be replaced in-place in the compression root.")
         self.setup_summary_label.setText("\n".join(lines))
 
     def _update_review_summary(self) -> None:
@@ -1606,6 +1627,7 @@ class MainWindow(QMainWindow):
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
         self.compress_status_log.clear()
+        self.compress_preparing_label.setText("Preparing a compression plan...")
         self._set_current_action(f"Scanning compression root {config.compression_root}")
         self._set_state(WorkflowState.PREPARING_COMPRESSION)
         self._switch_tab("compress")
@@ -1620,8 +1642,12 @@ class MainWindow(QMainWindow):
         self.prepare_progress.setRange(0, 100)
         if total:
             self.prepare_progress.setValue(int((completed / total) * 100))
-        self._set_current_action(f"Analyzing {completed}/{total}: {Path(path).name}")
-        self._append_status(f"Analyzed {completed}/{total}: {Path(path).name}")
+        file_name = Path(path).name
+        self.compress_preparing_label.setText(
+            f"Scanning compression root\nAnalysing {completed} of {total}: {file_name}"
+        )
+        self._set_current_action(f"Analysing {completed}/{total}: {file_name}")
+        self._append_status(f"Analysed {completed}/{total}: {file_name}")
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self.encode_preparation = preparation
@@ -1665,17 +1691,29 @@ class MainWindow(QMainWindow):
             selected_text = "yes" if item.source in selected_sources else "no"
             if item.source in selected_sources and not item.source.exists():
                 selected_text = "missing"
+            est_output = self._format_bytes(item.estimated_output_bytes) if item.estimated_output_bytes else ""
+            if item.estimated_savings_bytes and item.estimated_output_bytes:
+                total_size = item.estimated_output_bytes + item.estimated_savings_bytes
+                pct = int(100 * item.estimated_savings_bytes / total_size) if total_size else 0
+                est_saving = f"{self._format_bytes(item.estimated_savings_bytes)} ({pct}%)"
+            elif item.estimated_savings_bytes:
+                est_saving = self._format_bytes(item.estimated_savings_bytes)
+            else:
+                est_saving = ""
             values = [
                 item.source.name,
                 item.codec or "",
                 item.recommendation,
                 item.reason_text,
-                str(item.estimated_output_bytes) if item.estimated_output_bytes else "",
-                str(item.estimated_savings_bytes) if item.estimated_savings_bytes else "",
+                est_output,
+                est_saving,
                 selected_text,
             ]
             for column, value in enumerate(values):
-                self.compression_table.setItem(row, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(str(value))
+                cell.setToolTip(str(value))
+                self.compression_table.setItem(row, column, cell)
+            self.compression_table.item(row, 0).setToolTip(str(item.source))
 
     def _start_compression(self) -> None:
         if self.encode_preparation is None:
@@ -1741,22 +1779,55 @@ class MainWindow(QMainWindow):
 
     def _refresh_pipeline_summary(self) -> None:
         summary = build_pipeline_summary(self.apply_result, self.encode_results)
-        lines = [
-            "Pipeline Summary",
-            f"Organised plans: {summary.organised_plans}",
-            f"Organise errors: {summary.organised_errors}",
-            f"Encoded files: {summary.encoded_files}",
-            f"Skipped files: {summary.skipped_files}",
-            f"Failed files: {summary.failed_files}",
-            f"Bytes saved: {summary.bytes_saved}",
+        organise_on = self.organise_enabled.isChecked()
+        compress_on = self.compress_enabled.isChecked()
+
+        if organise_on and compress_on:
+            header = "Full pipeline completed"
+        elif compress_on:
+            header = "Compression-only run completed"
+        elif organise_on:
+            header = "Organise-only run completed"
+        else:
+            header = "Pipeline Summary"
+
+        lines = [header, ""]
+
+        if organise_on or self.apply_result is not None:
+            lines += [
+                f"Organised:        {summary.organised_plans} file(s)",
+                f"Organise errors:  {summary.organised_errors}",
+            ]
+
+        total_input = sum(
+            int(getattr(r, "input_size_bytes", 0) or 0)
+            for r in self.encode_results
+            if getattr(r, "success", False)
+        )
+        ratio = f" ({100 * summary.bytes_saved / total_input:.1f}%)" if total_input > 0 else ""
+
+        lines += [
+            f"Encoded:          {summary.encoded_files} file(s)",
+            f"Skipped:          {summary.skipped_files} file(s)",
+            f"Failed:           {summary.failed_files} file(s)",
+            f"Saved:            {self._format_bytes(summary.bytes_saved)}{ratio}" if summary.bytes_saved > 0 else "Saved:            0",
         ]
-        if self.organise_enabled.isChecked():
-            lines.append(f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}")
-        lines.append(f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}")
+
+        if compress_on:
+            if self.overwrite.isChecked():
+                lines.append("Output mode:      in-place (originals replaced)")
+            else:
+                lines.append("Output mode:      in-place (originals preserved)")
+            lines.append(f"Compression root: {self.compression_root_input.text().strip() or '(not set)'}")
+
+        if organise_on:
+            lines.append(f"Library:          {self.library_input.text().strip() or '(not set)'}")
+
         if summary.organise_report_path:
             lines.append(f"Organise report: {summary.organise_report_path}")
         if summary.organise_apply_report_path:
             lines.append(f"Organise apply report: {summary.organise_apply_report_path}")
+
         self.summary_overview_label.setText("\n".join(lines))
 
         details: list[str] = []
@@ -1768,20 +1839,39 @@ class MainWindow(QMainWindow):
             details.extend(["Compression plan", self.compress_summary_label.text(), ""])
         if self._custom_warnings:
             details.append("Warnings")
-            details.extend(f"- {warning}" for warning in self._custom_warnings)
+            details.extend(f"- {w}" for w in self._custom_warnings)
             details.append("")
         if self.encode_results:
             details.append("Compression results")
+            profile_name = ""
+            if self.encode_preparation and self.encode_preparation.profile:
+                p = self.encode_preparation.profile
+                profile_name = f"{p.name} ({p.encoder_key}, CRF {p.crf})"
+            any_success = False
             for result in self.encode_results:
                 if result.skipped:
-                    status = "skipped"
+                    details.append(f"- {result.job.source.name}: skipped")
                 elif result.success:
-                    status = "encoded"
-                elif result.error_message and "missing" in result.error_message.lower():
-                    status = "missing"
+                    any_success = True
+                    input_b = int(getattr(result, "input_size_bytes", 0) or 0)
+                    output_b = int(getattr(result, "output_size_bytes", 0) or 0)
+                    if input_b > 0 and output_b > 0:
+                        saved = input_b - output_b
+                        pct = 100 * saved / input_b
+                        size_line = f"  encoded:  {self._format_bytes(input_b)} → {self._format_bytes(output_b)}  (saved {self._format_bytes(saved)}, {pct:.1f}%)"
+                    else:
+                        size_line = "  encoded"
+                    details.append(f"- {result.job.source.name}")
+                    details.append(size_line)
+                    if profile_name:
+                        details.append(f"  profile:  {profile_name}")
+                    details.append(f"  location: {result.job.source}")
                 else:
-                    status = "failed"
-                details.append(f"- {result.job.source.name}: {status}")
-                if result.error_message:
-                    details.append(f"  {result.error_message}")
+                    label = "missing" if "missing" in (result.error_message or "").lower() else "failed"
+                    details.append(f"- {result.job.source.name}: {label}")
+                    if result.error_message:
+                        details.append(f"  {result.error_message}")
+            if any_success and self.overwrite.isChecked():
+                details.append("")
+                details.append("All encoded files replaced in-place. Originals no longer exist.")
         self._set_summary_text("\n".join(details).strip())

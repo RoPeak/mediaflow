@@ -87,9 +87,9 @@ def test_refresh_pipeline_summary_surfaces_existing_stage_results() -> None:
 
     overview = window.summary_overview_label.text()
     details = window.summary_log.toPlainText()
-    assert "Organised plans: 2" in overview
+    assert "Organised:        2 file(s)" in overview
     assert "Organise report: /tmp/report.json" in overview
-    assert "Compression Root: /tmp/compress" in overview
+    assert "Compression root: /tmp/compress" in overview
     assert "Applied 2 planned changes." in details
 
 
