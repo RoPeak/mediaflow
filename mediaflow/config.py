@@ -39,10 +39,11 @@ class PipelineConfig:
     shrink: ShrinkSettings = ShrinkSettings()
 
     def validate(self) -> None:
-        if not str(self.library).strip():
-            raise ValueError("A library folder is required.")
-        if self.library.exists() and self.library.is_file():
-            raise ValueError("Library path must be a folder.")
+        if self.plexify.enabled:
+            if not str(self.library).strip():
+                raise ValueError("A library folder is required when organise is enabled.")
+            if self.library.exists() and self.library.is_file():
+                raise ValueError("Library path must be a folder.")
         if not self.plexify.enabled and not self.shrink.enabled:
             raise ValueError("Enable at least one stage.")
         if self.plexify.enabled:

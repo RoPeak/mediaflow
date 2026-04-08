@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThreadPool
 from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QHeaderView,
+    QScrollArea,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -77,6 +80,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._restore_ui_state(default_source=default_source, default_library=default_library)
         self._loading_state = False
+        self._refresh_compression_link_label()
         self._set_state(WorkflowState.SETUP)
 
     def _build_widgets(self, *, default_source: Path | None, default_library: Path | None) -> None:
@@ -94,6 +98,10 @@ class MainWindow(QMainWindow):
 
         self.source_input = QLineEdit(str(default_source) if default_source else "")
         self.library_input = QLineEdit(str(default_library) if default_library else "")
+        self.library_label = QLabel("Library / Output Folder")
+        self.library_browse = QPushButton("Browse")
+        self.library_help = QLabel("Organised output is written here by the organise stage.")
+        self.library_help.setObjectName("helper-label")
         self.compression_root_input = QLineEdit(str(default_library) if default_library else "")
         self.link_compression_root = QCheckBox("Use the library / output folder as the compression root")
         self.link_compression_root.setChecked(True)
@@ -243,11 +251,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         banner = QGroupBox("Current Step")
         banner_layout = QVBoxLayout(banner)
-        banner_layout.setSpacing(6)
+        banner_layout.setSpacing(4)
         banner_layout.addWidget(self.step_label)
         banner_layout.addWidget(self.headline_label)
         banner_layout.addWidget(self.guidance_label)
@@ -342,7 +350,12 @@ class MainWindow(QMainWindow):
 
     def _build_setup_tab(self) -> QWidget:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(12)
 
         path_group = QGroupBox("Folders")
@@ -350,24 +363,21 @@ class MainWindow(QMainWindow):
         path_layout.setVerticalSpacing(8)
         source_browse = QPushButton("Browse")
         source_browse.clicked.connect(lambda: self._browse_into(self.source_input))
-        library_browse = QPushButton("Browse")
-        library_browse.clicked.connect(lambda: self._browse_into(self.library_input))
+        self.library_browse.clicked.connect(lambda: self._browse_into(self.library_input))
         compression_browse = QPushButton("Browse")
         compression_browse.clicked.connect(lambda: self._browse_into(self.compression_root_input))
         source_help = QLabel("Incoming folder scanned by plexify for new media.")
         source_help.setObjectName("helper-label")
-        library_help = QLabel("Organised output is written here by the organise stage.")
-        library_help.setObjectName("helper-label")
         compression_help = QLabel("Mediashrink scans and encodes files from this folder.")
         compression_help.setObjectName("helper-label")
         path_layout.addWidget(QLabel("Source"), 0, 0)
         path_layout.addWidget(self.source_input, 0, 1)
         path_layout.addWidget(source_browse, 0, 2)
         path_layout.addWidget(source_help, 1, 1, 1, 2)
-        path_layout.addWidget(QLabel("Library / Output Folder"), 2, 0)
+        path_layout.addWidget(self.library_label, 2, 0)
         path_layout.addWidget(self.library_input, 2, 1)
-        path_layout.addWidget(library_browse, 2, 2)
-        path_layout.addWidget(library_help, 3, 1, 1, 2)
+        path_layout.addWidget(self.library_browse, 2, 2)
+        path_layout.addWidget(self.library_help, 3, 1, 1, 2)
         path_layout.addWidget(QLabel("Compression Root"), 4, 0)
         path_layout.addWidget(self.compression_root_input, 4, 1)
         path_layout.addWidget(compression_browse, 4, 2)
@@ -407,6 +417,11 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.overwrite_warning_label)
         layout.addWidget(action_group)
         layout.addStretch(1)
+
+        scroll.setWidget(content)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         return panel
 
     def _build_organise_settings_page(self) -> QWidget:
@@ -446,50 +461,70 @@ class MainWindow(QMainWindow):
         placeholder_layout.addWidget(self.review_placeholder_label)
         placeholder_layout.addStretch(1)
 
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setSpacing(10)
-        content_layout.addWidget(QLabel("Discovered Items"))
-        content_layout.addWidget(self.review_table, stretch=2)
-        content_layout.addWidget(QLabel("Candidate Matches"))
-        content_layout.addWidget(self.candidate_table, stretch=1)
+        # Left pane: discovered items list + all action controls
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("Discovered Items"))
+        left_layout.addWidget(self.review_table, stretch=1)
+
+        nav_row = QHBoxLayout()
+        nav_row.addWidget(self.prev_item_button)
+        nav_row.addWidget(self.next_item_button)
+        nav_row.addWidget(self.accept_button)
+        nav_row.addWidget(self.skip_button)
+        nav_row.addWidget(self.auto_accept_button)
+        left_layout.addLayout(nav_row)
+
+        extra_row = QHBoxLayout()
+        extra_row.addWidget(self.switch_button)
+        extra_row.addWidget(self.folder_button)
+        extra_row.addWidget(self.title_group_button)
+        extra_row.addWidget(self.next_page_button)
+        left_layout.addLayout(extra_row)
 
         search_row = QHBoxLayout()
         search_row.addWidget(self.search_input)
         search_row.addWidget(self.search_button)
         search_row.addWidget(self.manual_button)
-        content_layout.addLayout(search_row)
-
-        action_row = QHBoxLayout()
-        for button in [
-            self.prev_item_button,
-            self.next_item_button,
-            self.accept_button,
-            self.skip_button,
-            self.next_page_button,
-            self.auto_accept_button,
-            self.switch_button,
-            self.folder_button,
-            self.title_group_button,
-        ]:
-            action_row.addWidget(button)
-        content_layout.addLayout(action_row)
+        left_layout.addLayout(search_row)
 
         footer_row = QHBoxLayout()
         footer_row.addWidget(self.preview_button)
         footer_row.addWidget(self.apply_button)
-        content_layout.addLayout(footer_row)
+        left_layout.addLayout(footer_row)
 
-        detail_row = QHBoxLayout()
+        # Right pane: candidates (top) + details/preview (bottom)
         detail_group = QGroupBox("Selected Item Details")
         detail_layout = QVBoxLayout(detail_group)
         detail_layout.addWidget(self.details_log)
         preview_group = QGroupBox("Organisation Preview")
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.addWidget(self.preview_log)
-        detail_row.addWidget(detail_group, stretch=1)
-        detail_row.addWidget(preview_group, stretch=1)
-        content_layout.addLayout(detail_row, stretch=1)
+
+        bottom_splitter = QSplitter(Qt.Horizontal)
+        bottom_splitter.addWidget(detail_group)
+        bottom_splitter.addWidget(preview_group)
+
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(QLabel("Candidate Matches"))
+        right_layout.addWidget(self.candidate_table, stretch=1)
+        right_layout.addWidget(bottom_splitter, stretch=1)
+
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.addWidget(left_pane)
+        main_splitter.addWidget(right_pane)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 1)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(main_splitter)
 
         self.review_stack.addWidget(placeholder)
         self.review_stack.addWidget(content)
@@ -517,6 +552,12 @@ class MainWindow(QMainWindow):
 
         ready_page = QWidget()
         ready_layout = QVBoxLayout(ready_page)
+        ready_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Left: status + controls + progress
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(0, 0, 4, 0)
         status_group = QGroupBox("Run Status")
         status_layout = QVBoxLayout(status_group)
         status_layout.addWidget(QLabel("Current action"))
@@ -525,16 +566,29 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.last_completed_label)
         status_layout.addWidget(QLabel("Warnings"))
         status_layout.addWidget(self.runtime_warnings_label)
-        ready_layout.addWidget(status_group)
-        ready_layout.addWidget(self.start_compress_button)
-        ready_layout.addWidget(QLabel("Current file progress"))
-        ready_layout.addWidget(self.file_progress)
-        ready_layout.addWidget(QLabel("Overall encode progress"))
-        ready_layout.addWidget(self.overall_progress)
-        ready_layout.addWidget(QLabel("Compression Plan"))
-        ready_layout.addWidget(self.compression_table, stretch=1)
-        ready_layout.addWidget(self.toggle_details_button)
-        ready_layout.addWidget(self.compress_status_log, stretch=1)
+        left_layout.addWidget(status_group)
+        left_layout.addWidget(self.start_compress_button)
+        left_layout.addWidget(QLabel("Current file progress"))
+        left_layout.addWidget(self.file_progress)
+        left_layout.addWidget(QLabel("Overall encode progress"))
+        left_layout.addWidget(self.overall_progress)
+        left_layout.addStretch(1)
+
+        # Right: plan table + log
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.addWidget(QLabel("Compression Plan"))
+        right_layout.addWidget(self.compression_table, stretch=1)
+        right_layout.addWidget(self.toggle_details_button)
+        right_layout.addWidget(self.compress_status_log, stretch=1)
+
+        compress_splitter = QSplitter(Qt.Horizontal)
+        compress_splitter.addWidget(left_pane)
+        compress_splitter.addWidget(right_pane)
+        compress_splitter.setStretchFactor(0, 1)
+        compress_splitter.setStretchFactor(1, 2)
+        ready_layout.addWidget(compress_splitter, stretch=1)
 
         self.compress_stack.addWidget(empty_page)
         self.compress_stack.addWidget(preparing_page)
@@ -551,7 +605,6 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         for signal in [
-            self.organise_enabled.toggled,
             self.compress_enabled.toggled,
             self.apply_mode.toggled,
             self.copy_mode.toggled,
@@ -562,7 +615,6 @@ class MainWindow(QMainWindow):
             self.no_skip.toggled,
             self.use_calibration.toggled,
             self.min_confidence.valueChanged,
-            self.source_input.textChanged,
             self.extensions_input.textChanged,
             self.conflict_mode.currentTextChanged,
             self.policy.currentTextChanged,
@@ -571,6 +623,8 @@ class MainWindow(QMainWindow):
         ]:
             signal.connect(self._on_config_edited)
 
+        self.organise_enabled.toggled.connect(self._organise_stage_toggled)
+        self.source_input.textChanged.connect(self._source_path_changed)
         self.library_input.textChanged.connect(self._library_path_changed)
         self.compression_root_input.textEdited.connect(self._compression_root_manually_edited)
         self.link_compression_root.toggled.connect(self._compression_root_link_toggled)
@@ -705,22 +759,50 @@ class MainWindow(QMainWindow):
             target.setText(selected)
 
     def _library_path_changed(self, text: str) -> None:
-        if self._compression_root_linked:
+        if self._compression_root_linked and self.organise_enabled.isChecked():
             self.compression_root_input.blockSignals(True)
             self.compression_root_input.setText(text)
             self.compression_root_input.blockSignals(False)
         self._on_config_edited()
 
+    def _source_path_changed(self, text: str) -> None:
+        if self._compression_root_linked and not self.organise_enabled.isChecked():
+            self.compression_root_input.blockSignals(True)
+            self.compression_root_input.setText(text)
+            self.compression_root_input.blockSignals(False)
+        self._on_config_edited()
+
+    def _organise_stage_toggled(self, checked: bool) -> None:
+        if not self._loading_state and self._compression_root_linked:
+            target = self.library_input.text() if checked else self.source_input.text()
+            self.compression_root_input.blockSignals(True)
+            self.compression_root_input.setText(target)
+            self.compression_root_input.blockSignals(False)
+        self._refresh_compression_link_label()
+        self._on_config_edited()
+
+    def _refresh_compression_link_label(self) -> None:
+        if self.organise_enabled.isChecked():
+            self.link_compression_root.setText(
+                "Use the library / output folder as the compression root"
+            )
+        else:
+            self.link_compression_root.setText(
+                "Use the source folder as the compression root"
+            )
+
     def _compression_root_link_toggled(self, checked: bool) -> None:
         self._compression_root_linked = checked
         if checked:
+            target = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
             self.compression_root_input.blockSignals(True)
-            self.compression_root_input.setText(self.library_input.text())
+            self.compression_root_input.setText(target)
             self.compression_root_input.blockSignals(False)
         self._on_config_edited()
 
     def _compression_root_manually_edited(self, text: str) -> None:
-        if self._compression_root_linked and text.strip() != self.library_input.text().strip():
+        linked_path = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
+        if self._compression_root_linked and text.strip() != linked_path.strip():
             self.link_compression_root.setChecked(False)
             self._compression_root_linked = False
         self._on_config_edited()
@@ -825,7 +907,7 @@ class MainWindow(QMainWindow):
 
     def _set_state(self, state: WorkflowState) -> None:
         self.workflow_state = state
-        presentation = describe_workflow_state(state)
+        presentation = describe_workflow_state(state, organise_enabled=self.organise_enabled.isChecked())
         self.step_label.setText(presentation.step_title)
         self.headline_label.setText(presentation.headline)
         guidance = presentation.guidance
@@ -841,11 +923,21 @@ class MainWindow(QMainWindow):
         self._update_ui()
 
     def _workflow_checklist_text(self) -> str:
+        organise_on = self.organise_enabled.isChecked()
+        compress_on = self.compress_enabled.isChecked()
         steps = [
             ("Setup", self.workflow_state == WorkflowState.SETUP, self.source_input.text().strip() and self.library_input.text().strip()),
-            ("Review", self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED}, self.preview_state is not None or self.apply_result is not None),
-            ("Apply", self.workflow_state in {WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING}, self.apply_result is not None),
-            ("Compress", self.workflow_state in {WorkflowState.PREPARING_COMPRESSION, WorkflowState.READY_TO_COMPRESS, WorkflowState.COMPRESSING}, self.encode_preparation is not None or self.encode_results),
+        ]
+        if organise_on:
+            steps += [
+                ("Review", self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED}, self.preview_state is not None or self.apply_result is not None),
+                ("Apply", self.workflow_state in {WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING}, self.apply_result is not None),
+            ]
+        if compress_on:
+            steps += [
+                ("Compress", self.workflow_state in {WorkflowState.PREPARING_COMPRESSION, WorkflowState.READY_TO_COMPRESS, WorkflowState.COMPRESSING}, self.encode_preparation is not None or bool(self.encode_results)),
+            ]
+        steps += [
             ("Summary", self.workflow_state in {WorkflowState.COMPLETED, WorkflowState.FAILED}, self.workflow_state in {WorkflowState.COMPLETED, WorkflowState.FAILED}),
         ]
         lines = []
@@ -876,6 +968,12 @@ class MainWindow(QMainWindow):
         current_has_more = False
         if has_review_selection and self.controller is not None:
             current_has_more = self.controller.items[review_index or 0].has_more
+
+        organise_on = self.organise_enabled.isChecked()
+        self.library_label.setVisible(organise_on)
+        self.library_input.setVisible(organise_on)
+        self.library_browse.setVisible(organise_on)
+        self.library_help.setVisible(organise_on)
 
         self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, has_controller or self.workflow_state in {WorkflowState.SCANNING, WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED, WorkflowState.READY_TO_APPLY, WorkflowState.APPLYING})
@@ -944,6 +1042,11 @@ class MainWindow(QMainWindow):
         if self._config_dirty and (self.controller is not None or self.encode_preparation is not None):
             return "Settings changed after runtime data was created. Re-run the affected stage before continuing."
         if self.workflow_state == WorkflowState.SETUP:
+            if not self.organise_enabled.isChecked() and self.compress_enabled.isChecked():
+                return (
+                    "Compression-only mode: mediashrink will scan the Source folder "
+                    "(or your chosen Compression Root) directly. Library / Output Folder is not used in this run."
+                )
             return "Start with the guided pipeline unless you only want a manual organise review or a compression-only run."
         return "Setup controls stay available, but later stages will ask you to rebuild stale data after changes."
 
@@ -973,14 +1076,19 @@ class MainWindow(QMainWindow):
 
     def _compress_empty_text(self) -> str:
         root = self.compression_root_input.text().strip() or "(not set)"
+        linked = self.link_compression_root.isChecked()
+        linked_to = "library / output folder" if self.organise_enabled.isChecked() else "source folder"
+        reason = f" (linked to {linked_to})" if linked else ""
         return (
             "No compression plan is ready yet.\n\n"
-            f"Compression Root: {root}\n"
-            "Prepare a compression plan from Setup or complete the guided organise flow first."
+            f"Compression Root: {root}{reason}\n"
+            "Prepare a compression plan from Setup to continue."
         )
 
     def _recommended_next_action(self) -> str:
         if self.workflow_state == WorkflowState.SETUP:
+            if not self.organise_enabled.isChecked() and self.compress_enabled.isChecked():
+                return "Prepare Compression Plan"
             return "Start Guided Pipeline"
         if self.workflow_state in {WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED}:
             return "Resolve review items and build an organisation preview"
@@ -993,9 +1101,10 @@ class MainWindow(QMainWindow):
         return "Wait for the current stage to finish"
 
     def _update_setup_summary(self) -> None:
-        lines = [
-            f"Source: {self.source_input.text().strip() or '(not set)'}",
-            f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}",
+        lines = [f"Source: {self.source_input.text().strip() or '(not set)'}"]
+        if self.organise_enabled.isChecked():
+            lines.append(f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}")
+        lines += [
             f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}",
             f"Organise enabled: {'yes' if self.organise_enabled.isChecked() else 'no'}",
             f"Compress enabled: {'yes' if self.compress_enabled.isChecked() else 'no'}",
@@ -1640,9 +1749,10 @@ class MainWindow(QMainWindow):
             f"Skipped files: {summary.skipped_files}",
             f"Failed files: {summary.failed_files}",
             f"Bytes saved: {summary.bytes_saved}",
-            f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}",
-            f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}",
         ]
+        if self.organise_enabled.isChecked():
+            lines.append(f"Library / Output Folder: {self.library_input.text().strip() or '(not set)'}")
+        lines.append(f"Compression Root: {self.compression_root_input.text().strip() or '(not set)'}")
         if summary.organise_report_path:
             lines.append(f"Organise report: {summary.organise_report_path}")
         if summary.organise_apply_report_path:

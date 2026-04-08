@@ -25,10 +25,19 @@ class WorkflowPresentation:
     guidance: str
 
 
-def describe_workflow_state(state: WorkflowState) -> WorkflowPresentation:
+def describe_workflow_state(
+    state: WorkflowState,
+    *,
+    organise_enabled: bool = True,
+) -> WorkflowPresentation:
+    if organise_enabled:
+        compress_step = "Step 4 of 4"
+    else:
+        compress_step = "Step 2 of 2"
+
     mapping = {
         WorkflowState.SETUP: WorkflowPresentation(
-            step_title="Step 1 of 4: Setup",
+            step_title="Step 1 of 4: Setup" if organise_enabled else "Step 1 of 2: Setup",
             headline="Configure source, library, and stages",
             guidance="Choose your folders, confirm stage toggles, then start a scan or guided pipeline.",
         ),
@@ -58,17 +67,17 @@ def describe_workflow_state(state: WorkflowState) -> WorkflowPresentation:
             guidance="Please wait while plexify moves or copies files.",
         ),
         WorkflowState.PREPARING_COMPRESSION: WorkflowPresentation(
-            step_title="Step 4 of 4: Prepare compression",
+            step_title=f"{compress_step}: Prepare compression",
             headline="Preparing mediashrink plan",
-            guidance="Scanning the library and building a compression plan.",
+            guidance="Scanning the compression root and building a compression plan.",
         ),
         WorkflowState.READY_TO_COMPRESS: WorkflowPresentation(
-            step_title="Step 4 of 4: Compression ready",
+            step_title=f"{compress_step}: Compression ready",
             headline="Compression plan is ready",
             guidance="Review the compression plan and start encoding when you are ready.",
         ),
         WorkflowState.COMPRESSING: WorkflowPresentation(
-            step_title="Step 4 of 4: Compressing",
+            step_title=f"{compress_step}: Compressing",
             headline="Encoding in progress",
             guidance="Progress bars show the current file and overall encode progress.",
         ),
