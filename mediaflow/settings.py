@@ -5,16 +5,20 @@ import os
 from pathlib import Path
 
 
-def get_settings_path() -> Path:
+def get_config_dir() -> Path:
     appdata = os.getenv("APPDATA")
     if appdata:
-        return Path(appdata) / "mediaflow" / "ui-state.json"
+        return Path(appdata) / "mediaflow"
 
     xdg_config = os.getenv("XDG_CONFIG_HOME")
     if xdg_config:
-        return Path(xdg_config) / "mediaflow" / "ui-state.json"
+        return Path(xdg_config) / "mediaflow"
 
-    return Path.home() / ".config" / "mediaflow" / "ui-state.json"
+    return Path.home() / ".config" / "mediaflow"
+
+
+def get_settings_path() -> Path:
+    return get_config_dir() / "ui-state.json"
 
 
 def load_ui_state(path: Path | None = None) -> dict[str, object]:

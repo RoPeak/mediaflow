@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import is_dataclass, replace
 import re
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QSystemTrayIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -38,13 +40,35 @@ from PySide6.QtWidgets import (
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
 from plexify.ui_controller import ApplyResultState, PreviewState, VideoUIController
 
+from .callback_types import PreparationProgress, PreparationStageUpdate
 from .compat import check_runtime_compatibility, compatibility_error_text
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
-from .mediashrink_adapter import missing_job_sources, prepare_compression, run_compression
+from .diagnostics import DiagnosticsRecorder
+from .integrations import (
+    build_compression_plan_rows,
+    build_encode_result_rows,
+    classify_compression_plan,
+    collect_retry_sources,
+    display_name_for_ui,
+    group_failure_rows,
+    recommended_headroom_bytes,
+    summarise_apply_result,
+)
+from .mediashrink_adapter import (
+    missing_job_sources,
+    prepare_compression,
+    prepare_retry_compression,
+    run_compression,
+)
 from .pipeline import build_pipeline_summary
 from .plexify_adapter import build_preview, build_video_controller, scan_controller
+from .progress import (
+    EncodeProgressModel,
+    PreparationProgressModel,
+    preparation_stage_title,
+    preparation_timeline_text,
+)
 from .settings import load_ui_state, save_ui_state
-from .callback_types import PreparationProgress, PreparationStageUpdate
 from .workers import FunctionWorker
 from .workflow import WorkflowState, describe_workflow_state
 
@@ -53,7 +77,6 @@ class MainWindow(QMainWindow):
     def __init__(self, *, default_source: Path | None = None, default_library: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("mediaflow")
-        self.resize(1420, 920)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.workflow_state = WorkflowState.SETUP
@@ -75,17 +98,22 @@ class MainWindow(QMainWindow):
         self._current_action = "Not started"
         self._last_completed_action = "Nothing completed yet"
         self._custom_warnings: list[str] = []
+        self._last_diagnostics_path: Path | None = None
+        self._retry_sources: set[Path] = set()
+        self._compression_plan_rows: list = []
+        self._summary_rows: list = []
+        self._plan_classification = classify_compression_plan(())
+        self._diagnostics = DiagnosticsRecorder()
+        self._encode_progress_model = EncodeProgressModel()
+        self._preparation_model = PreparationProgressModel()
 
         self._compression_start: float = 0.0
-        self._current_overall_progress: float = 0.0
         self._preparation_start: float = 0.0
         self._spinner_idx: int = 0
         self._last_encode_log_key: tuple[int, str] = (-1, "")
         self._last_encode_bucket: int = -1
         self._last_encode_file: str = ""
-        self._prepare_seen_files: int = 0
-        self._prepare_seen_bytes: int = 0
-        self._prepare_stage_key: str = "discovering"
+        self._last_status_text: str = ""
         self._startup_duration: float | None = None
         self._preparation_duration: float | None = None
         self._first_progress_delay: float | None = None
@@ -96,6 +124,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._restore_ui_state(default_source=default_source, default_library=default_library)
         self._loading_state = False
+        self._apply_initial_geometry()
         self._refresh_compression_link_label()
         if self._compression_root_linked:
             target = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
@@ -248,6 +277,12 @@ class MainWindow(QMainWindow):
         self.file_progress = QProgressBar()
         self.overall_progress = QProgressBar()
         self.start_compress_button = QPushButton("Start Compression")
+        self.include_risky_jobs = QCheckBox("Include risky follow-up jobs in the first run")
+        self.include_risky_jobs.setChecked(False)
+        self.retry_failed_button = QPushButton("Prepare Retry Plan")
+        self.retry_failed_button.setVisible(False)
+        self.retry_summary_button = QPushButton("Prepare Retry Plan")
+        self.retry_summary_button.setVisible(False)
         self.current_action_label = QLabel()
         self.current_action_label.setWordWrap(True)
         self.last_completed_label = QLabel()
@@ -256,16 +291,34 @@ class MainWindow(QMainWindow):
         self.runtime_warnings_label.setWordWrap(True)
         self.toggle_details_button = QPushButton("Show Details")
         self.toggle_details_button.setCheckable(True)
-        self.compression_table = QTableWidget(0, 7)
+        self.compression_filter_combo = QComboBox()
+        self.compression_filter_combo.addItems(
+            [
+                "All plan items",
+                "Safe selected",
+                "Risky follow-up",
+                "Informational skips",
+                "Selected only",
+                "Recommended only",
+                "Problem items",
+                "Missing items",
+            ]
+        )
+        self.compression_filter_status_label = QLabel("")
+        self.compression_filter_status_label.setWordWrap(True)
+        self.compression_filter_status_label.setObjectName("muted-label")
+        self.compression_table = QTableWidget(0, 8)
         self.compression_table.setHorizontalHeaderLabels(
-            ["File", "Codec", "Recommendation", "Reason", "Est. Output", "Est. Saving", "Selected"]
+            ["File", "Codec", "Recommendation", "Reason", "Issue", "Est. Output", "Est. Saving", "Selected"]
         )
         self.compression_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.compression_table.setSelectionMode(QTableWidget.NoSelection)
         self.compression_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.compression_table.setSortingEnabled(True)
         self.compression_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.compression_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)   # File
         self.compression_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)   # Reason
+        self.compression_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)   # Issue
         self.compression_table.horizontalHeader().setStretchLastSection(False)
         self.compress_status_log = QPlainTextEdit()
         self.compress_status_log.setReadOnly(True)
@@ -303,7 +356,7 @@ class MainWindow(QMainWindow):
         self.toggle_encode_card_button.setCheckable(True)
 
         self._compression_timer = QTimer(self)
-        self._compression_timer.setInterval(1000)
+        self._compression_timer.setInterval(250)
         self._compression_timer.timeout.connect(self._tick_compression)
 
         self.prepare_elapsed_label = QLabel("")
@@ -333,11 +386,25 @@ class MainWindow(QMainWindow):
         self.summary_mode_label = QLabel()
         self.summary_mode_label.setWordWrap(True)
         self.summary_mode_label.setObjectName("muted-label")
-        self.summary_table = QTableWidget(0, 6)
-        self.summary_table.setHorizontalHeaderLabels(["File", "Status", "Original", "Final", "Saved", "Location"])
+        self.summary_failure_label = QLabel()
+        self.summary_failure_label.setWordWrap(True)
+        self.summary_failure_label.setObjectName("muted-label")
+        self.summary_timeline_label = QLabel()
+        self.summary_timeline_label.setWordWrap(True)
+        self.summary_timeline_label.setObjectName("muted-label")
+        self.summary_filter_combo = QComboBox()
+        self.summary_filter_combo.addItems(["All results", "Encoded only", "Failed only", "Skipped only", "Retry-ready"])
+        self.summary_filter_status_label = QLabel("")
+        self.summary_filter_status_label.setWordWrap(True)
+        self.summary_filter_status_label.setObjectName("muted-label")
+        self.summary_table = QTableWidget(0, 7)
+        self.summary_table.setHorizontalHeaderLabels(
+            ["File", "Status", "Original", "Final", "Saved", "Reason", "Location"]
+        )
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.setSortingEnabled(True)
         self.summary_table.verticalHeader().setVisible(False)
         self.summary_table.setVisible(False)
         self.savings_bar = QProgressBar()
@@ -351,6 +418,9 @@ class MainWindow(QMainWindow):
         self.open_output_button.setVisible(False)
         self.save_summary_button = QPushButton("Save run summary...")
         self.save_summary_button.setVisible(False)
+        self.diagnostics_path_label = QLabel()
+        self.diagnostics_path_label.setWordWrap(True)
+        self.diagnostics_path_label.setObjectName("muted-label")
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -683,7 +753,14 @@ class MainWindow(QMainWindow):
 
     def _build_compress_tab(self) -> QWidget:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(10)
         layout.addWidget(self.compress_summary_label)
         layout.addWidget(self.compress_hint_label)
@@ -725,7 +802,11 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.runtime_warnings_label)
         status_layout.addWidget(self.run_stats_label)
         left_layout.addWidget(status_group)
-        left_layout.addWidget(self.start_compress_button)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.start_compress_button)
+        action_row.addWidget(self.retry_failed_button)
+        left_layout.addLayout(action_row)
+        left_layout.addWidget(self.include_risky_jobs)
         left_layout.addWidget(QLabel("Current file progress"))
         left_layout.addWidget(self.file_progress)
         left_layout.addWidget(QLabel("Overall encode progress"))
@@ -739,6 +820,9 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_pane)
         right_layout.setContentsMargins(4, 0, 0, 0)
         right_layout.addWidget(QLabel("Compression Plan"))
+        right_layout.addWidget(self.compression_filter_combo)
+        right_layout.addWidget(self.compression_filter_status_label)
+        self.compression_table.setMinimumHeight(280)
         right_layout.addWidget(self.compression_table, stretch=1)
         right_layout.addWidget(self.toggle_details_button)
         right_layout.addWidget(self.compress_status_log, stretch=1)
@@ -778,13 +862,26 @@ class MainWindow(QMainWindow):
         self.compress_stack.addWidget(preparing_page)
         self.compress_stack.addWidget(ready_page)
         layout.addWidget(self.compress_stack, stretch=1)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         return panel
 
     def _build_summary_tab(self) -> QWidget:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.addWidget(self.summary_headline_label)
         layout.addWidget(self.summary_mode_label)
+        layout.addWidget(self.diagnostics_path_label)
+        layout.addWidget(self.summary_failure_label)
+        layout.addWidget(self.summary_timeline_label)
         tile_row = QHBoxLayout()
         tile_row.addWidget(self.stat_files_label)
         tile_row.addWidget(self.stat_saved_label)
@@ -793,13 +890,21 @@ class MainWindow(QMainWindow):
         layout.addLayout(tile_row)
         layout.addWidget(self.summary_overview_label)
         layout.addWidget(self.savings_bar)
+        layout.addWidget(self.summary_filter_combo)
+        layout.addWidget(self.summary_filter_status_label)
+        self.summary_table.setMinimumHeight(240)
         layout.addWidget(self.summary_table, stretch=1)
+        self.summary_log.setMinimumHeight(220)
         layout.addWidget(self.summary_log, stretch=1)
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.open_output_button)
         btn_row.addWidget(self.save_summary_button)
+        btn_row.addWidget(self.retry_summary_button)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         return panel
 
     def _connect_signals(self) -> None:
@@ -834,6 +939,7 @@ class MainWindow(QMainWindow):
         self.prepare_compress_button.clicked.connect(self._prepare_compression_from_setup)
         self.reset_button.clicked.connect(lambda: self._reset_runtime_state("Cleared runtime state."))
         self.toggle_details_button.toggled.connect(self._toggle_details)
+        self.compression_filter_combo.currentTextChanged.connect(lambda *_: self._apply_compression_filter())
 
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
@@ -851,9 +957,13 @@ class MainWindow(QMainWindow):
         self.preview_button.clicked.connect(self._preview_plan)
         self.apply_button.clicked.connect(self._apply_plan)
         self.start_compress_button.clicked.connect(self._start_compression)
+        self.retry_failed_button.clicked.connect(self._prepare_retry_plan)
+        self.retry_summary_button.clicked.connect(self._prepare_retry_plan)
+        self.include_risky_jobs.toggled.connect(lambda *_: self._refresh_plan_view())
         self.open_output_button.clicked.connect(self._open_output_folder)
         self.save_summary_button.clicked.connect(self._save_run_summary)
         self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
+        self.summary_filter_combo.currentTextChanged.connect(lambda *_: self._apply_summary_filter())
 
     def _restore_ui_state(
         self,
@@ -905,6 +1015,35 @@ class MainWindow(QMainWindow):
             self.use_calibration.setChecked(saved["use_calibration"])
         if isinstance(saved.get("duplicate_policy"), str):
             self._set_combo_value(self.duplicate_policy, saved["duplicate_policy"])
+        if isinstance(saved.get("compression_filter"), str):
+            self._set_combo_value(self.compression_filter_combo, saved["compression_filter"])
+        if isinstance(saved.get("summary_filter"), str):
+            self._set_combo_value(self.summary_filter_combo, saved["summary_filter"])
+
+    def _apply_initial_geometry(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 820)
+            return
+        available = screen.availableGeometry()
+        max_width = max(960, int(available.width() * 0.96))
+        max_height = max(700, int(available.height() * 0.94))
+        saved = load_ui_state()
+        width = int(saved.get("window_width", min(1320, max_width)) or min(1320, max_width))
+        height = int(saved.get("window_height", min(860, max_height)) or min(860, max_height))
+        self.resize(min(width, max_width), min(height, max_height))
+        if all(key in saved for key in ("window_x", "window_y")):
+            x = int(saved.get("window_x", available.x()) or available.x())
+            y = int(saved.get("window_y", available.y()) or available.y())
+            clamped_x = max(available.x(), min(x, available.right() - self.width()))
+            clamped_y = max(available.y(), min(y, available.bottom() - self.height()))
+            self.move(clamped_x, clamped_y)
+        else:
+            frame = self.frameGeometry()
+            frame.moveCenter(available.center())
+            self.move(frame.topLeft())
+        if bool(saved.get("window_maximized", False)):
+            self.showMaximized()
 
     def _set_combo_value(self, combo: QComboBox, value: str) -> None:
         index = combo.findText(value)
@@ -912,6 +1051,7 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(index)
 
     def _ui_state_payload(self) -> dict[str, object]:
+        geometry = self.normalGeometry() if self.isMaximized() else self.geometry()
         return {
             "source": self.source_input.text().strip(),
             "library": self.library_input.text().strip(),
@@ -933,6 +1073,13 @@ class MainWindow(QMainWindow):
             "on_file_failure": self.on_file_failure.currentText(),
             "use_calibration": self.use_calibration.isChecked(),
             "duplicate_policy": self.duplicate_policy.currentText(),
+            "window_x": geometry.x(),
+            "window_y": geometry.y(),
+            "window_width": geometry.width(),
+            "window_height": geometry.height(),
+            "window_maximized": self.isMaximized(),
+            "compression_filter": self.compression_filter_combo.currentText(),
+            "summary_filter": self.summary_filter_combo.currentText(),
         }
 
     def _persist_ui_state(self) -> None:
@@ -1022,18 +1169,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _preparation_stage_title(stage: str) -> str:
-        lowered = stage.lower()
-        mapping = {
-            "discovering": "Discovering files",
-            "analysing": "Analysing files",
-            "benchmarking": "Benchmarking profiles",
-            "building provisional profiles...": "Building profile candidates",
-            "preparing smoke probes...": "Preparing smoke probes",
-            "smoke-probing risky container/profile combinations": "Smoke probing",
-            "scoring recommendations...": "Scoring recommendations",
-            "plan-ready": "Plan ready",
-        }
-        return mapping.get(lowered, stage.replace("_", " ").replace("-", " ").title())
+        return preparation_stage_title(stage)
 
     @staticmethod
     def _preparation_stage_key_for(stage: str) -> str:
@@ -1053,28 +1189,7 @@ class MainWindow(QMainWindow):
         return lowered
 
     def _preparation_timeline_text(self, active_stage: str) -> str:
-        stages = [
-            ("discovering", "Discovering"),
-            ("analysing", "Analysing"),
-            ("benchmarking", "Benchmarking"),
-            ("smoke-probing risky container/profile combinations", "Smoke probing"),
-            ("scoring recommendations...", "Scoring"),
-            ("plan-ready", "Plan ready"),
-        ]
-        current_index = next(
-            (idx for idx, (key, _label) in enumerate(stages) if key == active_stage),
-            0,
-        )
-        parts: list[str] = []
-        for idx, (_key, label) in enumerate(stages):
-            if idx < current_index:
-                prefix = "✓"
-            elif idx == current_index:
-                prefix = "▶"
-            else:
-                prefix = "○"
-            parts.append(f"{prefix} {label}")
-        return "  •  ".join(parts)
+        return preparation_timeline_text(active_stage)
 
     def _refresh_compression_link_label(self) -> None:
         if self.organise_enabled.isChecked():
@@ -1162,6 +1277,7 @@ class MainWindow(QMainWindow):
     def _record_warning(self, text: str) -> None:
         if text not in self._custom_warnings:
             self._custom_warnings.append(text)
+        self._diagnostics.record_warning(text)
 
     def _set_current_action(self, text: str) -> None:
         self._current_action = text
@@ -1177,6 +1293,12 @@ class MainWindow(QMainWindow):
         self.apply_result = None
         self.encode_preparation = None
         self.encode_results = []
+        self._compression_plan_rows = []
+        self._summary_rows = []
+        self._plan_classification = classify_compression_plan(())
+        self._retry_sources = set()
+        self._last_diagnostics_path = None
+        self._diagnostics = DiagnosticsRecorder()
         self._guided_mode = False
         self._continue_to_compress = False
         self._config_dirty = False
@@ -1195,6 +1317,9 @@ class MainWindow(QMainWindow):
         self.overall_progress.setValue(0)
         self._compression_timer.stop()
         self._preparation_timer.stop()
+        self._encode_progress_model.reset()
+        self._preparation_model = PreparationProgressModel()
+        self._last_status_text = ""
         self.elapsed_label.setText("Elapsed: —")
         self.eta_label.setText("ETA: —")
         self.run_stats_label.setText("Files: —")
@@ -1216,12 +1341,12 @@ class MainWindow(QMainWindow):
         self.prepare_stage_label.setText("Analysing files...")
         self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
         self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
-        self._prepare_seen_files = 0
-        self._prepare_seen_bytes = 0
-        self._prepare_stage_key = "discovering"
         self._clear_warnings()
         self._set_current_action("Not started")
         self._complete_action("Nothing completed yet")
+        self.retry_failed_button.setVisible(False)
+        self.retry_summary_button.setVisible(False)
+        self.diagnostics_path_label.setText("")
         self._refresh_pipeline_summary()
         if status_message:
             self._append_status(status_message)
@@ -1331,6 +1456,13 @@ class MainWindow(QMainWindow):
         self.apply_button.setEnabled(can_apply)
 
         self.start_compress_button.setEnabled(can_start_compression)
+        self.include_risky_jobs.setVisible(bool(self._plan_classification.risky_follow_up))
+        self.include_risky_jobs.setEnabled(has_compression_plan and not busy and not self._config_dirty)
+        can_retry = bool(self._retry_sources) and not busy and not self._config_dirty
+        self.retry_failed_button.setVisible(bool(self._retry_sources))
+        self.retry_failed_button.setEnabled(can_retry)
+        self.retry_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED and bool(self._retry_sources))
+        self.retry_summary_button.setEnabled(can_retry)
         self.open_output_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
 
@@ -1351,7 +1483,7 @@ class MainWindow(QMainWindow):
 
         warnings = list(self._custom_warnings)
         if self.overwrite.isChecked() and self.compress_enabled.isChecked():
-            warnings.append("Overwrite is enabled. Successful compression will replace originals.")
+            warnings.append("Overwrite is enabled. Successful compression will replace originals in-place.")
         if busy:
             warnings.append("A background task is currently running.")
         warning_text = "\n".join(warnings)
@@ -1361,13 +1493,11 @@ class MainWindow(QMainWindow):
         self.setup_hint_label.setText(self._setup_hint_text())
         self.review_hint_label.setText(self._review_hint_text())
         self.compress_hint_label.setText(self._compress_hint_text())
-        self.review_placeholder_label.setText(
-            "No organise review is loaded yet.\n\nStart the guided pipeline or load organise matches from Setup."
-        )
+        self.review_placeholder_label.setText(self._review_placeholder_text())
         self.compress_empty_label.setText(self._compress_empty_text())
         self.next_action_label.setText(f"Recommended next action: {self._recommended_next_action()}")
         self.overwrite_warning_label.setText(
-            "Compression will replace originals after successful encodes."
+            "Compression replaces originals after successful encodes. Review the plan carefully before starting."
             if self.overwrite.isChecked() and self.compress_enabled.isChecked()
             else ""
         )
@@ -1400,6 +1530,14 @@ class MainWindow(QMainWindow):
             return "Organisation preview is ready to apply."
         return "Some items still need a decision before organisation can continue."
 
+    def _review_placeholder_text(self) -> str:
+        if self.workflow_state == WorkflowState.SCANNING:
+            return (
+                "Scanning source with plexify...\n\n"
+                "Discovered items and candidate matches will appear here when the scan finishes."
+            )
+        return "No organise review is loaded yet.\n\nStart the guided pipeline or load organise matches from Setup."
+
     def _compress_hint_text(self) -> str:
         if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
             return "Scanning the compression root and assembling a compression plan."
@@ -1425,6 +1563,12 @@ class MainWindow(QMainWindow):
             f"Compression Root: {root}{reason}\n"
             "Prepare a compression plan from Setup to continue."
         )
+
+    def _refresh_plan_view(self) -> None:
+        if self.encode_preparation is None:
+            return
+        self._populate_compression_table(self.encode_preparation)
+        self._update_compress_summary()
 
     def _recommended_next_action(self) -> str:
         if self.workflow_state == WorkflowState.SETUP:
@@ -1472,14 +1616,41 @@ class MainWindow(QMainWindow):
             self.compress_summary_label.setText("No compression plan prepared.")
             return
         prep = self.encode_preparation
-        savings = prep.selected_input_bytes - prep.selected_estimated_output_bytes
+        runnable_sources = self._runnable_sources()
+        risky_sources = {row.source for row in self._plan_classification.risky_follow_up}
+        deferred_sources = risky_sources - runnable_sources
+        selected_input_bytes = sum(
+            row.estimated_output_bytes + row.estimated_savings_bytes
+            for row in self._compression_plan_rows
+            if row.source in runnable_sources
+        )
+        selected_estimated_output_bytes = sum(
+            row.estimated_output_bytes
+            for row in self._compression_plan_rows
+            if row.source in runnable_sources
+        )
+        savings = max(selected_input_bytes - selected_estimated_output_bytes, 0)
         lines = [
             f"Compression Root: {prep.directory}",
-            f"Input:    {self._format_bytes(prep.selected_input_bytes)} across {prep.selected_count} file(s)",
-            f"Output:   {self._format_bytes(prep.selected_estimated_output_bytes)} estimated",
+            f"Input:    {self._format_bytes(selected_input_bytes)} across {len(runnable_sources)} file(s)",
+            f"Output:   {self._format_bytes(selected_estimated_output_bytes)} estimated",
             f"Savings:  {self._format_bytes(savings)} expected",
             f"Plan:     {prep.recommended_count} recommended  |  {prep.maybe_count} maybe  |  {prep.skip_count} skipped",
         ]
+        lines.append(
+            f"Run split: {len(self._plan_classification.safe_selected)} safe now  |  "
+            f"{len(self._plan_classification.risky_follow_up)} risky follow-up  |  "
+            f"{len(self._plan_classification.informational_skips)} informational skips"
+        )
+        if deferred_sources and not self.include_risky_jobs.isChecked():
+            lines.append(
+                f"First run default: {len(runnable_sources)} safe file(s) selected now. "
+                f"{len(deferred_sources)} risky file(s) are deferred unless you explicitly include them."
+            )
+        elif self.include_risky_jobs.isChecked() and risky_sources:
+            lines.append(
+                f"Risky follow-up items are included in the next run ({len(risky_sources)} file(s))."
+            )
         if prep.compatible_count or prep.incompatible_count:
             lines.append(f"Compat:   {prep.compatible_count} compatible  |  {prep.incompatible_count} incompatible")
         if prep.size_confidence or prep.time_confidence:
@@ -1498,10 +1669,21 @@ class MainWindow(QMainWindow):
             )
         if prep.recommendation_reason:
             lines.append(f"Reason: {prep.recommendation_reason}")
+        if prep.followup_manifest_path:
+            lines.append(f"Follow-up manifest: {prep.followup_manifest_path}")
+        if self._retry_sources:
+            lines.append(
+                "Retry mode: compatibility-first review plan for failed or risky files."
+            )
         self.compress_summary_label.setText("\n".join(lines))
 
     def _append_status(self, text: str) -> None:
-        self.compress_status_log.appendPlainText(self._strip_rich(text))
+        clean = self._strip_rich(text)
+        if not clean or clean == self._last_status_text:
+            return
+        self._last_status_text = clean
+        self.compress_status_log.appendPlainText(clean)
+        self._diagnostics.record_event("status", text=clean)
 
     def _set_summary_text(self, text: str) -> None:
         self.summary_log.setPlainText(text)
@@ -1528,6 +1710,16 @@ class MainWindow(QMainWindow):
             return "A planned compression file is missing from the compression root."
         if "ffmpeg" in lowered or "ffprobe" in lowered:
             return "FFmpeg tools are unavailable. Run `mediaflow doctor` to confirm the compression toolchain."
+        if "output header failure" in lowered:
+            return (
+                "The planned output format was not compatible with one or more streams. "
+                "Prepare a retry plan for the failed items to use safer compatibility-first defaults."
+            )
+        if "container" in lowered and "incompat" in lowered:
+            return (
+                "A container compatibility issue blocked encoding. "
+                "A retry plan can review safer output assumptions for the affected files."
+            )
         if "compatibility check failed" in lowered:
             return "Installed plexify or mediashrink components are incompatible with this mediaflow build."
         return text
@@ -1548,17 +1740,22 @@ class MainWindow(QMainWindow):
             import subprocess
             subprocess.run(["xdg-open", path], check=False)  # noqa: S603, S607
 
-    def _preflight_check(self, directory: object) -> str | None:
+    def _preflight_check(self, preparation: EncodePreparation) -> str | None:
         """Return an error string if the output directory fails space or writability checks."""
         import shutil
         try:
-            root = Path(str(directory))
+            root = Path(str(preparation.directory))
             if not root.exists():
                 return f"Compression root does not exist: {root}"
             usage = shutil.disk_usage(root)
             free_gb = usage.free / (1024 ** 3)
-            if free_gb < 1.0:
-                return f"Less than 1 GB free on the compression root drive ({free_gb:.1f} GB available). Free up space before starting."
+            required_bytes = recommended_headroom_bytes(preparation)
+            if usage.free < required_bytes:
+                required_gb = required_bytes / (1024 ** 3)
+                return (
+                    "The compression root may not have enough temporary working space for a safe in-place run. "
+                    f"Available: {free_gb:.1f} GB. Recommended headroom: {required_gb:.1f} GB."
+                )
             probe = root / ".mediaflow_write_probe"
             try:
                 probe.write_bytes(b"")
@@ -1581,10 +1778,56 @@ class MainWindow(QMainWindow):
         sections = [
             self.summary_headline_label.text().strip(),
             self.summary_mode_label.text().strip(),
+            self.diagnostics_path_label.text().strip(),
             self.summary_overview_label.text().strip(),
             self.summary_log.toPlainText().strip(),
         ]
         return "\n\n".join(section for section in sections if section)
+
+    def _snapshot_config_for_diagnostics(self) -> dict[str, object]:
+        payload = self._ui_state_payload()
+        payload["workflow_state"] = self.workflow_state.value
+        return payload
+
+    def _summary_timeline_text(self) -> str:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for event in self._diagnostics.events:
+            kind = str(event.get("kind", ""))
+            label = ""
+            if kind == "guided_pipeline_started":
+                label = "Guided start"
+            elif kind == "scan_started":
+                label = "Scan"
+            elif kind == "manual_match":
+                label = "Manual match"
+            elif kind == "organisation_preview_ready":
+                label = "Preview"
+            elif kind == "organisation_applied":
+                label = "Apply"
+            elif kind == "compression_prepared":
+                label = "Prepare compression"
+            elif kind == "compression_started":
+                label = "Compression start"
+            elif kind == "compression_complete":
+                label = "Completion"
+            if label and label not in seen:
+                seen.add(label)
+                labels.append(label)
+        return f"Run timeline: {'  •  '.join(labels)}" if labels else ""
+
+    def _flush_diagnostics(self, *, failure_message: str | None = None) -> None:
+        summary = {
+            "workflow_state": self.workflow_state.value,
+            "organise_enabled": self.organise_enabled.isChecked(),
+            "compress_enabled": self.compress_enabled.isChecked(),
+            "warnings": list(self._custom_warnings),
+            "summary_headline": self.summary_headline_label.text().strip(),
+            "summary_overview": self.summary_overview_label.text().strip(),
+        }
+        failure = {"message": failure_message} if failure_message else None
+        self._last_diagnostics_path = self._diagnostics.write(summary=summary, failure=failure)
+        self.diagnostics_path_label.setText(f"Diagnostics: {self._last_diagnostics_path}")
 
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
@@ -1592,6 +1835,12 @@ class MainWindow(QMainWindow):
         self._complete_action("Last operation failed")
         summary, technical_detail = self._summarise_error(message)
         self._record_warning(summary)
+        self._diagnostics.record_event(
+            "error",
+            summary=summary,
+            technical_detail=technical_detail or message,
+            workflow_state=self.workflow_state.value,
+        )
         self._set_state(WorkflowState.FAILED)
         self._set_summary_text(
             "\n".join(
@@ -1605,6 +1854,7 @@ class MainWindow(QMainWindow):
             ).strip()
         )
         self._switch_tab("summary")
+        self._flush_diagnostics(failure_message=summary)
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Critical)
         dialog.setWindowTitle("mediaflow")
@@ -1646,6 +1896,8 @@ class MainWindow(QMainWindow):
             return
         self._persist_ui_state()
         self._reset_runtime_state()
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        self._diagnostics.record_event("scan_started", source=str(config.source), library=str(config.library))
         self._guided_mode = False
         self._continue_to_compress = False
         self._set_current_action("Scanning source with plexify")
@@ -1665,6 +1917,13 @@ class MainWindow(QMainWindow):
             return
         self._persist_ui_state()
         self._reset_runtime_state()
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        self._diagnostics.record_event(
+            "guided_pipeline_started",
+            source=str(config.source),
+            library=str(config.library),
+            compression_root=str(config.compression_root),
+        )
         self._guided_mode = True
         self._continue_to_compress = config.shrink.enabled
         if config.plexify.enabled:
@@ -1890,7 +2149,8 @@ class MainWindow(QMainWindow):
             self._show_error("Enter a manual title first.")
             return
         self.controller.manual_select(index, title=title)
-        self._append_status(f"Manually selected a title for item {index + 1}.")
+        self._diagnostics.record_event("manual_match", item=index + 1, title=title)
+        self._append_status(f"Manually selected '{title}' for item {index + 1}.")
         self._refresh_review()
 
     def _apply_choice_to_folder(self) -> None:
@@ -1938,6 +2198,7 @@ class MainWindow(QMainWindow):
             self._set_state(WorkflowState.REVIEW_BLOCKED)
             self._set_current_action("Manual review is still required")
         if not rebuild_only:
+            self._diagnostics.record_event("organisation_preview_ready", can_apply=self.preview_state.can_apply)
             self._append_status("Built organisation preview.")
             self._complete_action("Built organisation preview")
 
@@ -1963,6 +2224,14 @@ class MainWindow(QMainWindow):
 
     def _apply_complete(self, result: ApplyResultState) -> None:
         self.apply_result = result
+        self._diagnostics.record_event(
+            "organisation_applied",
+            moved_count=len(tuple(getattr(getattr(result, "result", None), "moved", []) or [])),
+            skipped_count=len(tuple(getattr(getattr(result, "result", None), "skipped", []) or [])),
+            error_count=len(tuple(getattr(getattr(result, "result", None), "errors", []) or [])),
+        )
+        for warning in getattr(result, "warnings", []) or []:
+            self._record_warning(str(warning))
         self._complete_action("Organisation stage complete")
         self._append_status("Organisation stage complete.")
         self._refresh_pipeline_summary()
@@ -1970,6 +2239,7 @@ class MainWindow(QMainWindow):
             if not self._guided_compression_can_continue():
                 self._set_state(WorkflowState.COMPLETED)
                 self._switch_tab("summary")
+                self._flush_diagnostics()
                 return
             self._append_status("Preparing compression plan after organisation.")
             self._prepare_compression_after_apply()
@@ -1977,6 +2247,7 @@ class MainWindow(QMainWindow):
         self._set_state(WorkflowState.COMPLETED)
         self._set_current_action("Pipeline finished")
         self._switch_tab("summary")
+        self._flush_diagnostics()
         self._notify_completion("Organisation complete", "Organisation stage finished.")
 
     def _guided_compression_can_continue(self) -> bool:
@@ -2014,6 +2285,15 @@ class MainWindow(QMainWindow):
             self._show_error("Compress stage is disabled.")
             return
         self._persist_ui_state()
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        self._diagnostics.record_event(
+            "compression_preparation_started",
+            compression_root=str(config.compression_root),
+            overwrite=config.shrink.overwrite,
+            policy=config.shrink.policy,
+            on_file_failure=config.shrink.on_file_failure,
+        )
+        self._retry_sources = set()
         if self._config_dirty and self.encode_preparation is not None:
             self.encode_preparation = None
             self.compression_table.setRowCount(0)
@@ -2021,14 +2301,12 @@ class MainWindow(QMainWindow):
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
         self.compress_status_log.clear()
+        self._preparation_model = PreparationProgressModel()
         self.compress_preparing_label.setText("Preparing a compression plan...")
         self.prepare_elapsed_label.setText("")
         self.prepare_stage_label.setText("Discovering files...")
         self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
         self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
-        self._prepare_seen_files = 0
-        self._prepare_seen_bytes = 0
-        self._prepare_stage_key = "discovering"
         self._preparation_duration = None
         self.prepare_log.clear()
         self.prepare_log.appendPlainText("Preparing compression plan...")
@@ -2043,53 +2321,70 @@ class MainWindow(QMainWindow):
 
     def _preparation_progress(self, payload: object) -> None:
         if isinstance(payload, PreparationStageUpdate):
-            self._prepare_stage_key = self._preparation_stage_key_for(payload.stage)
+            clean = self._strip_rich(payload.message)
+            self._preparation_model.update_stage(
+                payload.stage,
+                clean,
+                completed=payload.completed,
+                total=payload.total,
+            )
             self.prepare_stage_label.setText(self._preparation_stage_title(payload.stage))
-            self.prepare_timeline_label.setText(self._preparation_timeline_text(self._prepare_stage_key))
-            self.compress_preparing_label.setText(payload.message)
-            self.prepare_log.appendPlainText(self._strip_rich(payload.message))
-            self._set_current_action(self._strip_rich(payload.message))
-            if payload.completed is not None and payload.total:
-                self.prepare_progress.setRange(0, 100)
-                self.prepare_progress.setValue(int((payload.completed / payload.total) * 100))
+            self.prepare_timeline_label.setText(self._preparation_timeline_text(self._preparation_model.stage_key))
+            self.compress_preparing_label.setText(clean)
+            self.prepare_log.appendPlainText(clean)
+            self._set_current_action(clean)
+            self.prepare_progress.setRange(0, 100)
+            self.prepare_progress.setValue(int(self._preparation_model.progress_ratio * 100))
+            self._diagnostics.record_event(
+                "preparation_stage",
+                stage=self._preparation_model.stage_key,
+                message=clean,
+                completed=payload.completed,
+                total=payload.total,
+            )
             return
         if not isinstance(payload, PreparationProgress):
             return
         completed, total, path = payload.completed, payload.total, payload.path
-        self._prepare_stage_key = "analysing"
+        file_size = 0
+        if path:
+            try:
+                file_size = Path(path).stat().st_size
+            except OSError:
+                file_size = 0
+        file_name = Path(path).name
+        self._preparation_model.update_analysis(completed, total, file_name, file_size)
         self.prepare_stage_label.setText("Analysing files")
         self.prepare_timeline_label.setText(self._preparation_timeline_text("analysing"))
         self.prepare_progress.setRange(0, 100)
-        if total:
-            self.prepare_progress.setValue(int((completed / total) * 100))
-        file_name = Path(path).name
-        if path:
-            try:
-                self._prepare_seen_bytes += Path(path).stat().st_size
-            except OSError:
-                pass
-        self._prepare_seen_files = max(self._prepare_seen_files, completed)
+        self.prepare_progress.setValue(int(self._preparation_model.progress_ratio * 100))
         self.prepare_counts_label.setText(
-            f"{self._prepare_seen_files} file(s) discovered • {self._format_bytes(self._prepare_seen_bytes)}"
+            f"{self._preparation_model.discovered_files} file(s) discovered • "
+            f"{self._format_bytes(self._preparation_model.discovered_bytes)}"
         )
         self.compress_preparing_label.setText(f"Analysing {completed} of {total} file(s)")
         self._set_current_action(f"Analysing {completed}/{total}: {file_name}")
         self.prepare_log.appendPlainText(f"[{completed}/{total}] {file_name}")
-        if total and completed >= total:
-            self._prepare_stage_key = "benchmarking"
-            self.prepare_stage_label.setText("Benchmarking profiles")
-            self.prepare_timeline_label.setText(self._preparation_timeline_text("benchmarking"))
+        self._diagnostics.record_event(
+            "preparation_file",
+            completed=completed,
+            total=total,
+            path=path,
+            size_bytes=file_size,
+        )
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self._preparation_timer.stop()
         self._preparation_duration = time.monotonic() - self._preparation_start
         self.prepare_elapsed_label.setText("")
+        self._preparation_model.mark_ready()
         self.prepare_stage_label.setText("Plan ready.")
         self.prepare_timeline_label.setText(self._preparation_timeline_text("plan-ready"))
         self.encode_preparation = preparation
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(100)
         self._populate_compression_table(preparation)
+        self.include_risky_jobs.setChecked(False)
         self._config_dirty = False
         self._refresh_pipeline_summary()
         self._switch_tab("compress")
@@ -2118,19 +2413,32 @@ class MainWindow(QMainWindow):
         self._append_status(
             f"Prepared compression plan for {preparation.selected_count} file(s) from {preparation.directory}."
         )
+        self._diagnostics.record_event(
+            "compression_prepared",
+            selected_count=preparation.selected_count,
+            recommended_count=preparation.recommended_count,
+            maybe_count=preparation.maybe_count,
+            skip_count=preparation.skip_count,
+            selected_input_bytes=preparation.selected_input_bytes,
+            selected_estimated_output_bytes=preparation.selected_estimated_output_bytes,
+        )
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
         self.compression_table.setRowCount(0)
+        self._compression_plan_rows = build_compression_plan_rows(preparation)
+        self._plan_classification = classify_compression_plan(self._compression_plan_rows)
         if preparation is None:
             return
-        selected_sources = {job.source for job in preparation.jobs}
-        for row, item in enumerate(preparation.items):
+        self.compression_table.setSortingEnabled(False)
+        for row, item in enumerate(self._compression_plan_rows):
             self.compression_table.insertRow(row)
-            selected_text = "yes" if item.source in selected_sources else "no"
-            if item.source in selected_sources and not item.source.exists():
+            selected_text = "yes" if item.selected else "no"
+            if item.selected and not item.exists:
                 selected_text = "missing"
+            elif item.classification == "risky-follow-up" and not self.include_risky_jobs.isChecked():
+                selected_text = "deferred"
             est_output = self._format_bytes(item.estimated_output_bytes) if item.estimated_output_bytes else ""
             if item.estimated_savings_bytes and item.estimated_output_bytes:
                 total_size = item.estimated_output_bytes + item.estimated_savings_bytes
@@ -2141,10 +2449,11 @@ class MainWindow(QMainWindow):
             else:
                 est_saving = ""
             values = [
-                item.source.name,
+                item.display_name,
                 item.codec or "",
                 item.recommendation,
-                item.reason_text,
+                item.plain_reason or item.reason,
+                item.risk_reason or item.issue,
                 est_output,
                 est_saving,
                 selected_text,
@@ -2154,6 +2463,140 @@ class MainWindow(QMainWindow):
                 cell.setToolTip(str(value))
                 self.compression_table.setItem(row, column, cell)
             self.compression_table.item(row, 0).setToolTip(str(item.source))
+        self.compression_table.setSortingEnabled(True)
+        self._apply_compression_filter()
+
+    def _apply_compression_filter(self) -> None:
+        mode = self.compression_filter_combo.currentText()
+        visible_rows = 0
+        for row_index in range(self.compression_table.rowCount()):
+            selected_text = (self.compression_table.item(row_index, 7).text() if self.compression_table.item(row_index, 7) else "")
+            recommendation = (self.compression_table.item(row_index, 2).text() if self.compression_table.item(row_index, 2) else "")
+            issue = (self.compression_table.item(row_index, 4).text() if self.compression_table.item(row_index, 4) else "")
+            reason = (self.compression_table.item(row_index, 3).text() if self.compression_table.item(row_index, 3) else "")
+            hide = False
+            if mode == "Safe selected":
+                hide = selected_text != "yes" or "Deferred by default" in issue
+            elif mode == "Risky follow-up":
+                hide = "Deferred by default" not in issue
+            elif mode == "Informational skips":
+                hide = "Already efficient codec" not in reason
+            elif mode == "Selected only":
+                hide = selected_text not in {"yes", "missing"}
+            elif mode == "Recommended only":
+                hide = recommendation != "recommended"
+            elif mode == "Problem items":
+                hide = not bool(issue)
+            elif mode == "Missing items":
+                hide = selected_text != "missing"
+            self.compression_table.setRowHidden(row_index, hide)
+            if not hide:
+                visible_rows += 1
+        self.compression_filter_status_label.setText(
+            f"No plan rows match the '{mode}' filter." if visible_rows == 0 and self.compression_table.rowCount() else ""
+        )
+
+    def _apply_summary_filter(self) -> None:
+        mode = self.summary_filter_combo.currentText()
+        visible_rows = 0
+        for row_index in range(self.summary_table.rowCount()):
+            status = (self.summary_table.item(row_index, 1).text() if self.summary_table.item(row_index, 1) else "")
+            retry_ready = (
+                self.summary_table.item(row_index, 5).data(Qt.UserRole)
+                if self.summary_table.item(row_index, 5)
+                else False
+            )
+            hide = False
+            if mode == "Encoded only":
+                hide = status != "Encoded"
+            elif mode == "Failed only":
+                hide = status != "Failed"
+            elif mode == "Skipped only":
+                hide = status != "Skipped"
+            elif mode == "Retry-ready":
+                hide = not bool(retry_ready)
+            self.summary_table.setRowHidden(row_index, hide)
+            if not hide:
+                visible_rows += 1
+        self.summary_filter_status_label.setText(
+            f"No results match the '{mode}' filter." if visible_rows == 0 and self.summary_table.rowCount() else ""
+        )
+
+    def _prepare_retry_plan(self) -> None:
+        if not self._retry_sources:
+            self._show_error("There are no failed or compatibility-risk items to retry.")
+            return
+        try:
+            config = self._current_config()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._persist_ui_state()
+        self.encode_preparation = None
+        self.encode_results = []
+        self._config_dirty = False
+        self._diagnostics.record_event(
+            "retry_preparation_started",
+            retry_sources=[str(path) for path in sorted(self._retry_sources)],
+        )
+        self.prepare_progress.setRange(0, 0)
+        self.prepare_log.clear()
+        self.prepare_log.appendPlainText("Preparing compatibility-first retry plan...")
+        self.compress_preparing_label.setText("Preparing compatibility-first retry plan...")
+        self.prepare_stage_label.setText("Discovering files...")
+        self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
+        self._preparation_model = PreparationProgressModel()
+        self._set_current_action("Preparing retry plan for failed or risky files")
+        self._set_state(WorkflowState.PREPARING_COMPRESSION)
+        self._switch_tab("compress")
+        self._preparation_start = time.monotonic()
+        self._preparation_timer.start()
+        worker = FunctionWorker(prepare_retry_compression, config, set(self._retry_sources))
+        self._start_worker(worker, self._compression_prepared, self._preparation_progress)
+
+    def _runnable_sources(self) -> set[Path]:
+        if self.include_risky_jobs.isChecked():
+            return {row.source for row in self._compression_plan_rows if row.selected and row.exists}
+        return {
+            row.source
+            for row in self._compression_plan_rows
+            if row.selected and row.exists and row.classification != "risky-follow-up"
+        }
+
+    def _runnable_jobs(self, preparation: EncodePreparation) -> list:
+        runnable_sources = self._runnable_sources()
+        return [job for job in preparation.jobs if getattr(job, "source", None) in runnable_sources]
+
+    def _build_runnable_preparation(self, preparation: EncodePreparation) -> EncodePreparation:
+        jobs = self._runnable_jobs(preparation)
+        job_sources = {getattr(job, "source", None) for job in jobs}
+        selected_input_bytes = sum(
+            row.estimated_output_bytes + row.estimated_savings_bytes
+            for row in self._compression_plan_rows
+            if row.source in job_sources
+        )
+        selected_estimated_output_bytes = sum(
+            row.estimated_output_bytes
+            for row in self._compression_plan_rows
+            if row.source in job_sources
+        )
+        if is_dataclass(preparation):
+            return replace(
+                preparation,
+                jobs=jobs,
+                selected_count=len(jobs),
+                selected_input_bytes=selected_input_bytes,
+                selected_estimated_output_bytes=selected_estimated_output_bytes,
+            )
+        payload = dict(vars(preparation))
+        payload.update(
+            jobs=jobs,
+            selected_count=len(jobs),
+            selected_input_bytes=selected_input_bytes,
+            selected_estimated_output_bytes=selected_estimated_output_bytes,
+        )
+        return preparation.__class__(**payload)
 
     def _update_encode_dashboard(self, progress: EncodeProgress | None) -> None:
         prep = self.encode_preparation
@@ -2171,20 +2614,21 @@ class MainWindow(QMainWindow):
             if prep.profile is not None
             else "No profile selected"
         )
+        runnable_jobs = self._runnable_jobs(prep)
         if progress is None:
-            filename = prep.jobs[0].source.name if prep.jobs else "Compression plan ready"
+            filename = display_name_for_ui(runnable_jobs[0].source.name) if runnable_jobs else "Compression plan ready"
             phase = "Ready to encode"
-            file_progress = 0.0
-            overall_progress = 0.0
-            completed = 0
-            remaining = len(prep.jobs)
+            file_progress = self._encode_progress_model.displayed_file_progress
+            overall_progress = self._encode_progress_model.overall_progress
+            completed = self._encode_progress_model.completed_files
+            remaining = len(runnable_jobs) if prep.jobs else self._encode_progress_model.remaining_files
         else:
-            filename = self._strip_rich(progress.current_file)
-            phase = self._normalize_heartbeat_state(progress.heartbeat_state)
-            file_progress = progress.current_file_progress
-            overall_progress = progress.overall_progress
-            completed = progress.completed_files
-            remaining = progress.remaining_files
+            filename = self._encode_progress_model.current_file_name
+            phase = self._encode_progress_model.phase
+            file_progress = self._encode_progress_model.displayed_file_progress
+            overall_progress = self._encode_progress_model.overall_progress
+            completed = self._encode_progress_model.completed_files
+            remaining = self._encode_progress_model.remaining_files
 
         self.encode_filename_label.setText(filename)
         self.encode_phase_label.setText(f"Phase: {phase} • Profile: {profile_text}")
@@ -2213,7 +2657,7 @@ class MainWindow(QMainWindow):
 
     def _log_encode_milestones(self, progress: EncodeProgress) -> None:
         total = progress.completed_files + progress.remaining_files
-        file_name = self._strip_rich(progress.current_file)
+        file_name = display_name_for_ui(self._strip_rich(progress.current_file))
         phase = self._normalize_heartbeat_state(progress.heartbeat_state)
         bucket = self._progress_bucket(progress.current_file_progress)
 
@@ -2248,15 +2692,16 @@ class MainWindow(QMainWindow):
         if self._config_dirty:
             self._show_error("Settings changed after the compression plan was prepared. Prepare the plan again.")
             return
-        if not self.encode_preparation.jobs:
+        runnable_preparation = self._build_runnable_preparation(self.encode_preparation)
+        if not runnable_preparation.jobs:
             self._show_error("There are no jobs selected in the current compression plan.")
             return
-        preflight_error = self._preflight_check(self.encode_preparation.directory)
+        preflight_error = self._preflight_check(runnable_preparation)
         if preflight_error:
             self._show_error(preflight_error)
             return
-        missing_sources = missing_job_sources(self.encode_preparation)
-        if missing_sources and len(missing_sources) == len(self.encode_preparation.jobs):
+        missing_sources = missing_job_sources(runnable_preparation)
+        if missing_sources and len(missing_sources) == len(runnable_preparation.jobs):
             self._show_error(
                 f"All planned compression files are missing from the compression root. First missing file: {missing_sources[0]}"
             )
@@ -2269,10 +2714,16 @@ class MainWindow(QMainWindow):
                 f"Skipping {len(missing_sources)} missing file(s) before compression starts."
             )
         if self.overwrite.isChecked():
+            job_count = len(runnable_preparation.jobs)
+            input_size = self._format_bytes(runnable_preparation.selected_input_bytes)
+            projected = self._format_bytes(runnable_preparation.selected_estimated_output_bytes)
             confirm_msg = (
                 "Start compression?\n\n"
-                "WARNING: Originals will be permanently replaced after a successful encode. "
-                "This cannot be undone."
+                f"About to process {job_count} file(s).\n"
+                f"Input size: {input_size}\n"
+                f"Estimated output: {projected}\n\n"
+                "WARNING: Originals will be replaced in-place after each successful encode. "
+                "Keep the compression root unchanged during the run."
             )
         else:
             confirm_msg = "Start compression with the current plan?"
@@ -2284,21 +2735,30 @@ class MainWindow(QMainWindow):
         self._set_state(WorkflowState.COMPRESSING)
         self._append_status("Starting compression.")
         self._compression_start = time.monotonic()
-        self._current_overall_progress = 0.0
+        self._encode_progress_model.reset()
         self._last_encode_log_key = (-1, "")
         self._last_encode_bucket = -1
         self._last_encode_file = ""
+        self._last_status_text = ""
         self._first_progress_delay = None
         self.elapsed_label.setText("Elapsed: 0s")
-        self.eta_label.setText("ETA: calculating...")
+        self.eta_label.setText("ETA: settling...")
         self.encode_speed_label.setText("")
         self.encode_visual_bar.setValue(0)
         self.encode_projection_bar.setValue(0)
         self.encode_filename_label.setText("Starting...")
         self.toggle_encode_card_button.setChecked(False)  # always show card on new run
         self._update_encode_dashboard(None)
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        self._diagnostics.record_event(
+            "compression_started",
+            jobs=len(runnable_preparation.jobs),
+            selected_input_bytes=runnable_preparation.selected_input_bytes,
+            selected_estimated_output_bytes=runnable_preparation.selected_estimated_output_bytes,
+            deferred_risky=[str(path) for path in sorted({row.source for row in self._plan_classification.risky_follow_up} - self._runnable_sources())],
+        )
         self._compression_timer.start()
-        worker = FunctionWorker(run_compression, self.encode_preparation)
+        worker = FunctionWorker(run_compression, runnable_preparation)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
 
     def _encode_progress(self, progress: object) -> None:
@@ -2306,15 +2766,38 @@ class MainWindow(QMainWindow):
             return
         if self._first_progress_delay is None and self._compression_start > 0:
             self._first_progress_delay = time.monotonic() - self._compression_start
-        self.file_progress.setValue(int(progress.current_file_progress * 100))
-        self.overall_progress.setValue(int(progress.overall_progress * 100))
-        self._current_overall_progress = progress.overall_progress
+        now = time.monotonic()
+        file_name = display_name_for_ui(self._strip_rich(progress.current_file))
+        phase = self._normalize_heartbeat_state(progress.heartbeat_state)
+        self._encode_progress_model.update_from_progress(
+            current_file_name=file_name,
+            phase=phase,
+            current_file_progress=progress.current_file_progress,
+            overall_progress=progress.overall_progress,
+            completed_files=progress.completed_files,
+            remaining_files=progress.remaining_files,
+            bytes_processed=int(getattr(progress, "bytes_processed", 0) or 0),
+            total_bytes=int(getattr(progress, "total_bytes", 0) or 0),
+            now=now,
+        )
+        self._encode_progress_model.tick(now, now - self._compression_start)
+        self.file_progress.setValue(int(self._encode_progress_model.displayed_file_progress * 100))
+        self.overall_progress.setValue(int(self._encode_progress_model.overall_progress * 100))
         total = progress.completed_files + progress.remaining_files
         self.run_stats_label.setText(f"Files: {progress.completed_files} done / {total} total")
-        file_name = self._strip_rich(progress.current_file)
-        phase = self._normalize_heartbeat_state(progress.heartbeat_state)
         self._set_current_action(
             f"{file_name}\nCompleted: {progress.completed_files}  |  Remaining: {progress.remaining_files}  |  Phase: {phase}"
+        )
+        self._diagnostics.record_event(
+            "encode_progress",
+            current_file=file_name,
+            phase=phase,
+            current_file_progress=round(progress.current_file_progress, 2),
+            overall_progress=round(progress.overall_progress, 2),
+            completed_files=progress.completed_files,
+            remaining_files=progress.remaining_files,
+            bytes_processed=int(getattr(progress, "bytes_processed", 0) or 0),
+            total_bytes=getattr(progress, "total_bytes", 0),
         )
         self._update_encode_dashboard(progress)
         self._log_encode_milestones(progress)
@@ -2332,11 +2815,20 @@ class MainWindow(QMainWindow):
             self._record_warning(
                 f"{missing_count} planned file(s) were missing when compression started. The compression root changed after planning."
             )
+        self._retry_sources = collect_retry_sources(self.encode_preparation, self.encode_results)
+        self._diagnostics.record_event(
+            "compression_complete",
+            encoded=sum(1 for row in build_encode_result_rows(self.encode_results) if row.is_encoded),
+            failed=sum(1 for row in build_encode_result_rows(self.encode_results) if row.is_failed),
+            skipped=sum(1 for row in build_encode_result_rows(self.encode_results) if row.is_skipped),
+            retry_sources=[str(path) for path in sorted(self._retry_sources)],
+        )
         self._append_status("Compression stage complete.")
         self._update_encode_dashboard(None)
         self._refresh_pipeline_summary()
         self._switch_tab("summary")
         self._set_state(WorkflowState.COMPLETED)
+        self._flush_diagnostics()
         self._notify_completion("Compression complete", f"Encoded {len(self.encode_results)} file(s).")
 
     def _notify_completion(self, title: str, message: str) -> None:
@@ -2359,27 +2851,28 @@ class MainWindow(QMainWindow):
     def _tick_compression(self) -> None:
         elapsed = time.monotonic() - self._compression_start
         self.elapsed_label.setText(f"Elapsed: {self._format_elapsed(elapsed)}")
-        p = self._current_overall_progress
+        self._encode_progress_model.tick(time.monotonic(), elapsed)
+        p = self._encode_progress_model.overall_progress
 
         # Animate spinner and update encode card
         self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
         self.spinner_label.setText(self._SPINNER_FRAMES[self._spinner_idx])
-        self.encode_visual_bar.setValue(int(p * 100))
+        self.file_progress.setValue(int(self._encode_progress_model.displayed_file_progress * 100))
+        self.overall_progress.setValue(int(p * 100))
+        self.encode_visual_bar.setValue(int(self._encode_progress_model.displayed_file_progress * 100))
 
-        if p > 0.02:
-            eta = elapsed / p * (1 - p)
+        if self._encode_progress_model.eta_seconds is not None:
+            eta = self._encode_progress_model.eta_seconds
             self.eta_label.setText(f"ETA: {self._format_elapsed(eta)}")
-            # Estimate encode speed from known input size and progress
-            if self.encode_preparation and self.encode_preparation.selected_input_bytes > 0:
-                bytes_done = p * self.encode_preparation.selected_input_bytes
-                speed_mbs = bytes_done / max(elapsed, 0.1) / 1_048_576
-                self.encode_speed_label.setText(f"~{speed_mbs:.1f} MB/s")
-                self.encode_counts_label.setText(
-                    f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA {self._format_elapsed(eta)}"
-                )
-        else:
+            if self._encode_progress_model.speed_mbps is not None:
+                self.encode_speed_label.setText(f"~{self._encode_progress_model.speed_mbps:.1f} MB/s")
             self.encode_counts_label.setText(
-                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)}"
+                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA {self._format_elapsed(eta)}"
+            )
+        else:
+            self.eta_label.setText("ETA: settling...")
+            self.encode_counts_label.setText(
+                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA settling"
             )
 
     def _tick_preparation(self) -> None:
@@ -2388,6 +2881,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_pipeline_summary(self) -> None:
         summary = build_pipeline_summary(self.apply_result, self.encode_results)
+        apply_stats = summarise_apply_result(self.apply_result)
         organise_on = self.organise_enabled.isChecked()
         compress_on = self.compress_enabled.isChecked()
 
@@ -2405,7 +2899,8 @@ class MainWindow(QMainWindow):
 
         if organise_on or self.apply_result is not None:
             lines += [
-                f"Organised:        {summary.organised_plans} file(s)",
+                f"Organised:        {summary.organised_files} file(s)",
+                f"Organise skipped: {summary.organise_skipped} file(s)",
                 f"Organise errors:  {summary.organised_errors}",
             ]
 
@@ -2447,9 +2942,13 @@ class MainWindow(QMainWindow):
             lines.append(f"Organise report: {summary.organise_report_path}")
         if summary.organise_apply_report_path:
             lines.append(f"Organise apply report: {summary.organise_apply_report_path}")
+        if self._last_diagnostics_path is not None:
+            lines.append(f"Diagnostics:     {self._last_diagnostics_path}")
 
         self.summary_overview_label.setText("\n".join(lines))
-
+        self.diagnostics_path_label.setText(
+            f"Diagnostics: {self._last_diagnostics_path}" if self._last_diagnostics_path else ""
+        )
         # Stat tiles
         encoded = summary.encoded_files
         self.stat_files_label.setText(f"{encoded}\nfile{'s' if encoded != 1 else ''} encoded")
@@ -2474,38 +2973,61 @@ class MainWindow(QMainWindow):
 
         # Per-file results table
         self.summary_table.setRowCount(0)
-        for result in self.encode_results:
+        self._summary_rows = build_encode_result_rows(self.encode_results)
+        self.summary_table.setSortingEnabled(False)
+        for result in self._summary_rows:
             row = self.summary_table.rowCount()
             self.summary_table.insertRow(row)
-            if result.skipped:
-                status, orig, final, saved_str = "Skipped", "", "", ""
-            elif result.success:
-                input_b = int(getattr(result, "input_size_bytes", 0) or 0)
-                output_b = int(getattr(result, "output_size_bytes", 0) or 0)
-                status = "Encoded"
-                orig = self._format_bytes(input_b) if input_b else ""
-                final = self._format_bytes(output_b) if output_b else ""
-                if input_b > 0 and output_b > 0:
-                    saved_b = input_b - output_b
-                    pct = 100 * saved_b / input_b
-                    saved_str = f"{self._format_bytes(saved_b)} ({pct:.1f}%)"
-                else:
-                    saved_str = ""
+            orig = self._format_bytes(result.original_bytes) if result.original_bytes else ""
+            final = self._format_bytes(result.final_bytes) if result.final_bytes else ""
+            if result.saved_bytes and result.original_bytes:
+                pct = 100 * result.saved_bytes / result.original_bytes
+                saved_str = f"{self._format_bytes(result.saved_bytes)} ({pct:.1f}%)"
             else:
-                status, orig, final, saved_str = "Failed", "", "", ""
-            values = [result.job.source.name, status, orig, final, saved_str, str(result.job.source)]
+                saved_str = ""
+            values = [
+                result.display_name,
+                result.status,
+                orig,
+                final,
+                saved_str,
+                result.reason,
+                str(result.source),
+            ]
             for col, val in enumerate(values):
                 cell = QTableWidgetItem(val)
-                cell.setToolTip(val)
+                if col == 5:
+                    cell.setData(Qt.UserRole, result.retry_ready)
+                    if result.raw_reason and result.raw_reason != result.reason:
+                        cell.setToolTip(f"{result.reason}\n\nRaw detail:\n{result.raw_reason}")
+                    else:
+                        cell.setToolTip(val)
+                else:
+                    cell.setToolTip(val)
                 self.summary_table.setItem(row, col, cell)
+        self.summary_table.setSortingEnabled(True)
         self.summary_table.resizeColumnsToContents()
         self.summary_table.setVisible(bool(self.encode_results))
+        self._apply_summary_filter()
+        failure_groups = group_failure_rows(self._summary_rows) if self._summary_rows else []
+        if failure_groups:
+            self.summary_failure_label.setText(
+                "\n".join(
+                    f"Failure summary: {group.summary} ({group.count})\nNext step: {group.guidance}"
+                    for group in failure_groups
+                )
+            )
+        else:
+            self.summary_failure_label.setText("")
+        self.summary_timeline_label.setText(self._summary_timeline_text())
 
         details: list[str] = []
         if self.preview_state is not None:
             details.extend(["Organisation preview", *self.preview_state.summary_lines, ""])
         if self.apply_result is not None:
             details.extend(["Organisation apply", *self.apply_result.summary_lines, ""])
+            if apply_stats.warnings:
+                details.extend(["Apply warnings", *(f"- {warning}" for warning in apply_stats.warnings), ""])
         if self.encode_preparation is not None:
             details.extend(["Compression plan", self.compress_summary_label.text(), ""])
         if self._custom_warnings:
@@ -2521,7 +3043,7 @@ class MainWindow(QMainWindow):
             any_success = False
             for result in self.encode_results:
                 if result.skipped:
-                    details.append(f"- {result.job.source.name}: skipped")
+                    details.append(f"- {display_name_for_ui(result.job.source.name)}: skipped")
                 elif result.success:
                     any_success = True
                     input_b = int(getattr(result, "input_size_bytes", 0) or 0)
@@ -2532,16 +3054,22 @@ class MainWindow(QMainWindow):
                         size_line = f"  encoded:  {self._format_bytes(input_b)} → {self._format_bytes(output_b)}  (saved {self._format_bytes(saved)}, {pct:.1f}%)"
                     else:
                         size_line = "  encoded"
-                    details.append(f"- {result.job.source.name}")
+                    details.append(f"- {display_name_for_ui(result.job.source.name)}")
                     details.append(size_line)
                     if profile_name:
                         details.append(f"  profile:  {profile_name}")
                     details.append(f"  location: {result.job.source}")
                 else:
                     label = "missing" if "missing" in (result.error_message or "").lower() else "failed"
-                    details.append(f"- {result.job.source.name}: {label}")
+                    details.append(f"- {display_name_for_ui(result.job.source.name)}: {label}")
                     if result.error_message:
-                        details.append(f"  {result.error_message}")
+                        translated = next(
+                            (row.reason for row in self._summary_rows if row.source == result.job.source),
+                            self._translate_common_error(result.error_message),
+                        )
+                        details.append(f"  {translated}")
+                        if translated != result.error_message:
+                            details.append(f"  raw: {result.error_message}")
             if any_success and self.overwrite.isChecked():
                 details.append("")
                 details.append("All encoded files replaced in-place. Originals no longer exist.")

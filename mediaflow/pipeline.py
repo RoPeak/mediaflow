@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import PipelineConfig
+from .integrations import summarise_apply_result
 
 
 def _safe_path(value: object) -> str | None:
@@ -11,7 +12,8 @@ def _safe_path(value: object) -> str | None:
 
 @dataclass(frozen=True)
 class PipelineSummary:
-    organised_plans: int = 0
+    organised_files: int = 0
+    organise_skipped: int = 0
     organised_errors: int = 0
     encoded_files: int = 0
     skipped_files: int = 0
@@ -25,15 +27,7 @@ def build_pipeline_summary(
     apply_result: object | None,
     encode_results: list[object] | None,
 ) -> PipelineSummary:
-    organised_plans = 0
-    organised_errors = 0
-    organise_report_path = None
-    organise_apply_report_path = None
-    if apply_result is not None:
-        organised_plans = int(getattr(getattr(apply_result, "result", None), "planned", 0) or 0)
-        organised_errors = len(getattr(getattr(apply_result, "result", None), "errors", []) or [])
-        organise_report_path = _safe_path(getattr(apply_result, "report_path", None))
-        organise_apply_report_path = _safe_path(getattr(apply_result, "apply_report_path", None))
+    apply_stats = summarise_apply_result(apply_result)
 
     encoded_files = 0
     skipped_files = 0
@@ -53,14 +47,15 @@ def build_pipeline_summary(
             failed_files += 1
 
     return PipelineSummary(
-        organised_plans=organised_plans,
-        organised_errors=organised_errors,
+        organised_files=apply_stats.moved_count,
+        organise_skipped=apply_stats.skipped_count,
+        organised_errors=apply_stats.error_count,
         encoded_files=encoded_files,
         skipped_files=skipped_files,
         failed_files=failed_files,
         bytes_saved=bytes_saved,
-        organise_report_path=organise_report_path,
-        organise_apply_report_path=organise_apply_report_path,
+        organise_report_path=apply_stats.report_path,
+        organise_apply_report_path=apply_stats.apply_report_path,
     )
 
 

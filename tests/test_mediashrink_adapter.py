@@ -11,8 +11,10 @@ from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
 from mediaflow.mediashrink_adapter import (
     _convert_preparation_payload,
     missing_job_sources,
+    prepare_retry_compression,
     run_compression,
 )
+from mediaflow.config import PipelineConfig, ShrinkSettings
 
 
 def _job(tmp_path: Path, name: str) -> EncodeJob:
@@ -100,3 +102,45 @@ def test_convert_preparation_payload_maps_analysis_updates(tmp_path: Path) -> No
 
     assert isinstance(converted, PreparationProgress)
     assert converted.completed == 1
+
+
+def test_prepare_retry_compression_filters_to_requested_sources(tmp_path: Path) -> None:
+    first = _job(tmp_path, "first.mkv")
+    second = _job(tmp_path, "second.mkv")
+    for job in (first, second):
+        job.source.write_bytes(b"x")
+
+    item_one = SimpleNamespace(
+        source=first.source,
+        codec="h264",
+        size_bytes=100,
+        estimated_output_bytes=50,
+        estimated_savings_bytes=50,
+        recommendation="recommended",
+        reason_text="Needs retry",
+    )
+    item_two = SimpleNamespace(
+        source=second.source,
+        codec="h264",
+        size_bytes=120,
+        estimated_output_bytes=60,
+        estimated_savings_bytes=60,
+        recommendation="recommended",
+        reason_text="Needs retry",
+    )
+    prep = _preparation(tmp_path, [first, second])
+    prep = prep.__class__(**{**prep.__dict__, "items": [item_one, item_two]})
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_compression", return_value=prep):
+        retry = prepare_retry_compression(config, {first.source})
+
+    assert [item.source for item in retry.items] == [first.source]
+    assert [job.source for job in retry.jobs] == [first.source]
+    assert retry.selected_count == 1
+    assert retry.stage_messages is not None

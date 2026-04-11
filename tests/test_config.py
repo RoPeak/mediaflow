@@ -99,7 +99,8 @@ def test_build_pipeline_config_requires_existing_source_when_plexify_enabled(tmp
 
 def test_build_pipeline_summary_aggregates_stage_results() -> None:
     class ResultState:
-        planned = 4
+        moved = [object(), object(), object(), object()]
+        skipped = [object()]
         errors = ["one"]
 
     class ApplyState:
@@ -123,7 +124,8 @@ def test_build_pipeline_summary_aggregates_stage_results() -> None:
         ],
     )
 
-    assert summary.organised_plans == 4
+    assert summary.organised_files == 4
+    assert summary.organise_skipped == 1
     assert summary.organised_errors == 1
     assert summary.encoded_files == 1
     assert summary.skipped_files == 1

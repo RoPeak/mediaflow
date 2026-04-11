@@ -24,7 +24,7 @@ class TestStripRich:
 
     def test_mixed(self):
         result = MainWindow._strip_rich("[dim]In progress:[/dim] [white]The Dark Knight[/white]")
-        assert result == "In progress:  The Dark Knight"
+        assert result == "In progress: The Dark Knight"
 
 
 class TestFormatBytes:

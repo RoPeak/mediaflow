@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 from mediaflow.main_window import MainWindow
 from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
 from mediaflow.workflow import WorkflowState
-from mediashrink.gui_api import EncodePreparation
+from mediashrink.gui_api import EncodePreparation, EncodeProgress
 
 
 def _app() -> QApplication:
@@ -65,7 +65,7 @@ def test_config_edits_only_mark_runtime_data_as_stale_when_runtime_exists() -> N
     window._on_config_edited()
 
     assert window._config_dirty is True
-    assert "settings changed" in window.guidance_label.text().lower()
+    assert "settings have changed" in window.guidance_label.text().lower()
 
 
 def test_refresh_pipeline_summary_surfaces_existing_stage_results() -> None:
@@ -73,7 +73,8 @@ def test_refresh_pipeline_summary_surfaces_existing_stage_results() -> None:
     window = MainWindow()
 
     class ResultState:
-        planned = 2
+        moved = [object(), object()]
+        skipped = []
         errors = ["failure"]
 
     class ApplyState:
@@ -148,6 +149,115 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert "Benchmarking complete." in window.compress_status_log.toPlainText()
 
 
+def test_compression_plan_defers_risky_jobs_by_default(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    safe_source = tmp_path / "safe.mkv"
+    risky_source = tmp_path / "risky.mp4"
+    safe_source.write_bytes(b"x")
+    risky_source.write_bytes(b"x")
+    items = [
+        SimpleNamespace(
+            source=safe_source,
+            codec="mpeg2video",
+            recommendation="recommended",
+            reason_text="legacy codec with strong projected space savings",
+            estimated_output_bytes=400,
+            estimated_savings_bytes=600,
+        ),
+        SimpleNamespace(
+            source=risky_source,
+            codec="h264",
+            recommendation="recommended",
+            reason_text="output header failure: 6",
+            estimated_output_bytes=500,
+            estimated_savings_bytes=500,
+        ),
+    ]
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=items,
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=safe_source), SimpleNamespace(source=risky_source)],
+        recommended_count=2,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=2,
+        total_input_bytes=2000,
+        selected_input_bytes=2000,
+        selected_estimated_output_bytes=900,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_prepared(prep)
+
+    assert "deferred" in {window.compression_table.item(row, 7).text() for row in range(window.compression_table.rowCount())}
+    assert "risky file(s) are deferred" in window.compress_summary_label.text()
+
+
+def test_review_placeholder_shows_loading_state_during_scan() -> None:
+    _app()
+    window = MainWindow()
+
+    window._set_state(WorkflowState.SCANNING)
+
+    assert "Scanning source with plexify" in window.review_placeholder_label.text()
+
+
+def test_progress_model_does_not_lose_current_file_progress_between_ticks() -> None:
+    _app()
+    window = MainWindow()
+    progress = EncodeProgress(
+        current_file="movie.mkv",
+        current_file_progress=0.36,
+        overall_progress=0.25,
+        completed_files=1,
+        remaining_files=3,
+        bytes_processed=360,
+        total_bytes=1000,
+        heartbeat_state="active",
+    )
+
+    window._compression_start = 1.0
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+        window._encode_progress(progress)
+        window._tick_compression()
+
+    assert window.file_progress.value() >= 36
+    assert window.overall_progress.value() == 25
+
+
+def test_encode_progress_cleans_display_name_and_shows_eta_settling() -> None:
+    _app()
+    window = MainWindow()
+    progress = EncodeProgress(
+        current_file="In progress: Ghost (1990) (Unknown Year).mkv",
+        current_file_progress=0.36,
+        overall_progress=0.02,
+        completed_files=0,
+        remaining_files=3,
+        bytes_processed=36,
+        total_bytes=1000,
+        heartbeat_state="active",
+    )
+
+    window._compression_start = 1.0
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+        window._encode_progress(progress)
+        window._tick_compression()
+
+    assert "In progress:" not in window.encode_filename_label.text()
+    assert "Unknown Year" not in window.encode_filename_label.text()
+    assert "settling" in window.eta_label.text().lower()
+
+
 def test_preparing_compression_uses_preparing_view() -> None:
     _app()
     window = MainWindow()
@@ -179,6 +289,7 @@ def test_summary_export_includes_headline_and_mode(tmp_path: Path) -> None:
     window = MainWindow()
     window.summary_headline_label.setText("Compression-only run completed")
     window.summary_mode_label.setText("Compression output mode: in-place")
+    window.diagnostics_path_label.setText("Diagnostics: /tmp/run.json")
     window.summary_overview_label.setText("Encoded: 1 file(s)")
     window.summary_log.setPlainText("Compression results\n- movie.mkv")
 
@@ -186,18 +297,37 @@ def test_summary_export_includes_headline_and_mode(tmp_path: Path) -> None:
 
     assert "Compression-only run completed" in exported
     assert "Compression output mode: in-place" in exported
+    assert "Diagnostics: /tmp/run.json" in exported
     assert "Compression results" in exported
 
 
 def test_encode_dashboard_toggle_hides_live_view() -> None:
     _app()
     window = MainWindow()
-    window.encode_preparation = SimpleNamespace(jobs=[SimpleNamespace(source=Path("/tmp/movie.mkv"))])
+    window.encode_preparation = SimpleNamespace(
+        jobs=[SimpleNamespace(source=Path("/tmp/movie.mkv"))],
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        selected_count=1,
+        recommended_count=0,
+        maybe_count=0,
+        skip_count=0,
+        directory=Path("/tmp"),
+        profile=None,
+        followup_manifest_path=None,
+        recommendation_reason=None,
+        size_confidence=None,
+        time_confidence=None,
+        compatible_count=0,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+    )
     window.compress_stack.setCurrentIndex(2)
+    window.show()
+    _app().processEvents()
     window._set_state(WorkflowState.READY_TO_COMPRESS)
 
-    assert window.toggle_encode_card_button.isVisible() is True
-    window.toggle_encode_card_button.setChecked(True)
+    window.encode_card.setVisible(True)
     window._on_toggle_encode_card(True)
 
     assert window.encode_card.isVisible() is False
