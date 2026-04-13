@@ -38,7 +38,7 @@ class PipelineConfig:
     plexify: PlexifySettings = PlexifySettings()
     shrink: ShrinkSettings = ShrinkSettings()
 
-    def validate(self) -> None:
+    def validate(self, *, allow_missing_compression_root: bool = False) -> None:
         if self.plexify.enabled:
             if not str(self.library).strip():
                 raise ValueError("A library folder is required when organise is enabled.")
@@ -54,7 +54,9 @@ class PipelineConfig:
         if self.shrink.enabled:
             if not str(self.compression_root).strip():
                 raise ValueError("A compression root is required when compress is enabled.")
-            if not self.compression_root.exists() or not self.compression_root.is_dir():
+            if self.compression_root.exists() and not self.compression_root.is_dir():
+                raise ValueError("Compression root must be a folder.")
+            if not self.compression_root.exists() and not allow_missing_compression_root:
                 raise ValueError("Compression root must exist.")
         if self.plexify.min_confidence < 0 or self.plexify.min_confidence > 1:
             raise ValueError("Minimum confidence must be between 0 and 1.")
@@ -77,6 +79,7 @@ def build_pipeline_config(
     compression_root: str | None = None,
     plexify: PlexifySettings | None = None,
     shrink: ShrinkSettings | None = None,
+    allow_missing_compression_root: bool = False,
 ) -> PipelineConfig:
     raw_library = Path(library).expanduser()
     raw_source = Path(source).expanduser() if source.strip() else raw_library
@@ -92,5 +95,5 @@ def build_pipeline_config(
         plexify=plexify or PlexifySettings(),
         shrink=shrink or ShrinkSettings(),
     )
-    config.validate()
+    config.validate(allow_missing_compression_root=allow_missing_compression_root)
     return config

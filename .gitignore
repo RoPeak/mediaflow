@@ -9,3 +9,4 @@ dist/
 build/
 *.egg-info/
 mediaflow-terminal-output.txt
+.pytest-local*

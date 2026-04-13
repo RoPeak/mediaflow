@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from mediaflow.main_window import MainWindow
 from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
@@ -17,6 +17,18 @@ from mediashrink.gui_api import EncodePreparation, EncodeProgress
 
 def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persisted_state(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("mediaflow.main_window.load_ui_state", lambda: {})
+    monkeypatch.setattr("mediaflow.main_window.save_ui_state", lambda _payload: None)
+
+    def _fake_write(self, *, base_dir=None, summary=None, failure=None):
+        self.written_path = tmp_path / "run.json"
+        return self.written_path
+
+    monkeypatch.setattr("mediaflow.diagnostics.DiagnosticsRecorder.write", _fake_write)
 
 
 def test_initial_window_state_guides_user_through_setup() -> None:
@@ -207,6 +219,278 @@ def test_review_placeholder_shows_loading_state_during_scan() -> None:
     window._set_state(WorkflowState.SCANNING)
 
     assert "Scanning source with plexify" in window.review_placeholder_label.text()
+
+
+def test_scan_progress_updates_placeholder_counts() -> None:
+    _app()
+    window = MainWindow()
+    window._scan_started_at = 0.0
+    window._set_state(WorkflowState.SCANNING)
+
+    window._scan_progress({"kind": "scan_progress", "discovered": 3, "path": "/tmp/Doctor.Who.S07E05.mkv"})
+
+    assert "Discovered so far: 3" in window.review_placeholder_label.text()
+    assert "Doctor.Who.S07E05.mkv" in window.review_placeholder_label.text()
+
+
+def test_review_placeholder_distinguishes_empty_scan_from_no_scan() -> None:
+    _app()
+    window = MainWindow()
+
+    window.controller = SimpleNamespace(items=[])
+    window._set_state(WorkflowState.REVIEW)
+
+    assert "No organise candidates were discovered" in window.review_placeholder_label.text()
+    assert window.review_summary_label.text() == "No organise candidates found in the last scan."
+
+
+def test_review_summary_counts_blocked_items_as_unresolved() -> None:
+    _app()
+    window = MainWindow()
+    blocked = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/blocked.mkv"), media_type="tv", title="Blocked", season=None, episode=None),
+        manual_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="accepted",
+        preview_block_reason="Missing season or episode.",
+        unresolved_reason=None,
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        status_label="blocked",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    accepted = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/ok.mkv"), media_type="movie", title="Movie", season=None, episode=None),
+        manual_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="accepted",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        status_label="accepted",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(items=[blocked, accepted])
+
+    window._update_review_summary()
+
+    assert "Accepted: 1" in window.review_summary_label.text()
+    assert "Unresolved: 1" in window.review_summary_label.text()
+    assert "Why apply is blocked" in window.review_blocked_label.text()
+
+
+def test_review_filter_can_focus_blocked_items() -> None:
+    _app()
+    window = MainWindow()
+    items = [
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/blocked.mkv"), media_type="tv", title="Blocked", season=None, episode=None),
+            manual_candidate=None,
+            selected_candidate_index=None,
+            candidates=[],
+            decision_status="accepted",
+            preview_block_reason="Missing season or episode.",
+            unresolved_reason=None,
+            warning=None,
+            cache_context="search result",
+            auto_selectable=False,
+            status_label="blocked",
+            has_more=False,
+            candidate_states=[],
+            skipped=False,
+        ),
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/ok.mkv"), media_type="movie", title="Movie", season=None, episode=None),
+            manual_candidate=None,
+            selected_candidate_index=None,
+            candidates=[],
+            decision_status="accepted",
+            preview_block_reason=None,
+            unresolved_reason=None,
+            warning=None,
+            cache_context="search result",
+            auto_selectable=False,
+            status_label="accepted",
+            has_more=False,
+            candidate_states=[],
+            skipped=False,
+        ),
+    ]
+    window.controller = SimpleNamespace(items=items)
+
+    window._populate_review_table()
+    window._set_combo_value(window.review_filter_combo, "Blocked only")
+    window._apply_review_filter()
+
+    assert window.review_table.isRowHidden(0) is False
+    assert window.review_table.isRowHidden(1) is True
+
+
+def test_guided_pipeline_resets_filters_to_defaults(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "incoming"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    window.source_input.setText(str(source))
+    window.library_input.setText(str(library))
+    window.compression_root_input.setText(str(library))
+    window._set_combo_value(window.review_filter_combo, "Blocked only")
+    window._set_combo_value(window.compression_filter_combo, "Missing items")
+
+    monkeypatch.setattr(window, "_ensure_compatibility", lambda: True)
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(window, "_start_worker", lambda *_args, **_kwargs: None)
+
+    window._start_guided_pipeline()
+
+    assert window.review_filter_combo.currentText() == "All items"
+    assert window.compression_filter_combo.currentText() == "All plan items"
+
+
+def test_review_filter_banner_explains_hidden_rows() -> None:
+    _app()
+    window = MainWindow()
+    items = [
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/ok.mkv"), media_type="movie", title="Movie", season=None, episode=None),
+            manual_candidate=None,
+            selected_candidate_index=None,
+            candidates=[],
+            decision_status="accepted",
+            preview_block_reason=None,
+            preview_valid=True,
+            unresolved_reason=None,
+            warning=None,
+            cache_context="search result",
+            auto_selectable=False,
+            status_label="accepted",
+            has_more=False,
+            candidate_states=[],
+            skipped=False,
+        ),
+    ]
+    window.controller = SimpleNamespace(items=items)
+
+    window._populate_review_table()
+    window._set_combo_value(window.review_filter_combo, "Blocked only")
+    window._apply_review_filter()
+
+    assert "Filtered view" in window.review_filter_status_label.text()
+    assert "All items" in window.review_filter_status_label.text()
+
+
+def test_compression_filter_banner_explains_hidden_rows(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_prepared(prep)
+    window._set_combo_value(window.compression_filter_combo, "Missing items")
+    window._apply_compression_filter()
+
+    assert "Filtered view" in window.compression_filter_status_label.text()
+    assert "All plan items" in window.compression_filter_status_label.text()
+
+
+def test_summary_headline_tracks_non_completed_state() -> None:
+    _app()
+    window = MainWindow()
+    window.organise_enabled.setChecked(True)
+    window.compress_enabled.setChecked(True)
+    window._set_state(WorkflowState.READY_TO_APPLY)
+    window._refresh_pipeline_summary()
+
+    assert window.summary_headline_label.text() == "Organisation preview ready"
+    assert "Current workflow state: ready_to_apply" in window.summary_overview_label.text()
+
+
+def test_compression_prepared_flushes_matching_diagnostics_summary(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_write(*, summary, failure, base_dir=None):
+        captured["summary"] = summary
+        captured["failure"] = failure
+        return tmp_path / "run.json"
+
+    monkeypatch.setattr(window._diagnostics, "write", _fake_write)
+
+    window._compression_prepared(prep)
+
+    assert window._diagnostics.events[-1]["kind"] == "compression_prepared"
+    assert captured["summary"]["workflow_state"] == "ready_to_compress"
+    assert captured["summary"]["summary_headline"] == "Compression plan ready"
 
 
 def test_progress_model_does_not_lose_current_file_progress_between_ticks() -> None:

@@ -86,6 +86,22 @@ def test_build_pipeline_config_requires_existing_compression_root_when_enabled(t
         )
 
 
+def test_build_pipeline_config_allows_missing_compression_root_for_guided_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    library = tmp_path / "library"
+
+    config = build_pipeline_config(
+        source=str(source),
+        library=str(library),
+        compression_root=str(library),
+        allow_missing_compression_root=True,
+    )
+
+    assert config.library == library
+    assert config.compression_root == library
+
+
 def test_build_pipeline_config_requires_existing_source_when_plexify_enabled(tmp_path: Path) -> None:
     library = tmp_path / "library"
     library.mkdir()

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import is_dataclass, replace
+from datetime import datetime
 import re
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import QSystemTrayIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -29,6 +33,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QScrollArea,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -114,9 +119,14 @@ class MainWindow(QMainWindow):
         self._last_encode_bucket: int = -1
         self._last_encode_file: str = ""
         self._last_status_text: str = ""
+        self._scan_discovered_count: int = 0
+        self._scan_last_path: str = ""
+        self._syncing_diagnostics: bool = False
         self._startup_duration: float | None = None
         self._preparation_duration: float | None = None
         self._first_progress_delay: float | None = None
+        self._restored_state_warnings: list[str] = []
+        self._scan_started_at: float | None = None
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
@@ -223,6 +233,22 @@ class MainWindow(QMainWindow):
         self.review_hint_label.setWordWrap(True)
         self.review_placeholder_label = QLabel()
         self.review_placeholder_label.setWordWrap(True)
+        self.review_filter_combo = QComboBox()
+        self.review_filter_combo.addItems(
+            [
+                "All items",
+                "Blocked only",
+                "Unresolved only",
+                "Accepted/manual only",
+                "TV only",
+            ]
+        )
+        self.review_filter_status_label = QLabel("")
+        self.review_filter_status_label.setWordWrap(True)
+        self.review_filter_status_label.setObjectName("muted-label")
+        self.review_blocked_label = QLabel("")
+        self.review_blocked_label.setWordWrap(True)
+        self.review_blocked_label.setObjectName("muted-label")
         self.review_stack = QStackedWidget()
         self.review_table = QTableWidget(0, 7)
         self.review_table.setHorizontalHeaderLabels(
@@ -247,6 +273,7 @@ class MainWindow(QMainWindow):
 
         self.prev_item_button = QPushButton("Previous")
         self.next_item_button = QPushButton("Next")
+        self.next_blocked_button = QPushButton("Next Blocked")
         self.accept_button = QPushButton("Accept")
         self.skip_button = QPushButton("Skip")
         self.search_button = QPushButton("Search Again")
@@ -368,6 +395,9 @@ class MainWindow(QMainWindow):
         self._preparation_timer = QTimer(self)
         self._preparation_timer.setInterval(1000)
         self._preparation_timer.timeout.connect(self._tick_preparation)
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(1000)
+        self._scan_timer.timeout.connect(self._tick_scan)
 
         self.stat_files_label = QLabel("—")
         self.stat_files_label.setObjectName("stat-tile")
@@ -687,11 +717,14 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(8)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(QLabel("Discovered Items"))
+        left_layout.addWidget(self.review_filter_combo)
+        left_layout.addWidget(self.review_filter_status_label)
         left_layout.addWidget(self.review_table, stretch=1)
 
         nav_row = QHBoxLayout()
         nav_row.addWidget(self.prev_item_button)
         nav_row.addWidget(self.next_item_button)
+        nav_row.addWidget(self.next_blocked_button)
         nav_row.addWidget(self.accept_button)
         nav_row.addWidget(self.skip_button)
         nav_row.addWidget(self.auto_accept_button)
@@ -714,6 +747,7 @@ class MainWindow(QMainWindow):
         footer_row.addWidget(self.preview_button)
         footer_row.addWidget(self.apply_button)
         left_layout.addLayout(footer_row)
+        left_layout.addWidget(self.review_blocked_label)
 
         # Right pane: candidates (top) + details/preview (bottom)
         detail_group = QGroupBox("Selected Item Details")
@@ -939,12 +973,14 @@ class MainWindow(QMainWindow):
         self.prepare_compress_button.clicked.connect(self._prepare_compression_from_setup)
         self.reset_button.clicked.connect(lambda: self._reset_runtime_state("Cleared runtime state."))
         self.toggle_details_button.toggled.connect(self._toggle_details)
+        self.review_filter_combo.currentTextChanged.connect(lambda *_: self._apply_review_filter())
         self.compression_filter_combo.currentTextChanged.connect(lambda *_: self._apply_compression_filter())
 
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
         self.prev_item_button.clicked.connect(lambda: self._move_review_selection(-1))
         self.next_item_button.clicked.connect(lambda: self._move_review_selection(1))
+        self.next_blocked_button.clicked.connect(self._move_to_next_blocked_item)
         self.accept_button.clicked.connect(self._accept_selected_candidate)
         self.skip_button.clicked.connect(self._skip_selected_item)
         self.search_button.clicked.connect(self._search_current_item)
@@ -964,6 +1000,17 @@ class MainWindow(QMainWindow):
         self.save_summary_button.clicked.connect(self._save_run_summary)
         self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
         self.summary_filter_combo.currentTextChanged.connect(lambda *_: self._apply_summary_filter())
+
+        self._review_shortcuts = [
+            QShortcut(QKeySequence("Alt+A"), self, activated=self._accept_selected_candidate),
+            QShortcut(QKeySequence("Alt+S"), self, activated=self._skip_selected_item),
+            QShortcut(QKeySequence("Alt+R"), self, activated=self._search_current_item),
+            QShortcut(QKeySequence("Alt+M"), self, activated=self._manual_select_current_item),
+            QShortcut(QKeySequence("Alt+F"), self, activated=self._apply_choice_to_folder),
+            QShortcut(QKeySequence("Alt+T"), self, activated=self._apply_choice_to_title_group),
+            QShortcut(QKeySequence("Alt+N"), self, activated=self._move_to_next_blocked_item),
+            QShortcut(QKeySequence("Ctrl+P"), self, activated=self._preview_plan),
+        ]
 
     def _restore_ui_state(
         self,
@@ -1017,8 +1064,11 @@ class MainWindow(QMainWindow):
             self._set_combo_value(self.duplicate_policy, saved["duplicate_policy"])
         if isinstance(saved.get("compression_filter"), str):
             self._set_combo_value(self.compression_filter_combo, saved["compression_filter"])
+        if isinstance(saved.get("review_filter"), str):
+            self._set_combo_value(self.review_filter_combo, saved["review_filter"])
         if isinstance(saved.get("summary_filter"), str):
             self._set_combo_value(self.summary_filter_combo, saved["summary_filter"])
+        self._restored_state_warnings = self._restored_state_warning_messages()
 
     def _apply_initial_geometry(self) -> None:
         screen = QApplication.primaryScreen()
@@ -1050,6 +1100,73 @@ class MainWindow(QMainWindow):
         if index >= 0:
             combo.setCurrentIndex(index)
 
+    def _restored_state_warning_messages(self) -> list[str]:
+        warnings: list[str] = []
+        for label, widget in (
+            ("Source", self.source_input),
+            ("Library / Output Folder", self.library_input),
+            ("Compression Root", self.compression_root_input),
+        ):
+            text = widget.text().strip()
+            if not text:
+                continue
+            path = Path(text).expanduser()
+            if not path.exists():
+                warnings.append(f"{label} from the previous session is missing: {path}")
+        return warnings
+
+    @staticmethod
+    def _is_default_review_filter(mode: str) -> bool:
+        return mode == "All items"
+
+    @staticmethod
+    def _is_default_compression_filter(mode: str) -> bool:
+        return mode == "All plan items"
+
+    def _summarize_blocked_reasons(self) -> str:
+        if self.controller is None:
+            return ""
+        counts = Counter(
+            item.preview_block_reason
+            for item in self.controller.items
+            if item.preview_block_reason is not None
+        )
+        if not counts:
+            return ""
+        return ", ".join(f"{reason}: {count}" for reason, count in counts.most_common(3))
+
+    def _summarize_deferred_plan_reasons(self) -> str:
+        counts = Counter()
+        for row in self._plan_classification.risky_follow_up:
+            key = row.plain_reason or row.reason or row.issue or "Deferred by default"
+            counts[key] += 1
+        for row in self._plan_classification.missing_items:
+            key = row.issue or "Missing from compression root"
+            counts[key] += 1
+        if not counts:
+            return ""
+        return ", ".join(f"{reason}: {count}" for reason, count in counts.most_common(3))
+
+    def _reset_guided_filters(self) -> None:
+        self._set_combo_value(self.review_filter_combo, "All items")
+        self._set_combo_value(self.compression_filter_combo, "All plan items")
+        self._apply_review_filter()
+        self._apply_compression_filter()
+
+    def _sync_summary_for_diagnostics(self) -> None:
+        self._refresh_pipeline_summary()
+
+    def _flush_runtime_diagnostics(self, *, failure_message: str | None = None) -> None:
+        if self._syncing_diagnostics:
+            return
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        self._syncing_diagnostics = True
+        try:
+            self._sync_summary_for_diagnostics()
+            self._flush_diagnostics(failure_message=failure_message)
+        finally:
+            self._syncing_diagnostics = False
+
     def _ui_state_payload(self) -> dict[str, object]:
         geometry = self.normalGeometry() if self.isMaximized() else self.geometry()
         return {
@@ -1079,6 +1196,7 @@ class MainWindow(QMainWindow):
             "window_height": geometry.height(),
             "window_maximized": self.isMaximized(),
             "compression_filter": self.compression_filter_combo.currentText(),
+            "review_filter": self.review_filter_combo.currentText(),
             "summary_filter": self.summary_filter_combo.currentText(),
         }
 
@@ -1149,6 +1267,22 @@ class MainWindow(QMainWindow):
         if s < 60:
             return f"{s}s"
         return f"{s // 60}m {s % 60}s"
+
+    def _tick_scan(self) -> None:
+        if self.workflow_state != WorkflowState.SCANNING or self._scan_started_at is None:
+            self._scan_timer.stop()
+            return
+        elapsed = time.monotonic() - self._scan_started_at
+        self.review_placeholder_label.setText(self._review_placeholder_text())
+        discovered = (
+            f"{self._scan_discovered_count} discovered"
+            if self._scan_discovered_count
+            else "waiting for first candidates"
+        )
+        current_file = f" • {Path(self._scan_last_path).name}" if self._scan_last_path else ""
+        self.current_action_label.setText(
+            f"Scanning source with plexify ({self._format_elapsed(elapsed)} • {discovered}{current_file})"
+        )
 
     @staticmethod
     def _normalize_heartbeat_state(text: str) -> str:
@@ -1234,7 +1368,7 @@ class MainWindow(QMainWindow):
             self._config_dirty = True
         self._set_state(self.workflow_state)
 
-    def _current_config(self) -> PipelineConfig:
+    def _current_config(self, *, allow_missing_compression_root: bool = False) -> PipelineConfig:
         return build_pipeline_config(
             source=self.source_input.text().strip(),
             library=self.library_input.text().strip(),
@@ -1259,6 +1393,7 @@ class MainWindow(QMainWindow):
                 use_calibration=self.use_calibration.isChecked(),
                 duplicate_policy=self.duplicate_policy.currentText(),
             ),
+            allow_missing_compression_root=allow_missing_compression_root,
         )
 
     def _ensure_compatibility(self) -> bool:
@@ -1317,6 +1452,10 @@ class MainWindow(QMainWindow):
         self.overall_progress.setValue(0)
         self._compression_timer.stop()
         self._preparation_timer.stop()
+        self._scan_timer.stop()
+        self._scan_started_at = None
+        self._scan_discovered_count = 0
+        self._scan_last_path = ""
         self._encode_progress_model.reset()
         self._preparation_model = PreparationProgressModel()
         self._last_status_text = ""
@@ -1352,6 +1491,32 @@ class MainWindow(QMainWindow):
             self._append_status(status_message)
             self._complete_action(status_message)
         self._set_state(WorkflowState.SETUP)
+
+    def _summary_header_text(self) -> str:
+        organise_on = self.organise_enabled.isChecked()
+        compress_on = self.compress_enabled.isChecked()
+        if self.workflow_state == WorkflowState.FAILED:
+            return "Pipeline failed"
+        if self.workflow_state == WorkflowState.COMPLETED:
+            if organise_on and compress_on:
+                return "Full pipeline completed"
+            if compress_on:
+                return "Compression-only run completed"
+            if organise_on:
+                return "Organise-only run completed"
+        if self.workflow_state == WorkflowState.READY_TO_COMPRESS:
+            return "Compression plan ready"
+        if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
+            return "Preparing compression plan"
+        if self.workflow_state == WorkflowState.COMPRESSING:
+            return "Compression in progress"
+        if self.workflow_state == WorkflowState.READY_TO_APPLY:
+            return "Organisation preview ready"
+        if self.workflow_state == WorkflowState.APPLYING:
+            return "Applying organisation"
+        if self.workflow_state in {WorkflowState.REVIEW, WorkflowState.REVIEW_BLOCKED, WorkflowState.SCANNING}:
+            return "Organise review in progress"
+        return "Pipeline summary"
 
     def _set_state(self, state: WorkflowState) -> None:
         self.workflow_state = state
@@ -1443,6 +1608,11 @@ class MainWindow(QMainWindow):
         review_actions_enabled = has_review_selection and not busy and not self._config_dirty
         self.prev_item_button.setEnabled(review_actions_enabled and review_index not in {None, 0})
         self.next_item_button.setEnabled(review_actions_enabled and review_index is not None and review_index < self.review_table.rowCount() - 1)
+        self.next_blocked_button.setEnabled(
+            has_controller
+            and not busy
+            and any(item.preview_block_reason is not None for item in self.controller.items)
+        )
         self.accept_button.setEnabled(review_actions_enabled)
         self.skip_button.setEnabled(review_actions_enabled)
         self.search_button.setEnabled(review_actions_enabled)
@@ -1510,6 +1680,8 @@ class MainWindow(QMainWindow):
     def _setup_hint_text(self) -> str:
         if self._config_dirty and (self.controller is not None or self.encode_preparation is not None):
             return "Settings changed after runtime data was created. Re-run the affected stage before continuing."
+        if self._restored_state_warnings:
+            return "\n".join(self._restored_state_warnings)
         if self.workflow_state == WorkflowState.SETUP:
             if not self.organise_enabled.isChecked() and self.compress_enabled.isChecked():
                 return (
@@ -1524,17 +1696,47 @@ class MainWindow(QMainWindow):
             return "This step loads suggested plexify matches for each discovered item."
         if self._config_dirty:
             return "Review data is stale because setup changed. Start a new organise review."
+        blocked_count = sum(1 for item in self.controller.items if item.preview_block_reason is not None)
+        if self.controller.items and blocked_count == len(self.controller.items):
+            return "Scan finished, but every item still needs attention before organisation can continue."
         if self.preview_state is None:
             return "Accept, skip, or refine each item. Then build a preview."
         if self.preview_state.can_apply:
             return "Organisation preview is ready to apply."
-        return "Some items still need a decision before organisation can continue."
+        reason_summary = self._summarize_blocked_reasons()
+        if reason_summary:
+            return (
+                "Some items are still blocked. Fix the listed reasons or skip them before applying organisation.\n"
+                f"Top blocker reasons: {reason_summary}"
+            )
+        return "Some items are still blocked. Fix the listed reasons or skip them before applying organisation."
 
     def _review_placeholder_text(self) -> str:
         if self.workflow_state == WorkflowState.SCANNING:
+            elapsed = (
+                f" ({self._format_elapsed(time.monotonic() - self._scan_started_at)})"
+                if self._scan_started_at is not None
+                else ""
+            )
+            detail = (
+                f"\nDiscovered so far: {self._scan_discovered_count}"
+                if self._scan_discovered_count
+                else "\nDiscovered so far: 0"
+            )
+            current_file = (
+                f"\nCurrent file: {Path(self._scan_last_path).name}"
+                if self._scan_last_path
+                else "\nCurrent file: waiting for plexify results"
+            )
             return (
-                "Scanning source with plexify...\n\n"
+                f"Scanning source with plexify{elapsed}...\n\n"
                 "Discovered items and candidate matches will appear here when the scan finishes."
+                f"{detail}{current_file}"
+            )
+        if self.controller is not None and not self.controller.items:
+            return (
+                "No organise candidates were discovered in the source folder.\n\n"
+                "Check the Source path and organise filters, then start a new organise review."
             )
         return "No organise review is loaded yet.\n\nStart the guided pipeline or load organise matches from Setup."
 
@@ -1601,15 +1803,37 @@ class MainWindow(QMainWindow):
     def _update_review_summary(self) -> None:
         if self.controller is None:
             self.review_summary_label.setText("No organise review loaded.")
+            self.review_blocked_label.setText("")
+            return
+        if not self.controller.items:
+            self.review_summary_label.setText("No organise candidates found in the last scan.")
+            self.review_blocked_label.setText("")
             return
         total = len(self.controller.items)
-        accepted = sum(1 for item in self.controller.items if item.decision_status == "accepted")
-        manual = sum(1 for item in self.controller.items if item.decision_status == "manual")
+        blocked = [item for item in self.controller.items if item.preview_block_reason is not None]
+        accepted = sum(
+            1 for item in self.controller.items
+            if item.decision_status == "accepted" and item.preview_block_reason is None
+        )
+        manual = sum(
+            1 for item in self.controller.items
+            if item.decision_status == "manual" and item.preview_block_reason is None
+        )
         skipped = sum(1 for item in self.controller.items if item.decision_status == "skipped")
-        unresolved = sum(1 for item in self.controller.items if not item.resolved and not item.skipped)
+        unresolved = len(blocked)
         self.review_summary_label.setText(
             f"Items: {total} | Accepted: {accepted} | Manual: {manual} | Skipped: {skipped} | Unresolved: {unresolved}"
         )
+        if blocked:
+            sample = blocked[0]
+            grouped = self._summarize_blocked_reasons()
+            self.review_blocked_label.setText(
+                f"Why apply is blocked: {len(blocked)} item(s) still need attention. "
+                f"Next blocker: {sample.item.path.name} — {sample.preview_block_reason}"
+                + (f" | Top reasons: {grouped}" if grouped else "")
+            )
+        else:
+            self.review_blocked_label.setText("All reviewed items are preview-valid.")
 
     def _update_compress_summary(self) -> None:
         if self.encode_preparation is None:
@@ -1642,15 +1866,20 @@ class MainWindow(QMainWindow):
             f"{len(self._plan_classification.risky_follow_up)} risky follow-up  |  "
             f"{len(self._plan_classification.informational_skips)} informational skips"
         )
+        deferred_summary = self._summarize_deferred_plan_reasons()
         if deferred_sources and not self.include_risky_jobs.isChecked():
             lines.append(
                 f"First run default: {len(runnable_sources)} safe file(s) selected now. "
                 f"{len(deferred_sources)} risky file(s) are deferred unless you explicitly include them."
             )
+            if deferred_summary:
+                lines.append(f"Deferred details: {deferred_summary}")
         elif self.include_risky_jobs.isChecked() and risky_sources:
             lines.append(
                 f"Risky follow-up items are included in the next run ({len(risky_sources)} file(s))."
             )
+        elif deferred_summary:
+            lines.append(f"Follow-up details: {deferred_summary}")
         if prep.compatible_count or prep.incompatible_count:
             lines.append(f"Compat:   {prep.compatible_count} compatible  |  {prep.incompatible_count} incompatible")
         if prep.size_confidence or prep.time_confidence:
@@ -1791,7 +2020,8 @@ class MainWindow(QMainWindow):
 
     def _summary_timeline_text(self) -> str:
         labels: list[str] = []
-        seen: set[str] = set()
+        started_at = self._diagnostics.started_at
+        seen_kinds: set[str] = set()
         for event in self._diagnostics.events:
             kind = str(event.get("kind", ""))
             label = ""
@@ -1799,22 +2029,57 @@ class MainWindow(QMainWindow):
                 label = "Guided start"
             elif kind == "scan_started":
                 label = "Scan"
+            elif kind == "scan_finished":
+                label = "Scan finished"
+            elif kind == "organisation_apply_started":
+                label = "Apply start"
             elif kind == "manual_match":
                 label = "Manual match"
+            elif kind == "bulk_apply":
+                label = "Bulk apply"
             elif kind == "organisation_preview_ready":
                 label = "Preview"
             elif kind == "organisation_applied":
                 label = "Apply"
+            elif kind == "compression_preparation_started":
+                label = "Prepare compression start"
             elif kind == "compression_prepared":
                 label = "Prepare compression"
             elif kind == "compression_started":
                 label = "Compression start"
             elif kind == "compression_complete":
                 label = "Completion"
-            if label and label not in seen:
-                seen.add(label)
-                labels.append(label)
+            if not label or kind in seen_kinds:
+                continue
+            timestamp = str(event.get("timestamp", ""))
+            if timestamp:
+                try:
+                    seconds = max(0.0, (datetime.fromisoformat(timestamp) - started_at).total_seconds())
+                    label = f"{label} ({self._format_elapsed(seconds)})"
+                except ValueError:
+                    pass
+            seen_kinds.add(kind)
+            labels.append(label)
         return f"Run timeline: {'  •  '.join(labels)}" if labels else ""
+
+    def _checkpoint_review_diagnostics(self) -> None:
+        if self.controller is None:
+            return
+        self._flush_runtime_diagnostics()
+
+    def _guided_preflight_text(self, config: PipelineConfig) -> str:
+        lines = [
+            f"Source: {config.source}",
+            f"Library / Output Folder: {config.library}",
+            f"Compression Root: {config.compression_root}",
+            f"Organise enabled: {'yes' if config.plexify.enabled else 'no'}",
+            f"Compress enabled: {'yes' if config.shrink.enabled else 'no'}",
+            f"Compression root linked to output: {'yes' if self.link_compression_root.isChecked() else 'no'}",
+            f"Overwrite originals after encode: {'yes' if config.shrink.overwrite else 'no'}",
+        ]
+        if config.plexify.enabled and not config.library.exists():
+            lines.append("Output folder does not exist yet and will be created during organise.")
+        return "\n".join(lines)
 
     def _flush_diagnostics(self, *, failure_message: str | None = None) -> None:
         summary = {
@@ -1832,6 +2097,10 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
             return
+        self._scan_timer.stop()
+        self._scan_started_at = None
+        self._scan_discovered_count = 0
+        self._scan_last_path = ""
         self._complete_action("Last operation failed")
         summary, technical_detail = self._summarise_error(message)
         self._record_warning(summary)
@@ -1854,7 +2123,7 @@ class MainWindow(QMainWindow):
             ).strip()
         )
         self._switch_tab("summary")
-        self._flush_diagnostics(failure_message=summary)
+        self._flush_runtime_diagnostics(failure_message=summary)
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Critical)
         dialog.setWindowTitle("mediaflow")
@@ -1884,8 +2153,12 @@ class MainWindow(QMainWindow):
         self._update_ui()
 
     def _start_scan(self) -> None:
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         try:
-            config = self._current_config()
+            linked_output_root = self.organise_enabled.isChecked() and self.compress_enabled.isChecked() and (
+                self.compression_root_input.text().strip() == self.library_input.text().strip()
+            )
+            config = self._current_config(allow_missing_compression_root=linked_output_root)
         except ValueError as exc:
             self._show_error(str(exc))
             return
@@ -1900,21 +2173,41 @@ class MainWindow(QMainWindow):
         self._diagnostics.record_event("scan_started", source=str(config.source), library=str(config.library))
         self._guided_mode = False
         self._continue_to_compress = False
+        self._scan_discovered_count = 0
+        self._scan_last_path = ""
+        self._scan_started_at = time.monotonic()
+        self._scan_timer.start()
         self._set_current_action("Scanning source with plexify")
         self._set_state(WorkflowState.SCANNING)
         self._switch_tab("review")
         self._append_status("Scanning source with plexify...")
+        self._flush_runtime_diagnostics()
         worker = FunctionWorker(scan_controller, build_video_controller(config))
-        self._start_worker(worker, self._scan_complete)
+        self._start_worker(worker, self._scan_complete, self._scan_progress)
 
     def _start_guided_pipeline(self) -> None:
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         try:
-            config = self._current_config()
+            linked_output_root = self.organise_enabled.isChecked() and self.compress_enabled.isChecked() and (
+                self.compression_root_input.text().strip() == self.library_input.text().strip()
+            )
+            config = self._current_config(allow_missing_compression_root=linked_output_root)
         except ValueError as exc:
             self._show_error(str(exc))
             return
         if not self._ensure_compatibility():
             return
+        if QMessageBox.question(
+            self,
+            "mediaflow",
+            "Start guided pipeline with these settings?\n\n" + self._guided_preflight_text(config),
+        ) != QMessageBox.Yes:
+            return
+        filters_reset = (
+            not self._is_default_review_filter(self.review_filter_combo.currentText())
+            or not self._is_default_compression_filter(self.compression_filter_combo.currentText())
+        )
+        self._reset_guided_filters()
         self._persist_ui_state()
         self._reset_runtime_state()
         self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
@@ -1924,24 +2217,40 @@ class MainWindow(QMainWindow):
             library=str(config.library),
             compression_root=str(config.compression_root),
         )
+        if filters_reset:
+            self._diagnostics.record_event("guided_filters_reset", review_filter="All items", compression_filter="All plan items")
         self._guided_mode = True
         self._continue_to_compress = config.shrink.enabled
         if config.plexify.enabled:
+            self._diagnostics.record_event("scan_started", source=str(config.source), library=str(config.library))
+            self._scan_discovered_count = 0
+            self._scan_last_path = ""
+            self._scan_started_at = time.monotonic()
+            self._scan_timer.start()
             self._set_current_action("Starting guided organise review")
             self._set_state(WorkflowState.SCANNING)
             self._switch_tab("review")
             self._append_status("Starting guided pipeline with organise scan.")
+            self._flush_runtime_diagnostics()
             worker = FunctionWorker(scan_controller, build_video_controller(config))
-            self._start_worker(worker, self._scan_complete)
+            self._start_worker(worker, self._scan_complete, self._scan_progress)
         else:
             self._append_status("Guided pipeline is skipping organisation and preparing compression.")
             self._prepare_compression_from_setup()
 
     def _scan_complete(self, controller: VideoUIController) -> None:
+        self._scan_timer.stop()
+        self._scan_started_at = None
         self.controller = controller
         self.preview_state = None
         self.apply_result = None
         self._config_dirty = False
+        blocked_count = sum(1 for item in controller.items if item.preview_block_reason is not None)
+        self._diagnostics.record_event(
+            "scan_finished",
+            discovered=len(controller.items),
+            blocked=blocked_count,
+        )
         self._populate_review_table()
         self._switch_tab("review")
         self._complete_action("Finished organise scan")
@@ -1949,6 +2258,7 @@ class MainWindow(QMainWindow):
             self._set_state(WorkflowState.REVIEW)
             self._set_current_action("Organise scan finished with no review items")
             self._append_status("No organise candidates were discovered in the source folder.")
+            self._checkpoint_review_diagnostics()
             return
         if self._guided_mode:
             accepted = self._auto_accept_safe_matches()
@@ -1964,6 +2274,16 @@ class MainWindow(QMainWindow):
             self._set_state(WorkflowState.REVIEW)
             self._set_current_action("Review organise matches")
             self._append_status(f"Loaded {len(controller.items)} item(s) for manual review.")
+        self._checkpoint_review_diagnostics()
+
+    def _scan_progress(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        if payload.get("kind") != "scan_progress":
+            return
+        self._scan_discovered_count = int(payload.get("discovered", 0) or 0)
+        self._scan_last_path = str(payload.get("path", "") or "")
+        self.review_placeholder_label.setText(self._review_placeholder_text())
 
     def _populate_review_table(self) -> None:
         self.review_table.setRowCount(0)
@@ -1987,7 +2307,7 @@ class MainWindow(QMainWindow):
                 season_episode,
                 selected,
                 item.status_label,
-                item.warning or item.unresolved_reason or "",
+                item.warning or item.preview_block_reason or item.unresolved_reason or "",
             ]
             for column, value in enumerate(values):
                 self.review_table.setItem(row, column, QTableWidgetItem(str(value)))
@@ -1999,6 +2319,7 @@ class MainWindow(QMainWindow):
         count = len(self.controller.items) if self.controller else 0
         label = f"Review ({count})" if count else "Review"
         self.tabs.setTabText(1, label)
+        self._apply_review_filter()
         self._update_ui()
 
     def _review_selection_changed(self) -> None:
@@ -2006,6 +2327,7 @@ class MainWindow(QMainWindow):
         if index is None:
             self.details_log.clear()
             self.candidate_table.setRowCount(0)
+            self.search_input.setPlaceholderText("Search query or manual title")
             self._update_ui()
             return
         self._populate_candidate_table(index)
@@ -2017,6 +2339,67 @@ class MainWindow(QMainWindow):
         if not indexes:
             return None
         return indexes[0].row()
+
+    def _review_items_matching_filter(self) -> list[int]:
+        if self.controller is None:
+            return []
+        mode = self.review_filter_combo.currentText()
+        matches: list[int] = []
+        for idx, item in enumerate(self.controller.items):
+            show = True
+            if mode == "Blocked only":
+                show = item.preview_block_reason is not None
+            elif mode == "Unresolved only":
+                show = item.decision_status == "unresolved"
+            elif mode == "Accepted/manual only":
+                show = item.decision_status in {"accepted", "manual"} and item.preview_block_reason is None
+            elif mode == "TV only":
+                show = item.item.media_type == "tv"
+            if show:
+                matches.append(idx)
+        return matches
+
+    def _apply_review_filter(self) -> None:
+        mode = self.review_filter_combo.currentText()
+        matches = set(self._review_items_matching_filter())
+        visible = 0
+        for row in range(self.review_table.rowCount()):
+            hide = row not in matches
+            self.review_table.setRowHidden(row, hide)
+            if not hide:
+                visible += 1
+        if self.review_table.rowCount() == 0:
+            self.review_filter_status_label.setText("")
+        elif visible == 0:
+            self.review_filter_status_label.setText(
+                f"Filtered view: '{mode}' is hiding every review row. Switch back to 'All items' to see the full review."
+            )
+        elif not self._is_default_review_filter(mode):
+            self.review_filter_status_label.setText(
+                f"Filtered view: showing {visible} of {self.review_table.rowCount()} review row(s) with '{mode}'."
+            )
+        else:
+            self.review_filter_status_label.setText("")
+        current = self._current_review_index()
+        if current is None or self.review_table.isRowHidden(current):
+            if matches:
+                self.review_table.selectRow(next(iter(sorted(matches))))
+            else:
+                self.details_log.clear()
+                self.candidate_table.setRowCount(0)
+        if self.review_table.rowCount():
+            self._diagnostics.record_event(
+                "review_filter_applied",
+                filter=mode,
+                visible_rows=visible,
+                total_rows=self.review_table.rowCount(),
+            )
+            if (not self._is_default_review_filter(mode) or visible == 0) and not self._syncing_diagnostics:
+                self._flush_runtime_diagnostics()
+        self._update_review_summary()
+
+    def _visible_review_rows(self) -> list[int]:
+        return [row for row in range(self.review_table.rowCount()) if not self.review_table.isRowHidden(row)]
 
     def _populate_candidate_table(self, review_index: int) -> None:
         self.candidate_table.setRowCount(0)
@@ -2038,20 +2421,31 @@ class MainWindow(QMainWindow):
             self.details_log.clear()
             return
         item = self.controller.items[review_index]
+        suggested_search = getattr(self.controller, "suggested_search_query", None)
+        suggested_query = suggested_search(review_index) if callable(suggested_search) else None
         lines = [
             f"Path: {item.item.path}",
             f"Media type: {item.item.media_type}",
             f"Title: {item.item.title}",
-            f"Search query: {item.search_query}",
+            f"Search query: {getattr(item, 'search_query', '')}",
             f"Status: {item.status_label}",
-            f"Cache context: {item.cache_context}",
-            f"Auto-selectable: {item.auto_selectable}",
+            f"Cache context: {getattr(item, 'cache_context', '')}",
+            f"Auto-selectable: {getattr(item, 'auto_selectable', False)}",
+            f"Preview-valid: {'yes' if getattr(item, 'preview_valid', False) else 'no'}",
         ]
         if item.warning:
             lines.append(f"Warning: {item.warning}")
-        if item.unresolved_reason:
+        if item.preview_block_reason:
+            lines.append(f"Blocked: {item.preview_block_reason}")
+        elif item.unresolved_reason:
             lines.append(f"Unresolved: {item.unresolved_reason}")
+        if suggested_query and suggested_query.casefold() != item.item.title.casefold():
+            lines.append(f"Suggested search: {suggested_query}")
         self.details_log.setPlainText("\n".join(lines))
+        placeholder = "Search query or manual title"
+        if suggested_query and suggested_query.casefold() != item.item.title.casefold():
+            placeholder = f"Suggested search: {suggested_query}"
+        self.search_input.setPlaceholderText(placeholder)
 
     def _selected_candidate_index(self) -> int:
         indexes = self.candidate_table.selectionModel().selectedRows() if self.candidate_table.selectionModel() else []
@@ -2059,12 +2453,91 @@ class MainWindow(QMainWindow):
             return 0
         return indexes[0].row()
 
+    def _prompt_manual_tv_selection(self, item) -> dict[str, object] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual TV Match")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        suggested_query = None
+        if self.controller is not None:
+            try:
+                suggested_search = getattr(self.controller, "suggested_search_query", None)
+                if callable(suggested_search):
+                    suggested_query = suggested_search(self.controller.items.index(item))
+            except ValueError:
+                suggested_query = None
+        title_input = QLineEdit(self.search_input.text().strip() or suggested_query or item.item.title)
+        year_input = QSpinBox()
+        year_input.setRange(0, 9999)
+        year_input.setSpecialValueText("(optional)")
+        year_input.setValue(int(item.item.year or 0))
+        season_input = QSpinBox()
+        season_input.setRange(0, 999)
+        season_input.setSpecialValueText("(optional)")
+        season_input.setValue(int(item.item.season or 0))
+        episode_input = QSpinBox()
+        episode_input.setRange(0, 9999)
+        episode_input.setSpecialValueText("(optional)")
+        episode_input.setValue(int(item.item.episode or 0))
+        episode_title_input = QLineEdit(item.item.episode_title or "")
+
+        form.addRow("Show title", title_input)
+        form.addRow("Year", year_input)
+        form.addRow("Season", season_input)
+        form.addRow("Episode", episode_input)
+        form.addRow("Episode title", episode_title_input)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        title = title_input.text().strip()
+        if not title:
+            self._show_error("Enter a show title first.")
+            return None
+        return {
+            "title": title,
+            "year": year_input.value() or None,
+            "season": season_input.value() or None,
+            "episode": episode_input.value() or None,
+            "episode_title": episode_title_input.text().strip() or None,
+        }
+
     def _move_review_selection(self, delta: int) -> None:
-        if self.review_table.rowCount() == 0:
+        rows = self._visible_review_rows()
+        if not rows:
             return
-        current = self._current_review_index() or 0
-        target = max(0, min(self.review_table.rowCount() - 1, current + delta))
+        current = self._current_review_index()
+        if current not in rows:
+            self.review_table.selectRow(rows[0])
+            return
+        pos = rows.index(current)
+        target = rows[max(0, min(len(rows) - 1, pos + delta))]
         self.review_table.selectRow(target)
+
+    def _move_to_next_blocked_item(self) -> None:
+        if self.controller is None:
+            return
+        blocked_rows = [
+            idx for idx, item in enumerate(self.controller.items)
+            if item.preview_block_reason is not None and not self.review_table.isRowHidden(idx)
+        ]
+        if not blocked_rows:
+            return
+        current = self._current_review_index()
+        if current is None:
+            self.review_table.selectRow(blocked_rows[0])
+            return
+        for idx in blocked_rows:
+            if idx > current:
+                self.review_table.selectRow(idx)
+                return
+        self.review_table.selectRow(blocked_rows[0])
 
     def _refresh_review(self) -> None:
         current = self._current_review_index()
@@ -2120,6 +2593,9 @@ class MainWindow(QMainWindow):
             return
         query = self.search_input.text().strip()
         if not query:
+            suggested_search = getattr(self.controller, "suggested_search_query", None)
+            query = suggested_search(index) if callable(suggested_search) else ""
+        if not query:
             self._show_error("Enter a search query first.")
             return
         self.controller.refine_search(index, query)
@@ -2144,13 +2620,27 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
-        title = self.search_input.text().strip()
-        if not title:
-            self._show_error("Enter a manual title first.")
-            return
-        self.controller.manual_select(index, title=title)
-        self._diagnostics.record_event("manual_match", item=index + 1, title=title)
-        self._append_status(f"Manually selected '{title}' for item {index + 1}.")
+        item = self.controller.items[index]
+        if item.item.media_type == "tv":
+            payload = self._prompt_manual_tv_selection(item)
+            if payload is None:
+                return
+            self.controller.manual_select(index, **payload)
+            self._diagnostics.record_event("manual_match", item=index + 1, **payload)
+            season_text = payload["season"] if payload["season"] is not None else "-"
+            episode_text = payload["episode"] if payload["episode"] is not None else "-"
+            self._append_status(
+                f"Manually selected '{payload['title']}' for item {index + 1} "
+                f"(S{season_text} E{episode_text})."
+            )
+        else:
+            title = self.search_input.text().strip()
+            if not title:
+                self._show_error("Enter a manual title first.")
+                return
+            self.controller.manual_select(index, title=title)
+            self._diagnostics.record_event("manual_match", item=index + 1, title=title)
+            self._append_status(f"Manually selected '{title}' for item {index + 1}.")
         self._refresh_review()
 
     def _apply_choice_to_folder(self) -> None:
@@ -2159,8 +2649,19 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
-        self.controller.apply_choice_to_folder(index)
-        self._append_status(f"Applied the current decision to the folder for item {index + 1}.")
+        result = self.controller.apply_choice_to_folder(index)
+        self._diagnostics.record_event(
+            "bulk_apply",
+            mode="folder",
+            item=index + 1,
+            affected=result.affected_count,
+            preview_valid=result.preview_valid_count,
+            blocked=result.blocked_count,
+        )
+        self._append_status(
+            f"Applied the current decision to {result.affected_count} folder item(s): "
+            f"{result.preview_valid_count} preview-valid, {result.blocked_count} blocked."
+        )
         self._refresh_review()
 
     def _apply_choice_to_title_group(self) -> None:
@@ -2169,8 +2670,19 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
-        self.controller.apply_choice_to_title_group(index)
-        self._append_status(f"Applied the current decision to the title group for item {index + 1}.")
+        result = self.controller.apply_choice_to_title_group(index)
+        self._diagnostics.record_event(
+            "bulk_apply",
+            mode="title-group",
+            item=index + 1,
+            affected=result.affected_count,
+            preview_valid=result.preview_valid_count,
+            blocked=result.blocked_count,
+        )
+        self._append_status(
+            f"Applied the current decision to {result.affected_count} title-group item(s): "
+            f"{result.preview_valid_count} preview-valid, {result.blocked_count} blocked."
+        )
         self._refresh_review()
 
     def _render_preview_summary(self) -> None:
@@ -2198,9 +2710,14 @@ class MainWindow(QMainWindow):
             self._set_state(WorkflowState.REVIEW_BLOCKED)
             self._set_current_action("Manual review is still required")
         if not rebuild_only:
-            self._diagnostics.record_event("organisation_preview_ready", can_apply=self.preview_state.can_apply)
+            self._diagnostics.record_event(
+                "organisation_preview_ready",
+                can_apply=self.preview_state.can_apply,
+                blocked=self.preview_state.unresolved_count,
+            )
             self._append_status("Built organisation preview.")
             self._complete_action("Built organisation preview")
+        self._checkpoint_review_diagnostics()
 
     def _apply_plan(self) -> None:
         if self.controller is None:
@@ -2218,7 +2735,12 @@ class MainWindow(QMainWindow):
             return
         self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
+        self._diagnostics.record_event(
+            "organisation_apply_started",
+            planned=self.preview_state.planned_count if self.preview_state is not None else 0,
+        )
         self._append_status("Applying organisation plan...")
+        self._flush_runtime_diagnostics()
         worker = FunctionWorker(self.controller.apply_preview, self.preview_state)
         self._start_worker(worker, self._apply_complete)
 
@@ -2235,11 +2757,12 @@ class MainWindow(QMainWindow):
         self._complete_action("Organisation stage complete")
         self._append_status("Organisation stage complete.")
         self._refresh_pipeline_summary()
+        self._flush_runtime_diagnostics()
         if self._guided_mode and self._continue_to_compress:
             if not self._guided_compression_can_continue():
                 self._set_state(WorkflowState.COMPLETED)
                 self._switch_tab("summary")
-                self._flush_diagnostics()
+                self._flush_runtime_diagnostics()
                 return
             self._append_status("Preparing compression plan after organisation.")
             self._prepare_compression_after_apply()
@@ -2247,7 +2770,7 @@ class MainWindow(QMainWindow):
         self._set_state(WorkflowState.COMPLETED)
         self._set_current_action("Pipeline finished")
         self._switch_tab("summary")
-        self._flush_diagnostics()
+        self._flush_runtime_diagnostics()
         self._notify_completion("Organisation complete", "Organisation stage finished.")
 
     def _guided_compression_can_continue(self) -> bool:
@@ -2274,6 +2797,7 @@ class MainWindow(QMainWindow):
         self._start_compression_preparation("Preparing compression plan for the organised output.")
 
     def _start_compression_preparation(self, status_message: str) -> None:
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         try:
             config = self._current_config()
         except ValueError as exc:
@@ -2316,6 +2840,7 @@ class MainWindow(QMainWindow):
         self._append_status(status_message)
         self._preparation_start = time.monotonic()
         self._preparation_timer.start()
+        self._flush_runtime_diagnostics()
         worker = FunctionWorker(prepare_compression, config)
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
@@ -2342,6 +2867,7 @@ class MainWindow(QMainWindow):
                 completed=payload.completed,
                 total=payload.total,
             )
+            self._flush_runtime_diagnostics()
             return
         if not isinstance(payload, PreparationProgress):
             return
@@ -2383,8 +2909,8 @@ class MainWindow(QMainWindow):
         self.encode_preparation = preparation
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(100)
-        self._populate_compression_table(preparation)
         self.include_risky_jobs.setChecked(False)
+        self._populate_compression_table(preparation)
         self._config_dirty = False
         self._refresh_pipeline_summary()
         self._switch_tab("compress")
@@ -2393,11 +2919,21 @@ class MainWindow(QMainWindow):
             self._set_current_action("Compression root scan finished with no supported video files")
             self._append_status("No supported video files found in the compression root.")
             self._set_state(WorkflowState.READY_TO_COMPRESS)
+            self._diagnostics.record_event("compression_prepared", selected_count=0, recommended_count=0, maybe_count=0, skip_count=0)
+            self._flush_runtime_diagnostics()
             return
         if not preparation.jobs:
             self._set_current_action("Compression plan contains no selected jobs")
             self._append_status("Compression plan contains no selected jobs.")
             self._set_state(WorkflowState.READY_TO_COMPRESS)
+            self._diagnostics.record_event(
+                "compression_prepared",
+                selected_count=0,
+                recommended_count=preparation.recommended_count,
+                maybe_count=preparation.maybe_count,
+                skip_count=preparation.skip_count,
+            )
+            self._flush_runtime_diagnostics()
             return
         if preparation.stage_messages:
             for line in preparation.stage_messages:
@@ -2421,9 +2957,13 @@ class MainWindow(QMainWindow):
             skip_count=preparation.skip_count,
             selected_input_bytes=preparation.selected_input_bytes,
             selected_estimated_output_bytes=preparation.selected_estimated_output_bytes,
+            runnable_now=len(self._runnable_jobs(preparation)),
+            deferred_risky=len({row.source for row in self._plan_classification.risky_follow_up} - self._runnable_sources()),
+            missing_items=len(self._plan_classification.missing_items),
         )
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
+        self._flush_runtime_diagnostics()
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
         self.compression_table.setRowCount(0)
@@ -2492,9 +3032,27 @@ class MainWindow(QMainWindow):
             self.compression_table.setRowHidden(row_index, hide)
             if not hide:
                 visible_rows += 1
-        self.compression_filter_status_label.setText(
-            f"No plan rows match the '{mode}' filter." if visible_rows == 0 and self.compression_table.rowCount() else ""
-        )
+        if self.compression_table.rowCount() == 0:
+            self.compression_filter_status_label.setText("")
+        elif visible_rows == 0:
+            self.compression_filter_status_label.setText(
+                f"Filtered view: '{mode}' is hiding every compression row. Switch back to 'All plan items' to inspect the full plan."
+            )
+        elif not self._is_default_compression_filter(mode):
+            self.compression_filter_status_label.setText(
+                f"Filtered view: showing {visible_rows} of {self.compression_table.rowCount()} compression row(s) with '{mode}'."
+            )
+        else:
+            self.compression_filter_status_label.setText("")
+        if self.compression_table.rowCount():
+            self._diagnostics.record_event(
+                "compression_filter_applied",
+                filter=mode,
+                visible_rows=visible_rows,
+                total_rows=self.compression_table.rowCount(),
+            )
+            if (not self._is_default_compression_filter(mode) or visible_rows == 0) and not self._syncing_diagnostics:
+                self._flush_runtime_diagnostics()
 
     def _apply_summary_filter(self) -> None:
         mode = self.summary_filter_combo.currentText()
@@ -2526,6 +3084,7 @@ class MainWindow(QMainWindow):
         if not self._retry_sources:
             self._show_error("There are no failed or compatibility-risk items to retry.")
             return
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         try:
             config = self._current_config()
         except ValueError as exc:
@@ -2552,6 +3111,7 @@ class MainWindow(QMainWindow):
         self._switch_tab("compress")
         self._preparation_start = time.monotonic()
         self._preparation_timer.start()
+        self._flush_runtime_diagnostics()
         worker = FunctionWorker(prepare_retry_compression, config, set(self._retry_sources))
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
@@ -2757,6 +3317,7 @@ class MainWindow(QMainWindow):
             selected_estimated_output_bytes=runnable_preparation.selected_estimated_output_bytes,
             deferred_risky=[str(path) for path in sorted({row.source for row in self._plan_classification.risky_follow_up} - self._runnable_sources())],
         )
+        self._flush_runtime_diagnostics()
         self._compression_timer.start()
         worker = FunctionWorker(run_compression, runnable_preparation)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
@@ -2828,7 +3389,7 @@ class MainWindow(QMainWindow):
         self._refresh_pipeline_summary()
         self._switch_tab("summary")
         self._set_state(WorkflowState.COMPLETED)
-        self._flush_diagnostics()
+        self._flush_runtime_diagnostics()
         self._notify_completion("Compression complete", f"Encoded {len(self.encode_results)} file(s).")
 
     def _notify_completion(self, title: str, message: str) -> None:
@@ -2885,17 +3446,13 @@ class MainWindow(QMainWindow):
         organise_on = self.organise_enabled.isChecked()
         compress_on = self.compress_enabled.isChecked()
 
-        if organise_on and compress_on:
-            header = "Full pipeline completed"
-        elif compress_on:
-            header = "Compression-only run completed"
-        elif organise_on:
-            header = "Organise-only run completed"
-        else:
-            header = "Pipeline Summary"
+        header = self._summary_header_text()
 
         self.summary_headline_label.setText(header)
         lines = [header, ""]
+        if self.workflow_state not in {WorkflowState.COMPLETED, WorkflowState.FAILED}:
+            lines.append(f"Current workflow state: {self.workflow_state.value}")
+            lines.append("")
 
         if organise_on or self.apply_result is not None:
             lines += [

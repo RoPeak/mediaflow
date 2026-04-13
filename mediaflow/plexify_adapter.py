@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from plexify.ui_controller import PreviewState, VideoUIConfig, VideoUIController
 
 from .config import PipelineConfig
@@ -21,8 +23,12 @@ def build_video_controller(config: PipelineConfig) -> VideoUIController:
     )
 
 
-def scan_controller(controller: VideoUIController) -> VideoUIController:
-    controller.scan()
+def scan_controller(
+    controller: VideoUIController,
+    *,
+    progress_callback: Callable[[object], None] | None = None,
+) -> VideoUIController:
+    controller.scan(progress_callback=progress_callback)
     return controller
 
 
