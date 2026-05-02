@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from importlib import import_module
 
 
@@ -37,6 +38,34 @@ def check_runtime_compatibility() -> list[CompatibilityIssue]:
             )
 
     try:
+        ui_controller = import_module("plexify.ui_controller")
+    except Exception as exc:
+        issues.append(
+            CompatibilityIssue(
+                area="plexify",
+                message="Could not import plexify UI controller modules.",
+                technical_detail=str(exc),
+            )
+        )
+    else:
+        scan = getattr(getattr(ui_controller, "VideoUIController", None), "scan", None)
+        if scan is None:
+            issues.append(
+                CompatibilityIssue(
+                    area="plexify",
+                    message="Installed plexify build is missing `VideoUIController.scan`.",
+                )
+            )
+        elif not _supports_scan_signature(scan):
+            issues.append(
+                CompatibilityIssue(
+                    area="plexify",
+                    message="Installed plexify build exposes an unsupported scan interface.",
+                    technical_detail="VideoUIController.scan must support either `scan()` or `scan(progress_callback=...)`.",
+                )
+            )
+
+    try:
         gui_api = import_module("mediashrink.gui_api")
     except Exception as exc:
         issues.append(
@@ -57,6 +86,14 @@ def check_runtime_compatibility() -> list[CompatibilityIssue]:
                 )
 
     return issues
+
+
+def _supports_scan_signature(scan: object) -> bool:
+    try:
+        parameters = inspect.signature(scan).parameters
+    except (TypeError, ValueError):
+        return False
+    return "progress_callback" in parameters or len(parameters) == 1
 
 
 def compatibility_error_text(issues: list[CompatibilityIssue]) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 
@@ -16,6 +18,7 @@ def test_mediashrink_gui_api_contract() -> None:
 
 def test_plexify_ui_controller_contract() -> None:
     pytest.importorskip("requests")
+    pytest.importorskip("guessit")
     from plexify import ui_controller
     from plexify import executor
 
@@ -24,3 +27,5 @@ def test_plexify_ui_controller_contract() -> None:
     assert hasattr(ui_controller, "VideoUIConfig")
     assert hasattr(ui_controller, "VideoUIController")
     assert "moved" in getattr(executor.ExecutionResult, "__annotations__", {})
+    scan_parameters = inspect.signature(ui_controller.VideoUIController.scan).parameters
+    assert "progress_callback" in scan_parameters or len(scan_parameters) == 1

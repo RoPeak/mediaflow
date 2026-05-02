@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Callable
 
 from plexify.ui_controller import PreviewState, VideoUIConfig, VideoUIController
@@ -28,9 +29,20 @@ def scan_controller(
     *,
     progress_callback: Callable[[object], None] | None = None,
 ) -> VideoUIController:
-    controller.scan(progress_callback=progress_callback)
+    if _supports_scan_progress_callback(controller):
+        controller.scan(progress_callback=progress_callback)
+    else:
+        controller.scan()
     return controller
 
 
 def build_preview(controller: VideoUIController) -> PreviewState:
     return controller.build_preview()
+
+
+def _supports_scan_progress_callback(controller: VideoUIController) -> bool:
+    try:
+        signature = inspect.signature(controller.scan)
+    except (TypeError, ValueError):
+        return False
+    return "progress_callback" in signature.parameters
