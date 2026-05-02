@@ -25,3 +25,16 @@ class PreparationStageUpdate:
     message: str
     completed: int | None = None
     total: int | None = None
+
+
+@dataclass(frozen=True)
+class ApplyProgress:
+    """Progress payload emitted while organisation is being applied to disk."""
+
+    phase: str
+    current_source: str | None = None
+    current_destination: str | None = None
+    completed: int = 0
+    total: int = 0
+    last_applied_source: str | None = None
+    message: str | None = None

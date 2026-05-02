@@ -10,7 +10,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from mediaflow.main_window import MainWindow
-from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
+from mediaflow.callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
 from mediaflow.workflow import WorkflowState
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
 
@@ -44,6 +44,7 @@ def test_initial_window_state_guides_user_through_setup() -> None:
     assert window.start_compress_button.isEnabled() is False
     assert "guided pipeline" in window.setup_hint_label.text().lower()
     assert "compression root" in window.setup_summary_label.text().lower()
+    assert "Diagnostics:" in window.diagnostics_path_label.text()
 
 
 def test_library_path_updates_compression_root_while_linked() -> None:
@@ -583,6 +584,76 @@ def test_summary_export_includes_headline_and_mode(tmp_path: Path) -> None:
     assert "Compression output mode: in-place" in exported
     assert "Diagnostics: /tmp/run.json" in exported
     assert "Compression results" in exported
+
+
+def test_manual_movie_match_uses_explicit_year(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    captured: dict[str, object] = {}
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/movie.mp4"), media_type="movie", title="Movie", season=None, episode=None),
+        manual_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="pending",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        status_label="pending",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(
+        items=[item],
+        manual_select=lambda index, **payload: captured.update({"index": index, **payload}),
+    )
+    window._populate_review_table()
+    monkeypatch.setattr(window, "_prompt_manual_movie_selection", lambda _item: {"title": "Teen Titans", "year": 2019})
+    monkeypatch.setattr(window, "_refresh_review", lambda: None)
+
+    window._manual_select_current_item()
+
+    assert captured["index"] == 0
+    assert captured["title"] == "Teen Titans"
+    assert captured["year"] == 2019
+
+
+def test_apply_progress_updates_current_action_and_log() -> None:
+    _app()
+    window = MainWindow()
+
+    window._apply_progress_update(
+        ApplyProgress(
+            phase="copying",
+            current_source="/tmp/source.mp4",
+            current_destination="/tmp/dest.mp4",
+            completed=1,
+            total=3,
+            message="Copying source.mp4",
+        )
+    )
+
+    assert "Copying: 1 of 3" in window.current_action_label.text()
+    assert "source.mp4" in window.current_action_label.text()
+    assert window._diagnostics.events[-1]["kind"] == "organisation_apply_progress"
+
+
+def test_diagnostics_write_failure_becomes_visible_warning(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+
+    def _boom(*, summary, failure, base_dir=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(window._diagnostics, "write", _boom)
+
+    window._flush_runtime_diagnostics()
+
+    assert "Unable to write diagnostics" in window.diagnostics_path_label.text()
+    assert any("Unable to write diagnostics" in warning for warning in window._custom_warnings)
 
 
 def test_encode_dashboard_toggle_hides_live_view() -> None:

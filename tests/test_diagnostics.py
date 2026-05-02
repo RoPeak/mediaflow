@@ -9,6 +9,7 @@ from mediaflow.diagnostics import DiagnosticsRecorder
 def test_diagnostics_recorder_writes_structured_run_file(tmp_path: Path) -> None:
     recorder = DiagnosticsRecorder()
     recorder.set_config({"source": "/tmp/source"})
+    recorder.set_provenance({"app_version": "0.1.0"})
     recorder.record_event("compression_started", jobs=2)
     recorder.record_warning("Overwrite is enabled.")
 
@@ -17,6 +18,7 @@ def test_diagnostics_recorder_writes_structured_run_file(tmp_path: Path) -> None
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert path.parent == tmp_path
     assert payload["effective_config"]["source"] == "/tmp/source"
+    assert payload["provenance"]["app_version"] == "0.1.0"
     assert payload["warnings"] == ["Overwrite is enabled."]
     assert payload["summary"]["encoded"] == 1
 

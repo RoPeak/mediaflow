@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import is_dataclass, replace
 from datetime import datetime
+import importlib
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -45,10 +47,11 @@ from PySide6.QtWidgets import (
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
 from plexify.ui_controller import ApplyResultState, PreviewState, VideoUIController
 
-from .callback_types import PreparationProgress, PreparationStageUpdate
+from . import __version__
+from .callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
 from .compat import check_runtime_compatibility, compatibility_error_text
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
-from .diagnostics import DiagnosticsRecorder
+from .diagnostics import DiagnosticsRecorder, diagnostics_dir
 from .integrations import (
     build_compression_plan_rows,
     build_encode_result_rows,
@@ -66,14 +69,19 @@ from .mediashrink_adapter import (
     run_compression,
 )
 from .pipeline import build_pipeline_summary
-from .plexify_adapter import build_preview, build_video_controller, scan_controller
+from .plexify_adapter import (
+    apply_preview_controller,
+    build_preview,
+    build_video_controller,
+    scan_controller,
+)
 from .progress import (
     EncodeProgressModel,
     PreparationProgressModel,
     preparation_stage_title,
     preparation_timeline_text,
 )
-from .settings import load_ui_state, save_ui_state
+from .settings import get_config_dir, load_ui_state, save_ui_state
 from .workers import FunctionWorker
 from .workflow import WorkflowState, describe_workflow_state
 
@@ -104,6 +112,7 @@ class MainWindow(QMainWindow):
         self._last_completed_action = "Nothing completed yet"
         self._custom_warnings: list[str] = []
         self._last_diagnostics_path: Path | None = None
+        self._last_diagnostics_error: str | None = None
         self._retry_sources: set[Path] = set()
         self._compression_plan_rows: list = []
         self._summary_rows: list = []
@@ -127,6 +136,12 @@ class MainWindow(QMainWindow):
         self._first_progress_delay: float | None = None
         self._restored_state_warnings: list[str] = []
         self._scan_started_at: float | None = None
+        self._scan_last_update_at: float | None = None
+        self._preparation_last_update_at: float | None = None
+        self._apply_started_at: float | None = None
+        self._apply_last_update_at: float | None = None
+        self._apply_progress: ApplyProgress | None = None
+        self._last_apply_log_key: tuple[str, int, int, str] | None = None
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
@@ -140,6 +155,8 @@ class MainWindow(QMainWindow):
             target = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
             self.compression_root_input.setText(target)
         self._set_state(WorkflowState.SETUP)
+        self._set_diagnostics_provenance()
+        self._flush_runtime_diagnostics()
 
         self._tray: QSystemTrayIcon | None = None
 
@@ -153,6 +170,12 @@ class MainWindow(QMainWindow):
         self.warning_label.setWordWrap(True)
         self.step_checklist_label = QLabel()
         self.step_checklist_label.setWordWrap(True)
+        self.activity_label = QLabel()
+        self.activity_label.setWordWrap(True)
+        self.activity_label.setObjectName("muted-label")
+        self.active_diagnostics_label = QLabel()
+        self.active_diagnostics_label.setWordWrap(True)
+        self.active_diagnostics_label.setObjectName("muted-label")
 
         self.tabs = QTabWidget()
 
@@ -395,6 +418,9 @@ class MainWindow(QMainWindow):
         self._preparation_timer = QTimer(self)
         self._preparation_timer.setInterval(1000)
         self._preparation_timer.timeout.connect(self._tick_preparation)
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setInterval(1000)
+        self._apply_timer.timeout.connect(self._tick_apply)
         self._scan_timer = QTimer(self)
         self._scan_timer.setInterval(1000)
         self._scan_timer.timeout.connect(self._tick_scan)
@@ -446,6 +472,10 @@ class MainWindow(QMainWindow):
         self.summary_log.setReadOnly(True)
         self.open_output_button = QPushButton("Open output folder")
         self.open_output_button.setVisible(False)
+        self.open_diagnostics_button = QPushButton("Open diagnostics folder")
+        self.open_diagnostics_button.setVisible(False)
+        self.copy_diagnostics_button = QPushButton("Copy diagnostics path")
+        self.copy_diagnostics_button.setVisible(False)
         self.save_summary_button = QPushButton("Save run summary...")
         self.save_summary_button.setVisible(False)
         self.diagnostics_path_label = QLabel()
@@ -467,6 +497,8 @@ class MainWindow(QMainWindow):
         banner_layout.addWidget(self.guidance_label)
         banner_layout.addWidget(self.warning_label)
         banner_layout.addWidget(self.step_checklist_label)
+        banner_layout.addWidget(self.activity_label)
+        banner_layout.addWidget(self.active_diagnostics_label)
         layout.addWidget(banner)
 
         self.tabs.addTab(self._build_setup_tab(), "Setup")
@@ -932,6 +964,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.summary_log, stretch=1)
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.open_output_button)
+        btn_row.addWidget(self.open_diagnostics_button)
+        btn_row.addWidget(self.copy_diagnostics_button)
         btn_row.addWidget(self.save_summary_button)
         btn_row.addWidget(self.retry_summary_button)
         btn_row.addStretch(1)
@@ -997,6 +1031,8 @@ class MainWindow(QMainWindow):
         self.retry_summary_button.clicked.connect(self._prepare_retry_plan)
         self.include_risky_jobs.toggled.connect(lambda *_: self._refresh_plan_view())
         self.open_output_button.clicked.connect(self._open_output_folder)
+        self.open_diagnostics_button.clicked.connect(self._open_diagnostics_folder)
+        self.copy_diagnostics_button.clicked.connect(self._copy_diagnostics_path)
         self.save_summary_button.clicked.connect(self._save_run_summary)
         self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
         self.summary_filter_combo.currentTextChanged.connect(lambda *_: self._apply_summary_filter())
@@ -1268,6 +1304,67 @@ class MainWindow(QMainWindow):
             return f"{s}s"
         return f"{s // 60}m {s % 60}s"
 
+    @staticmethod
+    def _summarize_path(path_text: str | None) -> str:
+        if not path_text:
+            return "(waiting for file details)"
+        return Path(path_text).name or path_text
+
+    @staticmethod
+    def _phase_label(phase: str) -> str:
+        phase_text = phase.replace("-", " ").replace("_", " ").strip().title()
+        return phase_text or "Working"
+
+    def _set_diagnostics_provenance(self) -> None:
+        self._diagnostics.set_provenance(
+            {
+                "app_version": __version__,
+                "python_executable": sys.executable,
+                "python_version": sys.version.split()[0],
+                "platform": sys.platform,
+                "config_dir": str(get_config_dir()),
+                "diagnostics_dir": str(diagnostics_dir()),
+                "integrations": {
+                    "plexify": self._module_origin_details("plexify"),
+                    "mediashrink": self._module_origin_details("mediashrink"),
+                },
+            }
+        )
+
+    @staticmethod
+    def _module_origin_details(module_name: str) -> dict[str, object]:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            return {"imported": False, "error": str(exc)}
+        module_path = getattr(module, "__file__", None)
+        resolved = Path(module_path).resolve(strict=False) if module_path else None
+        return {
+            "imported": True,
+            "path": str(resolved) if resolved else None,
+            "editable_local": bool(resolved and ("github" in str(resolved) or ".egg-link" in str(resolved))),
+        }
+
+    @staticmethod
+    def _parse_title_with_year(text: str) -> tuple[str, int | None]:
+        clean = text.strip()
+        match = re.match(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)\s*$", clean)
+        if not match:
+            return clean, None
+        return match.group("title").strip(), int(match.group("year"))
+
+    def _diagnostics_directory_path(self) -> Path:
+        if self._last_diagnostics_path is not None:
+            return self._last_diagnostics_path.parent
+        return get_config_dir() / "runs"
+
+    def _diagnostics_status_text(self) -> str:
+        if self._last_diagnostics_path is not None:
+            return f"Diagnostics file: {self._last_diagnostics_path}"
+        if self._last_diagnostics_error:
+            return f"Diagnostics warning: {self._last_diagnostics_error}"
+        return f"Diagnostics folder: {self._diagnostics_directory_path()}"
+
     def _tick_scan(self) -> None:
         if self.workflow_state != WorkflowState.SCANNING or self._scan_started_at is None:
             self._scan_timer.stop()
@@ -1280,9 +1377,30 @@ class MainWindow(QMainWindow):
             else "waiting for first candidates"
         )
         current_file = f" • {Path(self._scan_last_path).name}" if self._scan_last_path else ""
-        self.current_action_label.setText(
-            f"Scanning source with plexify ({self._format_elapsed(elapsed)} • {discovered}{current_file})"
-        )
+        message = f"Scanning source with plexify ({self._format_elapsed(elapsed)} • {discovered}{current_file})"
+        if elapsed >= 10 and self._scan_discovered_count == 0:
+            message += ". Still working. Plexify has not returned first candidates yet."
+        self._set_current_action(message)
+
+    def _tick_apply(self) -> None:
+        if self.workflow_state != WorkflowState.APPLYING or self._apply_started_at is None:
+            self._apply_timer.stop()
+            return
+        elapsed = time.monotonic() - self._apply_started_at
+        progress = self._apply_progress
+        if progress is None:
+            message = f"Applying organisation ({self._format_elapsed(elapsed)} • waiting for first file operation)"
+            if elapsed >= 10:
+                message += ". Still working. Opening reports or starting the first copy can take time."
+            self._set_current_action(message)
+            return
+        current_name = self._summarize_path(progress.current_source)
+        phase = self._phase_label(progress.phase)
+        counts = f"{progress.completed} of {progress.total}" if progress.total else "starting"
+        message = f"{phase} organisation ({counts} • {self._format_elapsed(elapsed)}): {current_name}"
+        if self._apply_last_update_at is not None and time.monotonic() - self._apply_last_update_at >= 10:
+            message += ". Still working on the last reported file."
+        self._set_current_action(message)
 
     @staticmethod
     def _normalize_heartbeat_state(text: str) -> str:
@@ -1416,7 +1534,9 @@ class MainWindow(QMainWindow):
 
     def _set_current_action(self, text: str) -> None:
         self._current_action = text
-        self.current_action_label.setText(self._strip_rich(text))
+        clean = self._strip_rich(text)
+        self.current_action_label.setText(clean)
+        self.activity_label.setText(f"Current activity: {clean}")
 
     def _complete_action(self, text: str) -> None:
         self._last_completed_action = text
@@ -1433,7 +1553,9 @@ class MainWindow(QMainWindow):
         self._plan_classification = classify_compression_plan(())
         self._retry_sources = set()
         self._last_diagnostics_path = None
+        self._last_diagnostics_error = None
         self._diagnostics = DiagnosticsRecorder()
+        self._set_diagnostics_provenance()
         self._guided_mode = False
         self._continue_to_compress = False
         self._config_dirty = False
@@ -1452,10 +1574,17 @@ class MainWindow(QMainWindow):
         self.overall_progress.setValue(0)
         self._compression_timer.stop()
         self._preparation_timer.stop()
+        self._apply_timer.stop()
         self._scan_timer.stop()
         self._scan_started_at = None
+        self._scan_last_update_at = None
         self._scan_discovered_count = 0
         self._scan_last_path = ""
+        self._preparation_last_update_at = None
+        self._apply_started_at = None
+        self._apply_last_update_at = None
+        self._apply_progress = None
+        self._last_apply_log_key = None
         self._encode_progress_model.reset()
         self._preparation_model = PreparationProgressModel()
         self._last_status_text = ""
@@ -1486,6 +1615,7 @@ class MainWindow(QMainWindow):
         self.retry_failed_button.setVisible(False)
         self.retry_summary_button.setVisible(False)
         self.diagnostics_path_label.setText("")
+        self.active_diagnostics_label.setText(self._diagnostics_status_text())
         self._refresh_pipeline_summary()
         if status_message:
             self._append_status(status_message)
@@ -1634,6 +1764,9 @@ class MainWindow(QMainWindow):
         self.retry_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED and bool(self._retry_sources))
         self.retry_summary_button.setEnabled(can_retry)
         self.open_output_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
+        diagnostics_visible = self._last_diagnostics_path is not None or self._last_diagnostics_error is not None
+        self.open_diagnostics_button.setVisible(diagnostics_visible)
+        self.copy_diagnostics_button.setVisible(diagnostics_visible)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
 
         show_encode_dashboard = has_compression_plan and self.compress_stack.currentIndex() == 2
@@ -1655,7 +1788,7 @@ class MainWindow(QMainWindow):
         if self.overwrite.isChecked() and self.compress_enabled.isChecked():
             warnings.append("Overwrite is enabled. Successful compression will replace originals in-place.")
         if busy:
-            warnings.append("A background task is currently running.")
+            warnings.append(self._active_worker_warning_text())
         warning_text = "\n".join(warnings)
         self.warning_label.setText(warning_text)
         self.runtime_warnings_label.setText(warning_text or "No active warnings.")
@@ -1673,6 +1806,8 @@ class MainWindow(QMainWindow):
         )
         self.current_action_label.setText(self._current_action)
         self.last_completed_label.setText(self._last_completed_action)
+        self.activity_label.setText(f"Current activity: {self._strip_rich(self._current_action)}")
+        self.active_diagnostics_label.setText(self._diagnostics_status_text())
         self._update_setup_summary()
         self._update_review_summary()
         self._update_compress_summary()
@@ -1690,6 +1825,17 @@ class MainWindow(QMainWindow):
                 )
             return "Start with the guided pipeline unless you only want a manual organise review or a compression-only run."
         return "Setup controls stay available, but later stages will ask you to rebuild stale data after changes."
+
+    def _active_worker_warning_text(self) -> str:
+        if self.workflow_state == WorkflowState.SCANNING:
+            return "Organise scan is running. Mediaflow will move to review automatically when plexify finishes."
+        if self.workflow_state == WorkflowState.APPLYING:
+            return "Organisation is still being applied. Compression will not start until every planned copy or move finishes."
+        if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
+            return "Compression planning is running. Mediaflow will switch to the compression plan as soon as mediashrink finishes analysing files."
+        if self.workflow_state == WorkflowState.COMPRESSING:
+            return "Compression is running. Originals are only replaced after each successful encode."
+        return "A background task is currently running."
 
     def _review_hint_text(self) -> str:
         if self.controller is None:
@@ -1958,10 +2104,21 @@ class MainWindow(QMainWindow):
         self.toggle_encode_card_button.setText("Show live view" if checked else "Hide live view")
 
     def _open_output_folder(self) -> None:
-        import sys
         path = self.compression_root_input.text().strip() or self.library_input.text().strip()
         if not path:
             return
+        self._open_path(path)
+
+    def _open_diagnostics_folder(self) -> None:
+        self._open_path(str(self._diagnostics_directory_path()))
+
+    def _copy_diagnostics_path(self) -> None:
+        target = str(self._last_diagnostics_path or self._diagnostics_directory_path())
+        QApplication.clipboard().setText(target)
+        self._append_status(f"Copied diagnostics path: {target}")
+
+    @staticmethod
+    def _open_path(path: str) -> None:
         if sys.platform == "win32":
             import os
             os.startfile(path)  # noqa: S606
@@ -2079,6 +2236,10 @@ class MainWindow(QMainWindow):
         ]
         if config.plexify.enabled and not config.library.exists():
             lines.append("Output folder does not exist yet and will be created during organise.")
+        if config.plexify.enabled and config.plexify.copy_mode:
+            lines.append(
+                "Copy mode is enabled. Organisation may take time on large files, and compression will only begin after every copy finishes."
+            )
         return "\n".join(lines)
 
     def _flush_diagnostics(self, *, failure_message: str | None = None) -> None:
@@ -2091,14 +2252,30 @@ class MainWindow(QMainWindow):
             "summary_overview": self.summary_overview_label.text().strip(),
         }
         failure = {"message": failure_message} if failure_message else None
-        self._last_diagnostics_path = self._diagnostics.write(summary=summary, failure=failure)
-        self.diagnostics_path_label.setText(f"Diagnostics: {self._last_diagnostics_path}")
+        try:
+            self._last_diagnostics_path = self._diagnostics.write(summary=summary, failure=failure)
+            self._last_diagnostics_error = None
+            self.diagnostics_path_label.setText(f"Diagnostics: {self._last_diagnostics_path}")
+        except OSError as exc:
+            self._last_diagnostics_path = None
+            self._last_diagnostics_error = f"Unable to write diagnostics: {exc}"
+            self.diagnostics_path_label.setText(self._last_diagnostics_error)
+            if self._last_diagnostics_error not in self._custom_warnings:
+                self._custom_warnings.append(self._last_diagnostics_error)
+        self.active_diagnostics_label.setText(self._diagnostics_status_text())
 
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
             return
         self._scan_timer.stop()
+        self._apply_timer.stop()
+        self._preparation_timer.stop()
         self._scan_started_at = None
+        self._scan_last_update_at = None
+        self._apply_started_at = None
+        self._apply_last_update_at = None
+        self._apply_progress = None
+        self._preparation_last_update_at = None
         self._scan_discovered_count = 0
         self._scan_last_path = ""
         self._complete_action("Last operation failed")
@@ -2176,6 +2353,7 @@ class MainWindow(QMainWindow):
         self._scan_discovered_count = 0
         self._scan_last_path = ""
         self._scan_started_at = time.monotonic()
+        self._scan_last_update_at = self._scan_started_at
         self._scan_timer.start()
         self._set_current_action("Scanning source with plexify")
         self._set_state(WorkflowState.SCANNING)
@@ -2226,6 +2404,7 @@ class MainWindow(QMainWindow):
             self._scan_discovered_count = 0
             self._scan_last_path = ""
             self._scan_started_at = time.monotonic()
+            self._scan_last_update_at = self._scan_started_at
             self._scan_timer.start()
             self._set_current_action("Starting guided organise review")
             self._set_state(WorkflowState.SCANNING)
@@ -2241,6 +2420,7 @@ class MainWindow(QMainWindow):
     def _scan_complete(self, controller: VideoUIController) -> None:
         self._scan_timer.stop()
         self._scan_started_at = None
+        self._scan_last_update_at = None
         self.controller = controller
         self.preview_state = None
         self.apply_result = None
@@ -2283,6 +2463,7 @@ class MainWindow(QMainWindow):
             return
         self._scan_discovered_count = int(payload.get("discovered", 0) or 0)
         self._scan_last_path = str(payload.get("path", "") or "")
+        self._scan_last_update_at = time.monotonic()
         self.review_placeholder_label.setText(self._review_placeholder_text())
 
     def _populate_review_table(self) -> None:
@@ -2453,6 +2634,36 @@ class MainWindow(QMainWindow):
             return 0
         return indexes[0].row()
 
+    def _prompt_manual_movie_selection(self, item) -> dict[str, object] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Movie Match")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        typed_title, typed_year = self._parse_title_with_year(self.search_input.text())
+        title_input = QLineEdit(typed_title or item.item.title)
+        year_input = QSpinBox()
+        year_input.setRange(0, 9999)
+        year_input.setSpecialValueText("(optional)")
+        year_input.setValue(int(item.item.year or typed_year or 0))
+
+        form.addRow("Movie title", title_input)
+        form.addRow("Year", year_input)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        title = title_input.text().strip()
+        if not title:
+            self._show_error("Enter a movie title first.")
+            return None
+        return {"title": title, "year": year_input.value() or None}
+
     def _prompt_manual_tv_selection(self, item) -> dict[str, object] | None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Manual TV Match")
@@ -2467,11 +2678,12 @@ class MainWindow(QMainWindow):
                     suggested_query = suggested_search(self.controller.items.index(item))
             except ValueError:
                 suggested_query = None
-        title_input = QLineEdit(self.search_input.text().strip() or suggested_query or item.item.title)
+        typed_title, typed_year = self._parse_title_with_year(self.search_input.text())
+        title_input = QLineEdit(typed_title or suggested_query or item.item.title)
         year_input = QSpinBox()
         year_input.setRange(0, 9999)
         year_input.setSpecialValueText("(optional)")
-        year_input.setValue(int(item.item.year or 0))
+        year_input.setValue(int(typed_year or item.item.year or 0))
         season_input = QSpinBox()
         season_input.setRange(0, 999)
         season_input.setSpecialValueText("(optional)")
@@ -2634,13 +2846,13 @@ class MainWindow(QMainWindow):
                 f"(S{season_text} E{episode_text})."
             )
         else:
-            title = self.search_input.text().strip()
-            if not title:
-                self._show_error("Enter a manual title first.")
+            payload = self._prompt_manual_movie_selection(item)
+            if payload is None:
                 return
-            self.controller.manual_select(index, title=title)
-            self._diagnostics.record_event("manual_match", item=index + 1, title=title)
-            self._append_status(f"Manually selected '{title}' for item {index + 1}.")
+            self.controller.manual_select(index, **payload)
+            self._diagnostics.record_event("manual_match", item=index + 1, **payload)
+            year_text = f" ({payload['year']})" if payload.get("year") else ""
+            self._append_status(f"Manually selected '{payload['title']}{year_text}' for item {index + 1}.")
         self._refresh_review()
 
     def _apply_choice_to_folder(self) -> None:
@@ -2740,11 +2952,24 @@ class MainWindow(QMainWindow):
             planned=self.preview_state.planned_count if self.preview_state is not None else 0,
         )
         self._append_status("Applying organisation plan...")
+        self._apply_started_at = time.monotonic()
+        self._apply_last_update_at = self._apply_started_at
+        self._apply_progress = ApplyProgress(
+            phase="starting",
+            completed=0,
+            total=self.preview_state.planned_count if self.preview_state is not None else 0,
+            message="Opening organise report and starting file operations.",
+        )
+        self._last_apply_log_key = None
+        self._apply_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(self.controller.apply_preview, self.preview_state)
-        self._start_worker(worker, self._apply_complete)
+        worker = FunctionWorker(apply_preview_controller, self.controller, self.preview_state)
+        self._start_worker(worker, self._apply_complete, self._apply_progress_update)
 
     def _apply_complete(self, result: ApplyResultState) -> None:
+        self._apply_timer.stop()
+        self._apply_started_at = None
+        self._apply_last_update_at = None
         self.apply_result = result
         self._diagnostics.record_event(
             "organisation_applied",
@@ -2760,10 +2985,14 @@ class MainWindow(QMainWindow):
         self._flush_runtime_diagnostics()
         if self._guided_mode and self._continue_to_compress:
             if not self._guided_compression_can_continue():
+                self._set_current_action("Organisation completed, but guided compression cannot continue automatically")
+                self._append_status("Organisation completed, but compression cannot continue automatically.")
                 self._set_state(WorkflowState.COMPLETED)
                 self._switch_tab("summary")
                 self._flush_runtime_diagnostics()
                 return
+            self._set_current_action("Organisation complete. Preparing compression plan for organised output")
+            self._append_status("Organisation complete. Starting compression preparation.")
             self._append_status("Preparing compression plan after organisation.")
             self._prepare_compression_after_apply()
             return
@@ -2772,6 +3001,46 @@ class MainWindow(QMainWindow):
         self._switch_tab("summary")
         self._flush_runtime_diagnostics()
         self._notify_completion("Organisation complete", "Organisation stage finished.")
+
+    def _apply_progress_update(self, payload: object) -> None:
+        if not isinstance(payload, ApplyProgress):
+            return
+        self._apply_progress = payload
+        self._apply_last_update_at = time.monotonic()
+        current_name = self._summarize_path(payload.current_source)
+        phase = self._phase_label(payload.phase)
+        total = payload.total
+        if total:
+            status_line = f"{phase}: {payload.completed} of {total} • {current_name}"
+        else:
+            status_line = f"{phase}: {current_name}"
+        if payload.message:
+            self._set_current_action(f"{status_line}\n{payload.message}")
+        else:
+            self._set_current_action(status_line)
+        log_key = (
+            payload.phase,
+            payload.completed,
+            payload.total,
+            payload.current_source or payload.last_applied_source or "",
+        )
+        if log_key == self._last_apply_log_key:
+            return
+        self._last_apply_log_key = log_key
+        self._diagnostics.record_event(
+            "organisation_apply_progress",
+            phase=payload.phase,
+            completed=payload.completed,
+            total=payload.total,
+            current_source=payload.current_source,
+            current_destination=payload.current_destination,
+            last_applied_source=payload.last_applied_source,
+            message=payload.message,
+        )
+        if payload.message:
+            self._append_status(f"{status_line} • {payload.message}")
+        else:
+            self._append_status(status_line)
 
     def _guided_compression_can_continue(self) -> bool:
         compression_root = Path(self.compression_root_input.text().strip())
@@ -2817,6 +3086,7 @@ class MainWindow(QMainWindow):
             policy=config.shrink.policy,
             on_file_failure=config.shrink.on_file_failure,
         )
+        self._apply_progress = None
         self._retry_sources = set()
         if self._config_dirty and self.encode_preparation is not None:
             self.encode_preparation = None
@@ -2839,6 +3109,7 @@ class MainWindow(QMainWindow):
         self._switch_tab("compress")
         self._append_status(status_message)
         self._preparation_start = time.monotonic()
+        self._preparation_last_update_at = self._preparation_start
         self._preparation_timer.start()
         self._flush_runtime_diagnostics()
         worker = FunctionWorker(prepare_compression, config)
@@ -2847,6 +3118,7 @@ class MainWindow(QMainWindow):
     def _preparation_progress(self, payload: object) -> None:
         if isinstance(payload, PreparationStageUpdate):
             clean = self._strip_rich(payload.message)
+            self._preparation_last_update_at = time.monotonic()
             self._preparation_model.update_stage(
                 payload.stage,
                 clean,
@@ -2871,6 +3143,7 @@ class MainWindow(QMainWindow):
             return
         if not isinstance(payload, PreparationProgress):
             return
+        self._preparation_last_update_at = time.monotonic()
         completed, total, path = payload.completed, payload.total, payload.path
         file_size = 0
         if path:
@@ -2901,6 +3174,7 @@ class MainWindow(QMainWindow):
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self._preparation_timer.stop()
+        self._preparation_last_update_at = None
         self._preparation_duration = time.monotonic() - self._preparation_start
         self.prepare_elapsed_label.setText("")
         self._preparation_model.mark_ready()
@@ -3406,6 +3680,9 @@ class MainWindow(QMainWindow):
 
     def note_startup_complete(self, started_at: float) -> None:
         self._startup_duration = max(0.0, time.monotonic() - started_at)
+        self._set_diagnostics_provenance()
+        self._diagnostics.record_event("startup_complete", seconds=round(self._startup_duration, 2))
+        self._flush_runtime_diagnostics()
 
     _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -3439,6 +3716,12 @@ class MainWindow(QMainWindow):
     def _tick_preparation(self) -> None:
         elapsed = time.monotonic() - self._preparation_start
         self.prepare_elapsed_label.setText(f"Elapsed: {self._format_elapsed(elapsed)}")
+        if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
+            stage = self._preparation_stage_title(self._preparation_model.stage_key)
+            message = f"{stage} ({self._format_elapsed(elapsed)})"
+            if self._preparation_last_update_at is not None and time.monotonic() - self._preparation_last_update_at >= 10:
+                message += ". Still working on the current preparation step."
+            self._set_current_action(message)
 
     def _refresh_pipeline_summary(self) -> None:
         summary = build_pipeline_summary(self.apply_result, self.encode_results)
@@ -3501,11 +3784,16 @@ class MainWindow(QMainWindow):
             lines.append(f"Organise apply report: {summary.organise_apply_report_path}")
         if self._last_diagnostics_path is not None:
             lines.append(f"Diagnostics:     {self._last_diagnostics_path}")
+        elif self._last_diagnostics_error:
+            lines.append(f"Diagnostics:     {self._last_diagnostics_error}")
 
         self.summary_overview_label.setText("\n".join(lines))
-        self.diagnostics_path_label.setText(
-            f"Diagnostics: {self._last_diagnostics_path}" if self._last_diagnostics_path else ""
-        )
+        if self._last_diagnostics_path is not None:
+            self.diagnostics_path_label.setText(f"Diagnostics: {self._last_diagnostics_path}")
+        elif self._last_diagnostics_error:
+            self.diagnostics_path_label.setText(self._last_diagnostics_error)
+        else:
+            self.diagnostics_path_label.setText(f"Diagnostics folder: {self._diagnostics_directory_path()}")
         # Stat tiles
         encoded = summary.encoded_files
         self.stat_files_label.setText(f"{encoded}\nfile{'s' if encoded != 1 else ''} encoded")

@@ -22,6 +22,7 @@ def diagnostics_path(base_dir: Path | None = None, *, started_at: datetime | Non
 @dataclass
 class DiagnosticsRecorder:
     effective_config: dict[str, object] | None = None
+    provenance: dict[str, object] | None = None
     events: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -30,6 +31,9 @@ class DiagnosticsRecorder:
 
     def set_config(self, payload: dict[str, object]) -> None:
         self.effective_config = payload
+
+    def set_provenance(self, payload: dict[str, object]) -> None:
+        self.provenance = payload
 
     def record_event(self, kind: str, **payload: object) -> None:
         serialized_payload = {key: _serialize(value) for key, value in payload.items()}
@@ -60,6 +64,7 @@ class DiagnosticsRecorder:
         payload = {
             "started_at": self.started_at.isoformat(),
             "effective_config": _serialize(self.effective_config),
+            "provenance": _serialize(self.provenance),
             "warnings": list(self.warnings),
             "events": list(self.events),
             "summary": _serialize(summary),

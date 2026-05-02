@@ -64,6 +64,19 @@ class _ProgressController:
     def scan(self, *, progress_callback=None) -> None:
         self.progress_callback = progress_callback
 
+    def apply_preview(self, preview, *, progress_callback=None):
+        self.progress_callback = progress_callback
+        return preview
+
+
+class _LegacyApplyController:
+    def __init__(self) -> None:
+        self.preview = None
+
+    def apply_preview(self, preview):
+        self.preview = preview
+        return preview
+
 
 def test_scan_controller_supports_legacy_plexify_scan_signature() -> None:
     adapter = _load_adapter_with_stubbed_plexify()
@@ -84,3 +97,36 @@ def test_scan_controller_passes_progress_callback_when_supported() -> None:
 
     assert result is controller
     assert controller.progress_callback is callback
+
+
+def test_apply_preview_controller_supports_legacy_signature() -> None:
+    adapter = _load_adapter_with_stubbed_plexify()
+    controller = _LegacyApplyController()
+    preview = object()
+
+    result = adapter.apply_preview_controller(controller, preview, progress_callback=lambda _payload: None)
+
+    assert result is preview
+    assert controller.preview is preview
+
+
+def test_apply_preview_controller_converts_apply_progress_payload() -> None:
+    adapter = _load_adapter_with_stubbed_plexify()
+    controller = _ProgressController()
+    captured = []
+
+    adapter.apply_preview_controller(controller, object(), progress_callback=captured.append)
+    controller.progress_callback(
+        {
+            "phase": "copying",
+            "completed": 1,
+            "total": 3,
+            "current_source": "/tmp/source.mp4",
+            "current_destination": "/tmp/dest.mp4",
+            "message": "Copying source.mp4",
+        }
+    )
+
+    assert captured[0].phase == "copying"
+    assert captured[0].completed == 1
+    assert captured[0].current_source == "/tmp/source.mp4"
