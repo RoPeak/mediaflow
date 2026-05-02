@@ -4,6 +4,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
+from mediashrink.analysis import (
+    estimate_analysis_encode_seconds,
+    estimate_size_confidence,
+    estimate_time_confidence,
+)
 from mediashrink.gui_api import (
     EncodePreparation,
     EncodeProgress,
@@ -12,6 +17,8 @@ from mediashrink.gui_api import (
     run_encode_plan,
 )
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
+from mediashrink.scanner import build_jobs
+from mediashrink.wizard import prepare_profile_planning
 
 from .config import PipelineConfig
 from .callback_types import PreparationProgress, PreparationStageUpdate
@@ -21,7 +28,7 @@ def prepare_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
 ) -> EncodePreparation:
-    return prepare_encode_run(
+    preparation = prepare_encode_run(
         directory=config.compression_root,
         recursive=config.shrink.recursive,
         overwrite=config.shrink.overwrite,
@@ -36,6 +43,7 @@ def prepare_compression(
             else None
         ),
     )
+    return _recover_zero_job_preparation(preparation, config)
 
 
 def missing_job_sources(preparation: EncodePreparation) -> list:
@@ -176,6 +184,97 @@ def _filter_preparation_to_sources(
         total_input_bytes=total_input_bytes,
         selected_input_bytes=selected_input_bytes,
         selected_estimated_output_bytes=selected_estimated_output_bytes,
+    )
+
+
+def _recover_zero_job_preparation(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+) -> EncodePreparation:
+    if preparation.jobs or not preparation.items:
+        return preparation
+
+    selected_items = [item for item in preparation.items if item.recommendation == "recommended"]
+    if not selected_items:
+        selected_items = [item for item in preparation.items if item.recommendation == "maybe"]
+    if not selected_items:
+        return preparation
+
+    planning = prepare_profile_planning(
+        analysis_items=preparation.items,
+        ffmpeg=preparation.ffmpeg,
+        ffprobe=preparation.ffprobe,
+        policy=config.shrink.policy,
+        use_calibration=preparation.use_calibration,
+        console=None,
+    )
+    profiles = list(planning.profiles) if planning is not None else []
+    profile = next((candidate for candidate in profiles if candidate.is_recommended), None)
+    if profile is None and profiles:
+        profile = profiles[0]
+    if profile is None:
+        messages = list(preparation.stage_messages or [])
+        messages.append(
+            "Compression analysis completed, but no encoder profile could be auto-selected. "
+            "Review the plan details or rebuild the plan with different settings."
+        )
+        return replace(preparation, stage_messages=messages)
+
+    jobs = build_jobs(
+        files=[item.source for item in selected_items],
+        output_dir=None,
+        overwrite=config.shrink.overwrite,
+        crf=profile.crf,
+        preset=profile.encoder_key,
+        dry_run=False,
+        ffprobe=preparation.ffprobe,
+        no_skip=config.shrink.no_skip,
+    )
+    messages = list(preparation.stage_messages or [])
+    if preparation.profile is None:
+        messages.append(
+            "No encoder profile was auto-selected, so mediaflow chose the first available profile "
+            f"({profile.name}) to keep the recommended plan runnable."
+        )
+    selected_input_bytes = sum(int(getattr(item, "size_bytes", 0) or 0) for item in selected_items)
+    selected_estimated_output_bytes = sum(
+        int(getattr(item, "estimated_output_bytes", 0) or 0)
+        for item in selected_items
+        if int(getattr(item, "estimated_output_bytes", 0) or 0) > 0
+    )
+    estimated_total_seconds = estimate_analysis_encode_seconds(
+        selected_items,
+        preset=profile.encoder_key,
+        crf=profile.crf,
+        ffmpeg=preparation.ffmpeg,
+        known_speed=None,
+        use_calibration=preparation.use_calibration,
+        calibration_store=planning.active_calibration if planning is not None else None,
+    )
+    return replace(
+        preparation,
+        profile=profile,
+        jobs=jobs,
+        selected_count=len(selected_items),
+        selected_input_bytes=selected_input_bytes,
+        selected_estimated_output_bytes=selected_estimated_output_bytes,
+        estimated_total_seconds=estimated_total_seconds,
+        size_confidence=estimate_size_confidence(
+            selected_items,
+            preset=profile.encoder_key,
+            use_calibration=preparation.use_calibration,
+        ),
+        time_confidence=estimate_time_confidence(
+            selected_items,
+            benchmarked_files=1 if planning is not None and planning.benchmark_speeds else 0,
+            preset=profile.encoder_key,
+            use_calibration=preparation.use_calibration,
+        ),
+        compatible_count=profile.compatible_count,
+        incompatible_count=profile.incompatible_count,
+        grouped_incompatibilities=profile.grouped_incompatibilities,
+        recommendation_reason=preparation.recommendation_reason or profile.why_choose,
+        stage_messages=messages,
     )
 
 

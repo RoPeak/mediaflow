@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QSystemTrayIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -508,9 +508,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs, stretch=1)
 
     def _apply_styles(self) -> None:
+        base_font = QFont(self.font())
+        if base_font.pointSizeF() <= 0:
+            base_font.setPointSize(10)
+        self.setFont(base_font)
         self.setStyleSheet(
             """
-            QWidget { font-size: 13px; }
             QMainWindow, QWidget { background: #1e1f22; color: #f2f2f2; }
             QGroupBox {
                 border: 1px solid #555;
@@ -1703,7 +1706,7 @@ class MainWindow(QMainWindow):
         can_apply = bool(self.preview_state and self.preview_state.can_apply and not busy and not self._config_dirty)
         can_start_compression = bool(
             has_compression_plan
-            and self.encode_preparation.jobs
+            and self._runnable_jobs(self.encode_preparation)
             and self.workflow_state == WorkflowState.READY_TO_COMPRESS
             and not busy
             and not self._config_dirty
@@ -1756,6 +1759,7 @@ class MainWindow(QMainWindow):
         self.apply_button.setEnabled(can_apply)
 
         self.start_compress_button.setEnabled(can_start_compression)
+        self.start_compress_button.setToolTip(self._compression_start_tooltip())
         self.include_risky_jobs.setVisible(bool(self._plan_classification.risky_follow_up))
         self.include_risky_jobs.setEnabled(has_compression_plan and not busy and not self._config_dirty)
         can_retry = bool(self._retry_sources) and not busy and not self._config_dirty
@@ -2007,6 +2011,15 @@ class MainWindow(QMainWindow):
             f"Savings:  {self._format_bytes(savings)} expected",
             f"Plan:     {prep.recommended_count} recommended  |  {prep.maybe_count} maybe  |  {prep.skip_count} skipped",
         ]
+        if not prep.jobs:
+            lines.append(
+                "No encode jobs were auto-selected from this analysis. Recommended rows are analysis results only until "
+                "a runnable profile and job set are chosen."
+            )
+        elif not runnable_sources:
+            lines.append(
+                "The current plan has no runnable jobs in this view. Include risky follow-up jobs or rebuild the plan."
+            )
         lines.append(
             f"Run split: {len(self._plan_classification.safe_selected)} safe now  |  "
             f"{len(self._plan_classification.risky_follow_up)} risky follow-up  |  "
@@ -2110,7 +2123,20 @@ class MainWindow(QMainWindow):
         self._open_path(path)
 
     def _open_diagnostics_folder(self) -> None:
-        self._open_path(str(self._diagnostics_directory_path()))
+        target = self._diagnostics_directory_path()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            fallback = get_config_dir()
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                message = f"Unable to open diagnostics folder: {exc}"
+                self._append_status(message)
+                QMessageBox.warning(self, "mediaflow", message)
+                return
+            target = fallback
+        self._open_path(str(target))
 
     def _copy_diagnostics_path(self) -> None:
         target = str(self._last_diagnostics_path or self._diagnostics_directory_path())
@@ -3197,8 +3223,9 @@ class MainWindow(QMainWindow):
             self._flush_runtime_diagnostics()
             return
         if not preparation.jobs:
-            self._set_current_action("Compression plan contains no selected jobs")
-            self._append_status("Compression plan contains no selected jobs.")
+            detail = self._compression_zero_jobs_message(preparation)
+            self._set_current_action(detail)
+            self._append_status(detail)
             self._set_state(WorkflowState.READY_TO_COMPRESS)
             self._diagnostics.record_event(
                 "compression_prepared",
@@ -3238,6 +3265,19 @@ class MainWindow(QMainWindow):
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
         self._flush_runtime_diagnostics()
+
+    def _compression_zero_jobs_message(self, preparation: EncodePreparation) -> str:
+        if preparation.profile is None:
+            return (
+                "Compression analysis finished, but no encoder profile could be auto-selected. "
+                "Review the plan details or rebuild the plan with different settings."
+            )
+        if preparation.recommended_count or preparation.maybe_count:
+            return (
+                "Compression analysis finished, but no runnable jobs were selected. "
+                "Recommended rows are available for review, but the current plan cannot start yet."
+            )
+        return "Compression plan contains no selected jobs."
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
         self.compression_table.setRowCount(0)
@@ -3401,6 +3441,22 @@ class MainWindow(QMainWindow):
     def _runnable_jobs(self, preparation: EncodePreparation) -> list:
         runnable_sources = self._runnable_sources()
         return [job for job in preparation.jobs if getattr(job, "source", None) in runnable_sources]
+
+    def _compression_start_tooltip(self) -> str:
+        prep = self.encode_preparation
+        if prep is None:
+            return "Prepare a compression plan first."
+        if self._active_worker_count > 0:
+            return "Wait for the current background task to finish."
+        if self._config_dirty:
+            return "Settings changed after planning. Rebuild the compression plan first."
+        if self.workflow_state != WorkflowState.READY_TO_COMPRESS:
+            return "Finish preparing the compression plan before starting encoding."
+        if not prep.jobs:
+            return self._compression_zero_jobs_message(prep)
+        if not self._runnable_jobs(prep):
+            return "No runnable jobs are selected in the current view. Include risky follow-up jobs or rebuild the plan."
+        return "Start the current compression plan."
 
     def _build_runnable_preparation(self, preparation: EncodePreparation) -> EncodePreparation:
         jobs = self._runnable_jobs(preparation)

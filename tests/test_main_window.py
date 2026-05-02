@@ -45,6 +45,7 @@ def test_initial_window_state_guides_user_through_setup() -> None:
     assert "guided pipeline" in window.setup_hint_label.text().lower()
     assert "compression root" in window.setup_summary_label.text().lower()
     assert "Diagnostics:" in window.diagnostics_path_label.text()
+    assert window.font().pointSizeF() > 0
 
 
 def test_library_path_updates_compression_root_while_linked() -> None:
@@ -656,6 +657,20 @@ def test_diagnostics_write_failure_becomes_visible_warning(monkeypatch) -> None:
     assert any("Unable to write diagnostics" in warning for warning in window._custom_warnings)
 
 
+def test_open_diagnostics_folder_creates_target_before_opening(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    target = tmp_path / "missing" / "runs" / "run.json"
+    opened: list[str] = []
+    monkeypatch.setattr(window, "_last_diagnostics_path", target)
+    monkeypatch.setattr(window, "_open_path", opened.append)
+
+    window._open_diagnostics_folder()
+
+    assert target.parent.exists() is True
+    assert opened == [str(target.parent)]
+
+
 def test_encode_dashboard_toggle_hides_live_view() -> None:
     _app()
     window = MainWindow()
@@ -704,6 +719,48 @@ def test_traceback_errors_are_summarised_for_users() -> None:
 
     assert "unexpected keyword argument" in summary
     assert details == traceback_text
+
+
+def test_zero_job_compression_plan_explains_disabled_start(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.start_compress_button.isEnabled() is False
+    assert "cannot start yet" in window.current_action_label.text().lower()
+    assert "no encode jobs were auto-selected" in window.compress_summary_label.text().lower()
+    assert "no runnable jobs were selected" in window.start_compress_button.toolTip().lower()
 
 
 def test_missing_file_error_is_translated_for_users() -> None:
