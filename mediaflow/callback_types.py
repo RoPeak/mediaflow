@@ -38,3 +38,12 @@ class ApplyProgress:
     total: int = 0
     last_applied_source: str | None = None
     message: str | None = None
+    operation: str | None = None
+    source_size_bytes: int | None = None
+    bytes_copied: int | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    report_path: str | None = None
+    conflict_action: str | None = None
+    error: str | None = None
+    cancel_requested: bool = False

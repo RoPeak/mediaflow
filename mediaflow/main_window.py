@@ -78,6 +78,7 @@ from .plexify_adapter import (
     scan_controller,
 )
 from .progress import (
+    ApplyProgressModel,
     EncodeProgressModel,
     PreparationProgressModel,
     preparation_stage_title,
@@ -122,6 +123,7 @@ class MainWindow(QMainWindow):
         self._diagnostics = DiagnosticsRecorder()
         self._encode_progress_model = EncodeProgressModel()
         self._preparation_model = PreparationProgressModel()
+        self._apply_progress_model = ApplyProgressModel()
 
         self._compression_start: float = 0.0
         self._preparation_start: float = 0.0
@@ -143,7 +145,9 @@ class MainWindow(QMainWindow):
         self._apply_started_at: float | None = None
         self._apply_last_update_at: float | None = None
         self._apply_progress: ApplyProgress | None = None
+        self._apply_cancel_requested: bool = False
         self._last_apply_log_key: tuple[str, int, int, str] | None = None
+        self._last_diagnostics_flush_at: float = 0.0
         self._activity_spinner_idx: int = 0
 
         self._build_widgets(default_source=default_source, default_library=default_library)
@@ -180,6 +184,8 @@ class MainWindow(QMainWindow):
         self.active_diagnostics_label = QLabel()
         self.active_diagnostics_label.setWordWrap(True)
         self.active_diagnostics_label.setObjectName("muted-label")
+        self.active_open_diagnostics_button = QPushButton("Open diagnostics folder")
+        self.active_copy_diagnostics_button = QPushButton("Copy diagnostics path")
 
         self.tabs = QTabWidget()
 
@@ -277,6 +283,22 @@ class MainWindow(QMainWindow):
         self.review_blocked_label.setWordWrap(True)
         self.review_blocked_label.setObjectName("muted-label")
         self.review_stack = QStackedWidget()
+        self.apply_dashboard_label = QLabel("Organisation apply has not started.")
+        self.apply_dashboard_label.setWordWrap(True)
+        self.apply_counts_label = QLabel("")
+        self.apply_counts_label.setWordWrap(True)
+        self.apply_current_label = QLabel("")
+        self.apply_current_label.setWordWrap(True)
+        self.apply_destination_label = QLabel("")
+        self.apply_destination_label.setWordWrap(True)
+        self.apply_elapsed_label = QLabel("")
+        self.apply_elapsed_label.setWordWrap(True)
+        self.apply_progress_bar = QProgressBar()
+        self.apply_progress_bar.setRange(0, 100)
+        self.apply_log = QPlainTextEdit()
+        self.apply_log.setReadOnly(True)
+        self.apply_log.document().setMaximumBlockCount(300)
+        self.cancel_apply_button = QPushButton("Cancel after current file")
         self.review_table = QTableWidget(0, 7)
         self.review_table.setHorizontalHeaderLabels(
             ["Source", "Type", "Title", "Season/Episode", "Selected", "Status", "Warning"]
@@ -512,7 +534,11 @@ class MainWindow(QMainWindow):
         banner_activity_row.addWidget(self.activity_indicator_label)
         banner_activity_row.addWidget(self.activity_label, stretch=1)
         banner_layout.addLayout(banner_activity_row)
-        banner_layout.addWidget(self.active_diagnostics_label)
+        diagnostics_row = QHBoxLayout()
+        diagnostics_row.addWidget(self.active_diagnostics_label, stretch=1)
+        diagnostics_row.addWidget(self.active_open_diagnostics_button)
+        diagnostics_row.addWidget(self.active_copy_diagnostics_button)
+        banner_layout.addLayout(diagnostics_row)
         layout.addWidget(banner)
 
         self.tabs.addTab(self._build_setup_tab(), "Setup")
@@ -837,7 +863,28 @@ class MainWindow(QMainWindow):
 
         self.review_stack.addWidget(placeholder)
         self.review_stack.addWidget(content)
+        self.review_stack.addWidget(self._build_apply_dashboard())
         layout.addWidget(self.review_stack, stretch=1)
+        return panel
+
+    def _build_apply_dashboard(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        dashboard = QGroupBox("Organisation Apply")
+        dashboard_layout = QVBoxLayout(dashboard)
+        dashboard_layout.addWidget(self.apply_dashboard_label)
+        dashboard_layout.addWidget(self.apply_counts_label)
+        dashboard_layout.addWidget(self.apply_current_label)
+        dashboard_layout.addWidget(self.apply_destination_label)
+        dashboard_layout.addWidget(self.apply_elapsed_label)
+        dashboard_layout.addWidget(self.apply_progress_bar)
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        action_row.addWidget(self.cancel_apply_button)
+        dashboard_layout.addLayout(action_row)
+        layout.addWidget(dashboard)
+        layout.addWidget(self.apply_log, stretch=1)
         return panel
 
     def _build_compress_tab(self) -> QWidget:
@@ -1060,8 +1107,11 @@ class MainWindow(QMainWindow):
         self.open_output_button.clicked.connect(self._open_output_folder)
         self.open_diagnostics_button.clicked.connect(self._open_diagnostics_folder)
         self.copy_diagnostics_button.clicked.connect(self._copy_diagnostics_path)
+        self.active_open_diagnostics_button.clicked.connect(self._open_diagnostics_folder)
+        self.active_copy_diagnostics_button.clicked.connect(self._copy_diagnostics_path)
         self.save_summary_button.clicked.connect(self._save_run_summary)
         self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
+        self.cancel_apply_button.clicked.connect(self._request_apply_cancel)
         self.summary_filter_combo.currentTextChanged.connect(lambda *_: self._apply_summary_filter())
 
         self._review_shortcuts = [
@@ -1219,14 +1269,18 @@ class MainWindow(QMainWindow):
     def _sync_summary_for_diagnostics(self) -> None:
         self._refresh_pipeline_summary()
 
-    def _flush_runtime_diagnostics(self, *, failure_message: str | None = None) -> None:
+    def _flush_runtime_diagnostics(self, *, failure_message: str | None = None, progress_only: bool = False) -> None:
         if self._syncing_diagnostics:
+            return
+        now = time.monotonic()
+        if progress_only and now - self._last_diagnostics_flush_at < 5:
             return
         self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         self._syncing_diagnostics = True
         try:
             self._sync_summary_for_diagnostics()
             self._flush_diagnostics(failure_message=failure_message)
+            self._last_diagnostics_flush_at = now
         finally:
             self._syncing_diagnostics = False
 
@@ -1346,6 +1400,9 @@ class MainWindow(QMainWindow):
             "copying": "Copying",
             "moving": "Moving",
             "completed-item": "Completed",
+            "skipped-item": "Skipped",
+            "error-item": "Error",
+            "cancelled": "Cancelled",
             "finalizing-report": "Finalizing report",
             "done": "Done",
         }
@@ -1424,6 +1481,15 @@ class MainWindow(QMainWindow):
             return clean, None
         return match.group("title").strip(), int(match.group("year"))
 
+    @staticmethod
+    def _optional_year_from_text(text: str) -> int | None:
+        clean = text.strip()
+        if not clean:
+            return None
+        if re.fullmatch(r"\d{4}", clean):
+            return int(clean)
+        return -1
+
     def _diagnostics_directory_path(self) -> Path:
         if self._last_diagnostics_path is not None:
             return self._last_diagnostics_path.parent
@@ -1451,6 +1517,8 @@ class MainWindow(QMainWindow):
         message = f"Scanning source with plexify ({self._format_elapsed(elapsed)} • {discovered}{current_file})"
         if elapsed >= 10 and self._scan_discovered_count == 0:
             message += ". Still working. Plexify has not returned first candidates yet."
+        elif self._scan_last_update_at is not None and time.monotonic() - self._scan_last_update_at >= 10:
+            message += f". No scan update for {self._format_elapsed(time.monotonic() - self._scan_last_update_at)}."
         self._set_current_action(message)
 
     def _tick_apply(self) -> None:
@@ -1464,14 +1532,23 @@ class MainWindow(QMainWindow):
             if elapsed >= 10:
                 message += ". Still working. Opening reports or starting the first copy can take time."
             self._set_current_action(message)
+            self._apply_progress_model.update_stall(elapsed_seconds=elapsed, stalled_seconds=elapsed)
+            self._refresh_apply_dashboard(stalled_seconds=elapsed)
             return
         stalled = bool(
             self._apply_last_update_at is not None
             and time.monotonic() - self._apply_last_update_at >= 10
         )
+        stalled_seconds = (
+            time.monotonic() - self._apply_last_update_at
+            if self._apply_last_update_at is not None
+            else 0.0
+        )
+        self._apply_progress_model.update_stall(elapsed_seconds=elapsed, stalled_seconds=stalled_seconds)
         self._set_current_action(
             self._format_apply_status_text(progress, elapsed=elapsed, stalled=stalled)
         )
+        self._refresh_apply_dashboard(stalled_seconds=stalled_seconds)
 
     @staticmethod
     def _normalize_heartbeat_state(text: str) -> str:
@@ -1633,7 +1710,10 @@ class MainWindow(QMainWindow):
     ) -> str:
         phase = self._phase_label(payload.phase)
         current_index, total = self._apply_progress_position(payload)
-        counts = f"item {current_index} of {total}" if total else "starting"
+        if total:
+            counts = f"current item {current_index} of {total} • completed {payload.completed} of {total}"
+        else:
+            counts = "starting"
         current_name = self._summarize_path(payload.current_source or payload.last_applied_source)
         first_line = f"{phase} organisation ({counts}"
         if elapsed is not None:
@@ -1645,15 +1725,82 @@ class MainWindow(QMainWindow):
             lines.append(f"Current file: {payload.current_source}")
         if payload.current_destination:
             lines.append(f"Destination: {payload.current_destination}")
+        if payload.source_size_bytes:
+            lines.append(f"Current file size: {self._format_bytes(payload.source_size_bytes)}")
+        if payload.report_path:
+            lines.append(f"Report: {payload.report_path}")
+        if payload.conflict_action:
+            lines.append(f"Conflict handling: {payload.conflict_action}")
+        if payload.error:
+            lines.append(f"Error: {payload.error}")
         if payload.message:
             lines.append(payload.message)
         if stalled:
-            lines.append("Still working on the last reported file.")
+            lines.append("No new apply update yet. Still working on the last reported file; large copies can spend a long time here.")
+        if payload.cancel_requested or self._apply_cancel_requested:
+            lines.append("Cancel requested. Mediaflow will stop before the next file operation.")
         return "\n".join(lines)
 
     def _complete_action(self, text: str) -> None:
         self._last_completed_action = text
         self.last_completed_label.setText(text)
+
+    def _request_apply_cancel(self) -> None:
+        if self.workflow_state != WorkflowState.APPLYING:
+            return
+        self._apply_cancel_requested = True
+        self.cancel_apply_button.setEnabled(False)
+        self._append_status("Cancel requested. Organisation will stop after the current file operation.")
+        self._diagnostics.record_event("organisation_apply_cancel_requested")
+        if self._apply_progress is not None:
+            self._apply_progress_model.cancel_requested = True
+            self._refresh_apply_dashboard(stalled_seconds=0.0)
+
+    def _apply_cancel_requested_callback(self) -> bool:
+        return self._apply_cancel_requested
+
+    def _refresh_apply_dashboard(self, *, stalled_seconds: float = 0.0) -> None:
+        model = self._apply_progress_model
+        current_name = self._summarize_path(model.current_source)
+        destination = model.current_destination or "(waiting for destination)"
+        if model.total_items:
+            pct = int(100 * min(model.completed_items, model.total_items) / model.total_items)
+            count_text = (
+                f"Current item: {model.current_item_index} of {model.total_items}  |  "
+                f"Completed: {model.completed_items} of {model.total_items}"
+            )
+        else:
+            pct = 0
+            count_text = "Current item: starting  |  Completed: 0"
+        size_text = (
+            f"Current file size: {self._format_bytes(model.current_file_bytes)}"
+            if model.current_file_bytes
+            else "Current file size: unknown"
+        )
+        stalled_text = ""
+        if stalled_seconds >= 10:
+            stalled_text = (
+                f"\nNo new apply update for {self._format_elapsed(stalled_seconds)}. "
+                "Still working on the last reported file."
+            )
+        cancel_text = "\nCancel requested; mediaflow will stop before the next file." if model.cancel_requested else ""
+        self.apply_dashboard_label.setText(
+            f"{self._phase_label(model.phase)} organisation\n"
+            f"{size_text}{stalled_text}{cancel_text}"
+        )
+        self.apply_counts_label.setText(count_text)
+        self.apply_current_label.setText(f"Current file: {model.current_source or current_name}")
+        self.apply_destination_label.setText(f"Destination: {destination}")
+        report = f"  |  Report: {model.report_path}" if model.report_path else ""
+        self.apply_elapsed_label.setText(
+            f"Elapsed: {self._format_elapsed(model.elapsed_seconds)}{report}"
+        )
+        self.apply_progress_bar.setValue(pct)
+        self.cancel_apply_button.setEnabled(
+            self.workflow_state == WorkflowState.APPLYING and not self._apply_cancel_requested
+        )
+        if model.event_log:
+            self.apply_log.setPlainText("\n".join(model.event_log))
 
     def _reset_runtime_state(self, status_message: str | None = None) -> None:
         self.controller = None
@@ -1679,6 +1826,8 @@ class MainWindow(QMainWindow):
         self.details_log.clear()
         self.preview_log.clear()
         self.prepare_log.clear()
+        self.apply_log.clear()
+        self.apply_progress_bar.setValue(0)
         self.summary_log.clear()
         self.compress_status_log.clear()
         self.prepare_progress.setRange(0, 100)
@@ -1697,6 +1846,8 @@ class MainWindow(QMainWindow):
         self._apply_started_at = None
         self._apply_last_update_at = None
         self._apply_progress = None
+        self._apply_progress_model.reset()
+        self._apply_cancel_requested = False
         self._last_apply_log_key = None
         self._encode_progress_model.reset()
         self._preparation_model = PreparationProgressModel()
@@ -1804,7 +1955,31 @@ class MainWindow(QMainWindow):
             return True
         if getattr(prep, "compatible_count", 0) <= 0:
             return True
+        if self._compression_has_blocking_risk():
+            return True
         return not bool(self._runnable_jobs(prep))
+
+    def _compression_has_blocking_risk(self) -> bool:
+        blocking_tokens = (
+            "hardware encoder startup",
+            "output/header",
+            "output header",
+            "container/header",
+            "container compatibility",
+        )
+        runnable_sources = self._runnable_sources() if self.encode_preparation is not None else set()
+        for row in self._compression_plan_rows:
+            if row.source not in runnable_sources or not row.exists:
+                continue
+            haystack = " ".join([row.issue, row.reason, row.plain_reason, row.risk_reason]).lower()
+            if any(token in haystack for token in blocking_tokens):
+                return True
+        prep = self.encode_preparation
+        if prep is not None:
+            grouped = getattr(prep, "grouped_incompatibilities", {}) or {}
+            if any(any(token in str(key).lower() for token in blocking_tokens) for key in grouped):
+                return True
+        return False
 
     def _followup_sources(self) -> set[Path]:
         sources = set(self._retry_sources)
@@ -1870,6 +2045,7 @@ class MainWindow(QMainWindow):
         can_start_compression = bool(
             has_compression_plan
             and self._runnable_jobs(self.encode_preparation)
+            and not self._compression_plan_is_blocked()
             and self.workflow_state == WorkflowState.READY_TO_COMPRESS
             and not busy
             and not self._config_dirty
@@ -1949,6 +2125,8 @@ class MainWindow(QMainWindow):
         diagnostics_visible = self._last_diagnostics_path is not None or self._last_diagnostics_error is not None
         self.open_diagnostics_button.setVisible(diagnostics_visible)
         self.copy_diagnostics_button.setVisible(diagnostics_visible)
+        self.active_open_diagnostics_button.setVisible(True)
+        self.active_copy_diagnostics_button.setVisible(True)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
 
         show_encode_dashboard = has_compression_plan and self.compress_stack.currentIndex() == 2
@@ -1958,7 +2136,10 @@ class MainWindow(QMainWindow):
         else:
             self.encode_card.setVisible(False)
 
-        self.review_stack.setCurrentIndex(1 if has_controller else 0)
+        if self.workflow_state == WorkflowState.APPLYING:
+            self.review_stack.setCurrentIndex(2)
+        else:
+            self.review_stack.setCurrentIndex(1 if has_controller else 0)
         if self.workflow_state == WorkflowState.PREPARING_COMPRESSION:
             self.compress_stack.setCurrentIndex(1)
         elif self.encode_preparation is None:
@@ -2077,6 +2258,8 @@ class MainWindow(QMainWindow):
             return "Compression plan is stale because setup changed. Prepare the plan again."
         if not self.encode_preparation.jobs:
             return "No compressible files are currently selected in the compression plan."
+        if self._compression_plan_is_blocked():
+            return "Compression needs attention before it can start. Rebuild with safer compatibility-first settings or prepare follow-up."
         if self.workflow_state == WorkflowState.COMPRESSING:
             return "Compression is in progress. Avoid moving files in the compression root until the run finishes."
         if self.overwrite.isChecked():
@@ -2199,6 +2382,10 @@ class MainWindow(QMainWindow):
             lines.append(
                 "The current profile is predicted to work for 0 file(s). Rebuild with a safer compatibility-first profile before starting."
             )
+        elif self._compression_has_blocking_risk():
+            lines.append(
+                "Start blocked: hardware or container compatibility risk was detected. Rebuild with a safer compatibility-first profile before encoding."
+            )
         elif not runnable_sources:
             lines.append(
                 "The current plan has no runnable jobs in this view. Include risky follow-up jobs or rebuild the plan."
@@ -2246,6 +2433,8 @@ class MainWindow(QMainWindow):
             lines.append(
                 "Retry mode: compatibility-first review plan for failed or risky files."
             )
+        if self._compression_has_blocking_risk():
+            lines.append("Suggested follow-up for output/header failures: review an MKV sidecar retry plan where available.")
         self.compress_summary_label.setText("\n".join(lines))
 
     def _append_status(self, text: str) -> None:
@@ -2495,6 +2684,20 @@ class MainWindow(QMainWindow):
             lines.append(
                 "Copy mode is enabled. Organisation may take time on large files, and compression will only begin after every copy finishes."
             )
+            try:
+                exts = {ext.strip().lower() for ext in config.plexify.extensions.split(",") if ext.strip()}
+                source_sizes = [
+                    path.stat().st_size
+                    for path in config.source.rglob("*")
+                    if path.is_file() and path.suffix.lower() in exts
+                ]
+            except OSError:
+                source_sizes = []
+            if source_sizes:
+                lines.append(
+                    f"Visible source media: {len(source_sizes)} file(s), "
+                    f"{self._format_bytes(sum(source_sizes))} total, largest {self._format_bytes(max(source_sizes))}."
+                )
         return "\n".join(lines)
 
     def _flush_diagnostics(self, *, failure_message: str | None = None) -> None:
@@ -2505,6 +2708,8 @@ class MainWindow(QMainWindow):
             "warnings": list(self._custom_warnings),
             "summary_headline": self.summary_headline_label.text().strip(),
             "summary_overview": self.summary_overview_label.text().strip(),
+            "last_known_activity": self._strip_rich(self._current_action),
+            "active_diagnostics": self._diagnostics_status_text(),
         }
         failure = {"message": failure_message} if failure_message else None
         try:
@@ -2720,6 +2925,16 @@ class MainWindow(QMainWindow):
         self._scan_last_path = str(payload.get("path", "") or "")
         self._scan_last_update_at = time.monotonic()
         self.review_placeholder_label.setText(self._review_placeholder_text())
+        current_file = Path(self._scan_last_path).name if self._scan_last_path else "waiting for plexify results"
+        self._set_current_action(
+            f"Scanning source with plexify: {self._scan_discovered_count} discovered • {current_file}"
+        )
+        self._diagnostics.record_event(
+            "scan_progress",
+            discovered=self._scan_discovered_count,
+            path=self._scan_last_path,
+        )
+        self._flush_runtime_diagnostics(progress_only=True)
 
     def _populate_review_table(self) -> None:
         self.review_table.setRowCount(0)
@@ -2766,6 +2981,7 @@ class MainWindow(QMainWindow):
             self.search_input.setPlaceholderText("Search query or manual title")
             self._update_ui()
             return
+        self.search_input.clear()
         self._populate_candidate_table(index)
         self._populate_detail_view(index)
         self._update_ui()
@@ -2897,10 +3113,8 @@ class MainWindow(QMainWindow):
 
         typed_title, typed_year = self._parse_title_with_year(self.search_input.text())
         title_input = QLineEdit(typed_title or item.item.title)
-        year_input = QSpinBox()
-        year_input.setRange(0, 9999)
-        year_input.setSpecialValueText("(optional)")
-        year_input.setValue(int(item.item.year or typed_year or 0))
+        year_input = QLineEdit(str(item.item.year or typed_year or ""))
+        year_input.setPlaceholderText("optional")
 
         form.addRow("Movie title", title_input)
         form.addRow("Year", year_input)
@@ -2917,7 +3131,11 @@ class MainWindow(QMainWindow):
         if not title:
             self._show_error("Enter a movie title first.")
             return None
-        return {"title": title, "year": year_input.value() or None}
+        year = self._optional_year_from_text(year_input.text())
+        if year == -1:
+            self._show_error("Enter a four-digit year or leave it blank.")
+            return None
+        return {"title": title, "year": year}
 
     def _prompt_manual_tv_selection(self, item) -> dict[str, object] | None:
         dialog = QDialog(self)
@@ -2935,10 +3153,8 @@ class MainWindow(QMainWindow):
                 suggested_query = None
         typed_title, typed_year = self._parse_title_with_year(self.search_input.text())
         title_input = QLineEdit(typed_title or suggested_query or item.item.title)
-        year_input = QSpinBox()
-        year_input.setRange(0, 9999)
-        year_input.setSpecialValueText("(optional)")
-        year_input.setValue(int(typed_year or item.item.year or 0))
+        year_input = QLineEdit(str(typed_year or item.item.year or ""))
+        year_input.setPlaceholderText("optional")
         season_input = QSpinBox()
         season_input.setRange(0, 999)
         season_input.setSpecialValueText("(optional)")
@@ -2967,9 +3183,13 @@ class MainWindow(QMainWindow):
         if not title:
             self._show_error("Enter a show title first.")
             return None
+        year = self._optional_year_from_text(year_input.text())
+        if year == -1:
+            self._show_error("Enter a four-digit year or leave it blank.")
+            return None
         return {
             "title": title,
-            "year": year_input.value() or None,
+            "year": year,
             "season": season_input.value() or None,
             "episode": episode_input.value() or None,
             "episode_title": episode_title_input.text().strip() or None,
@@ -3108,6 +3328,7 @@ class MainWindow(QMainWindow):
             self._diagnostics.record_event("manual_match", item=index + 1, **payload)
             year_text = f" ({payload['year']})" if payload.get("year") else ""
             self._append_status(f"Manually selected '{payload['title']}{year_text}' for item {index + 1}.")
+        self.search_input.clear()
         self._refresh_review()
 
     def _apply_choice_to_folder(self) -> None:
@@ -3186,6 +3407,70 @@ class MainWindow(QMainWindow):
             self._complete_action("Built organisation preview")
         self._checkpoint_review_diagnostics()
 
+    def _organisation_preflight_lines(self) -> list[str]:
+        if self.preview_state is None:
+            return ["No organisation preview is ready."]
+        plans = list(self.preview_state.plans)
+        operation = "copy" if self.copy_mode.isChecked() else "move"
+        sizes: list[tuple[Path, int]] = []
+        for plan in plans:
+            try:
+                sizes.append((plan.source, plan.source.stat().st_size))
+            except OSError:
+                sizes.append((plan.source, 0))
+        total_bytes = sum(size for _path, size in sizes)
+        largest_path, largest_size = max(sizes, key=lambda item: item[1], default=(Path(), 0))
+        lines = [
+            f"Planned operations: {len(plans)} {operation}(s)",
+            f"Total source size: {self._format_bytes(total_bytes)}",
+            f"Largest file: {largest_path.name if largest_size else '(unknown)'}"
+            + (f" ({self._format_bytes(largest_size)})" if largest_size else ""),
+            f"Conflict policy: {self.conflict_mode.currentText()}",
+        ]
+        if self.copy_mode.isChecked():
+            lines.append(f"Estimated destination space required: {self._format_bytes(total_bytes)}")
+        lines.append("")
+        lines.append("Plan:")
+        for index, plan in enumerate(plans[:12], start=1):
+            try:
+                size = plan.source.stat().st_size
+            except OSError:
+                size = 0
+            destination_state = "exists" if plan.destination.exists() else "new"
+            lines.append(
+                f"{index}. {plan.source.name} -> {plan.destination.name} "
+                f"({self._format_bytes(size)}, {destination_state})"
+            )
+        return lines
+
+    def _organisation_preflight_error(self) -> str | None:
+        if self.preview_state is None or not self.copy_mode.isChecked():
+            return None
+        import shutil
+        plans = list(self.preview_state.plans)
+        if not plans:
+            return None
+        required = 0
+        for plan in plans:
+            try:
+                required += plan.source.stat().st_size
+            except OSError:
+                continue
+        try:
+            root = Path(self.library_input.text().strip())
+            usage_root = root if root.exists() else next((parent for parent in root.parents if parent.exists()), root)
+            usage = shutil.disk_usage(usage_root)
+        except OSError as exc:
+            return f"Organisation output folder is not writable: {exc}"
+        headroom = 512 * 1024 * 1024
+        if usage.free < required + headroom:
+            return (
+                "The organisation output folder may not have enough free space for copy mode. "
+                f"Available: {self._format_bytes(usage.free)}. "
+                f"Required plus headroom: {self._format_bytes(required + headroom)}."
+            )
+        return None
+
     def _apply_plan(self) -> None:
         if self.controller is None:
             self._show_error("No organise review is loaded.")
@@ -3198,7 +3483,15 @@ class MainWindow(QMainWindow):
         if self.preview_state is None or not self.preview_state.can_apply:
             self._show_error("Resolve or skip all unresolved items before applying organisation.")
             return
-        if QMessageBox.question(self, "mediaflow", "Apply the current organisation plan to disk?") != QMessageBox.Yes:
+        preflight_lines = self._organisation_preflight_lines()
+        preflight_error = self._organisation_preflight_error()
+        if preflight_error:
+            self._show_error(preflight_error)
+            return
+        confirm_text = "Apply the current organisation plan to disk?\n\n" + "\n".join(preflight_lines[:18])
+        if len(preflight_lines) > 18:
+            confirm_text += f"\n... {len(preflight_lines) - 18} more planned operation(s)"
+        if QMessageBox.question(self, "mediaflow", confirm_text) != QMessageBox.Yes:
             return
         self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
@@ -3215,10 +3508,23 @@ class MainWindow(QMainWindow):
             total=self.preview_state.planned_count if self.preview_state is not None else 0,
             message="Opening organise report and starting file operations.",
         )
+        self._apply_progress_model.reset()
+        self._apply_cancel_requested = False
+        self.apply_log.clear()
+        for line in preflight_lines:
+            self.apply_log.appendPlainText(line)
+            self._apply_progress_model.event_log.append(line)
+        self._apply_progress_model.update_from_progress(self._apply_progress, now=0.0)
         self._last_apply_log_key = None
+        self._refresh_apply_dashboard()
         self._apply_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(apply_preview_controller, self.controller, self.preview_state)
+        worker = FunctionWorker(
+            apply_preview_controller,
+            self.controller,
+            self.preview_state,
+            cancel_callback=self._apply_cancel_requested_callback,
+        )
         self._start_worker(worker, self._apply_complete, self._apply_progress_update)
 
     def _apply_complete(self, result: ApplyResultState) -> None:
@@ -3260,10 +3566,19 @@ class MainWindow(QMainWindow):
     def _apply_progress_update(self, payload: object) -> None:
         if not isinstance(payload, ApplyProgress):
             return
+        if self._apply_cancel_requested and not payload.cancel_requested:
+            payload = replace(payload, cancel_requested=True)
         self._apply_progress = payload
         self._apply_last_update_at = time.monotonic()
+        elapsed = (
+            self._apply_last_update_at - self._apply_started_at
+            if self._apply_started_at is not None
+            else 0.0
+        )
+        self._apply_progress_model.update_from_progress(payload, now=elapsed)
         status_line = self._format_apply_status_text(payload)
         self._set_current_action(status_line)
+        self._refresh_apply_dashboard()
         log_key = (
             payload.phase,
             payload.completed,
@@ -3282,8 +3597,15 @@ class MainWindow(QMainWindow):
             current_destination=payload.current_destination,
             last_applied_source=payload.last_applied_source,
             message=payload.message,
+            operation=payload.operation,
+            source_size_bytes=payload.source_size_bytes,
+            report_path=payload.report_path,
+            conflict_action=payload.conflict_action,
+            error=payload.error,
+            cancel_requested=payload.cancel_requested,
         )
         self._append_status(status_line.replace("\n", " • "))
+        self._flush_runtime_diagnostics(progress_only=True)
 
     def _guided_compression_can_continue(self) -> bool:
         compression_root = Path(self.compression_root_input.text().strip())
@@ -3467,6 +3789,10 @@ class MainWindow(QMainWindow):
         if getattr(preparation, "compatible_count", 0) <= 0:
             blocked_detail = (
                 "Compression plan needs attention. The selected profile is not safe for this batch."
+            )
+        elif self._compression_has_blocking_risk():
+            blocked_detail = (
+                "Compression plan needs attention. Hardware or container compatibility risk blocks the default run."
             )
         elif not self._runnable_jobs(preparation):
             blocked_detail = self._compression_zero_jobs_message(preparation)
@@ -3757,6 +4083,8 @@ class MainWindow(QMainWindow):
             return "No encoder profile is selected for this plan. Rebuild with safer settings first."
         if getattr(prep, "compatible_count", 0) <= 0:
             return "The selected profile is predicted to work for 0 files. Rebuild with a safer compatibility-first profile."
+        if self._compression_has_blocking_risk():
+            return "This plan has hardware or container compatibility risk. Rebuild with a safer compatibility-first profile before starting."
         if not prep.jobs:
             return self._compression_zero_jobs_message(prep)
         if not self._runnable_jobs(prep):
@@ -3886,6 +4214,9 @@ class MainWindow(QMainWindow):
             return
         if self._config_dirty:
             self._show_error("Settings changed after the compression plan was prepared. Prepare the plan again.")
+            return
+        if self._compression_plan_is_blocked():
+            self._show_error(self._compression_start_tooltip())
             return
         runnable_preparation = self._build_runnable_preparation(self.encode_preparation)
         if not runnable_preparation.jobs:
@@ -4025,7 +4356,14 @@ class MainWindow(QMainWindow):
         self._switch_tab("summary")
         self._set_state(WorkflowState.COMPLETED)
         self._flush_runtime_diagnostics()
-        self._notify_completion("Compression complete", f"Encoded {len(self.encode_results)} file(s).")
+        rows = build_encode_result_rows(self.encode_results)
+        encoded = sum(1 for row in rows if row.is_encoded)
+        skipped = sum(1 for row in rows if row.is_skipped)
+        failed = sum(1 for row in rows if row.is_failed)
+        self._notify_completion(
+            "Compression complete",
+            f"Encoded {encoded} file(s), skipped {skipped}, failed {failed}.",
+        )
 
     def _notify_completion(self, title: str, message: str) -> None:
         if self.isActiveWindow() or not QSystemTrayIcon.isSystemTrayAvailable():

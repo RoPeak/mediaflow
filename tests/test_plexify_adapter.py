@@ -60,12 +60,14 @@ class _LegacyController:
 class _ProgressController:
     def __init__(self) -> None:
         self.progress_callback = None
+        self.cancel_callback = None
 
     def scan(self, *, progress_callback=None) -> None:
         self.progress_callback = progress_callback
 
-    def apply_preview(self, preview, *, progress_callback=None):
+    def apply_preview(self, preview, *, progress_callback=None, cancel_callback=None):
         self.progress_callback = progress_callback
+        self.cancel_callback = cancel_callback
         return preview
 
 
@@ -123,6 +125,12 @@ def test_apply_preview_controller_converts_apply_progress_payload() -> None:
             "total": 3,
             "current_source": "/tmp/source.mp4",
             "current_destination": "/tmp/dest.mp4",
+            "source_size_bytes": 100,
+            "bytes_copied": 50,
+            "operation": "copying",
+            "report_path": "/tmp/report.json",
+            "conflict_action": "overwrite",
+            "cancel_requested": True,
             "message": "Copying source.mp4",
         }
     )
@@ -130,3 +138,19 @@ def test_apply_preview_controller_converts_apply_progress_payload() -> None:
     assert captured[0].phase == "copying"
     assert captured[0].completed == 1
     assert captured[0].current_source == "/tmp/source.mp4"
+    assert captured[0].source_size_bytes == 100
+    assert captured[0].bytes_copied == 50
+    assert captured[0].operation == "copying"
+    assert captured[0].report_path == "/tmp/report.json"
+    assert captured[0].conflict_action == "overwrite"
+    assert captured[0].cancel_requested is True
+
+
+def test_apply_preview_controller_passes_cancel_callback_when_supported() -> None:
+    adapter = _load_adapter_with_stubbed_plexify()
+    controller = _ProgressController()
+    cancel = lambda: False
+
+    adapter.apply_preview_controller(controller, object(), progress_callback=lambda _payload: None, cancel_callback=cancel)
+
+    assert controller.cancel_callback is cancel

@@ -226,6 +226,7 @@ def _stabilize_preparation(
         current_profile is not None
         and getattr(current_profile, "compatible_count", 0) > 0
         and preparation.jobs
+        and not _profile_has_blocking_risk(current_profile)
     )
     if current_usable:
         return preparation
@@ -324,7 +325,12 @@ def _stabilize_preparation(
 
 
 def _choose_safe_profile(profiles: list[object]) -> object | None:
-    compatible = [profile for profile in profiles if int(getattr(profile, "compatible_count", 0) or 0) > 0]
+    compatible = [
+        profile
+        for profile in profiles
+        if int(getattr(profile, "compatible_count", 0) or 0) > 0
+        and not _profile_has_blocking_risk(profile)
+    ]
     if not compatible:
         return None
 
@@ -339,6 +345,15 @@ def _choose_safe_profile(profiles: list[object]) -> object | None:
         )
 
     return min(compatible, key=_rank)
+
+
+def _profile_has_blocking_risk(profile: object) -> bool:
+    grouped = getattr(profile, "grouped_incompatibilities", {}) or {}
+    return any(
+        token in str(reason).lower()
+        for reason in grouped
+        for token in ("hardware encoder startup", "output header failure", "container/header")
+    )
 
 
 def _convert_preparation_payload(payload: object) -> object:

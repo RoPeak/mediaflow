@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from mediaflow.progress import EncodeProgressModel, PreparationProgressModel
+from types import SimpleNamespace
+
+from mediaflow.progress import ApplyProgressModel, EncodeProgressModel, PreparationProgressModel
 
 
 def test_encode_progress_model_keeps_file_progress_monotonic_within_file() -> None:
@@ -130,3 +132,25 @@ def test_encode_progress_model_produces_eta_once_history_is_stable() -> None:
 
     assert model.eta_seconds is not None
     assert model.eta_confident is True
+
+
+def test_apply_progress_model_tracks_current_and_completed_counts() -> None:
+    model = ApplyProgressModel()
+
+    model.update_from_progress(
+        SimpleNamespace(
+            phase="copying",
+            completed=0,
+            total=7,
+            current_source="/tmp/source.mp4",
+            current_destination="/tmp/dest.mp4",
+            source_size_bytes=100,
+            message="Copying source.mp4",
+        ),
+        now=12.0,
+    )
+
+    assert model.current_item_index == 1
+    assert model.completed_items == 0
+    assert model.total_items == 7
+    assert model.current_file_bytes == 100

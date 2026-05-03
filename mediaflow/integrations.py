@@ -286,11 +286,13 @@ def translate_result_reason(reason: str) -> str:
         return ""
     lowered = reason.lower()
     if "nothing was written into output file" in lowered:
-        return "Output container/profile combination produced no valid file; retry with compatibility-first settings."
+        return "Output container/profile combination produced no valid file; retry with compatibility-first settings and consider MKV sidecar output."
     if "output header failure" in lowered:
-        return "Output/container compatibility blocked encoding; retry with compatibility-first settings."
+        return "Output/container compatibility blocked encoding; retry with compatibility-first settings and consider MKV sidecar output."
     if "container" in lowered and "incompat" in lowered:
-        return "Container compatibility blocked encoding; retry with compatibility-first settings."
+        return "Container compatibility blocked encoding; retry with compatibility-first settings and consider MKV sidecar output."
+    if "hardware encoder startup failure" in lowered:
+        return "Skipped by compatibility checks: hardware encoder failed to start; rebuild with a software compatibility-first profile."
     if lowered.startswith("incompatible:") or "compatibility check failed" in lowered:
         return "Skipped by compatibility checks; retry with compatibility-first settings."
     if "works for 0 file" in lowered or "0 compatible" in lowered:
@@ -323,9 +325,11 @@ def _result_is_retry_ready(*, skipped: bool, success: bool, raw_reason: str) -> 
 def group_failure_rows(rows: Iterable[EncodeResultRow]) -> list[FailureSummaryGroup]:
     grouped: dict[tuple[str, str], list[str]] = {}
     for row in rows:
-        if not row.is_failed:
+        if not row.is_failed and not row.retry_ready:
             continue
         guidance = "Prepare a compatibility-first retry plan for the affected files."
+        if "output/container" in row.reason.lower() or "container" in row.raw_reason.lower():
+            guidance = "Prepare a compatibility-first retry plan; for output/header failures, consider MKV sidecar output."
         key = (row.reason, guidance)
         grouped.setdefault(key, [])
         if row.raw_reason:
@@ -375,6 +379,8 @@ def _problem_issue_text(reason: str) -> str:
     lowered = reason.lower()
     if "output header" in lowered:
         return "Container/header compatibility risk"
+    if "hardware encoder startup" in lowered:
+        return "Hardware encoder startup risk"
     if "container" in lowered:
         return "Container compatibility risk"
     if "copied stream" in lowered:
@@ -394,5 +400,6 @@ def _looks_retryable_problem(reason: str) -> bool:
             "copied stream",
             "incompatib",
             "follow-up",
+            "hardware encoder startup",
         )
     )

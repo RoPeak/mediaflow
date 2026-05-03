@@ -47,16 +47,19 @@ def apply_preview_controller(
     preview: PreviewState,
     *,
     progress_callback: Callable[[object], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ):
     if _supports_apply_progress_callback(controller):
-        return controller.apply_preview(
-            preview,
-            progress_callback=(
+        kwargs = {
+            "progress_callback": (
                 (lambda payload: progress_callback(_convert_apply_progress(payload)))
                 if progress_callback is not None
                 else None
-            ),
-        )
+            )
+        }
+        if _supports_apply_cancel_callback(controller):
+            kwargs["cancel_callback"] = cancel_callback
+        return controller.apply_preview(preview, **kwargs)
     return controller.apply_preview(preview)
 
 
@@ -76,6 +79,14 @@ def _supports_apply_progress_callback(controller: VideoUIController) -> bool:
     return "progress_callback" in signature.parameters
 
 
+def _supports_apply_cancel_callback(controller: VideoUIController) -> bool:
+    try:
+        signature = inspect.signature(controller.apply_preview)
+    except (TypeError, ValueError):
+        return False
+    return "cancel_callback" in signature.parameters
+
+
 def _convert_apply_progress(payload: object) -> object:
     if not isinstance(payload, dict):
         return payload
@@ -87,6 +98,15 @@ def _convert_apply_progress(payload: object) -> object:
         total=int(payload.get("total", 0) or 0),
         last_applied_source=_path_text(payload.get("last_applied_source")),
         message=str(payload.get("message") or "").strip() or None,
+        operation=str(payload.get("operation") or "").strip() or None,
+        source_size_bytes=_optional_int(payload.get("source_size_bytes")),
+        bytes_copied=_optional_int(payload.get("bytes_copied")),
+        started_at=str(payload.get("started_at") or "").strip() or None,
+        completed_at=str(payload.get("completed_at") or "").strip() or None,
+        report_path=_path_text(payload.get("report_path")),
+        conflict_action=str(payload.get("conflict_action") or "").strip() or None,
+        error=str(payload.get("error") or "").strip() or None,
+        cancel_requested=bool(payload.get("cancel_requested", False)),
     )
 
 
@@ -97,3 +117,12 @@ def _path_text(value: object) -> str | None:
         return str(value)
     text = str(value).strip()
     return text or None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

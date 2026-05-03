@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 PREPARATION_STAGE_SPECS: tuple[tuple[str, str, float, float], ...] = (
@@ -100,6 +101,84 @@ class PreparationProgressModel:
             if candidate == stage_key:
                 return start + (end - start) * clipped
         return clipped
+
+
+@dataclass
+class ApplyProgressModel:
+    phase: str = "starting"
+    current_source: str = ""
+    current_destination: str = ""
+    current_item_index: int = 0
+    completed_items: int = 0
+    total_items: int = 0
+    current_file_bytes: int = 0
+    total_bytes: int = 0
+    bytes_copied: int = 0
+    elapsed_seconds: float = 0.0
+    stalled_seconds: float = 0.0
+    report_path: str = ""
+    cancel_requested: bool = False
+    event_log: deque[str] = field(default_factory=lambda: deque(maxlen=200))
+
+    def reset(self) -> None:
+        self.phase = "starting"
+        self.current_source = ""
+        self.current_destination = ""
+        self.current_item_index = 0
+        self.completed_items = 0
+        self.total_items = 0
+        self.current_file_bytes = 0
+        self.total_bytes = 0
+        self.bytes_copied = 0
+        self.elapsed_seconds = 0.0
+        self.stalled_seconds = 0.0
+        self.report_path = ""
+        self.cancel_requested = False
+        self.event_log.clear()
+
+    def update_from_progress(self, payload: object, *, now: float) -> None:
+        phase = str(getattr(payload, "phase", "") or "working")
+        completed = max(0, int(getattr(payload, "completed", 0) or 0))
+        total = max(0, int(getattr(payload, "total", 0) or 0))
+        current_source = str(getattr(payload, "current_source", "") or "")
+        current_destination = str(getattr(payload, "current_destination", "") or "")
+        current_size = int(getattr(payload, "source_size_bytes", 0) or 0)
+        bytes_copied = int(getattr(payload, "bytes_copied", 0) or 0)
+        report_path = str(getattr(payload, "report_path", "") or "")
+
+        self.phase = phase
+        self.completed_items = min(completed, total) if total else completed
+        self.total_items = max(self.total_items, total)
+        self.current_source = current_source or self.current_source
+        self.current_destination = current_destination or self.current_destination
+        self.current_file_bytes = current_size or self.current_file_bytes
+        self.bytes_copied = max(self.bytes_copied, bytes_copied)
+        self.report_path = report_path or self.report_path
+        self.cancel_requested = self.cancel_requested or bool(getattr(payload, "cancel_requested", False))
+        self.current_item_index = self._current_index(phase, self.completed_items, self.total_items)
+        self.elapsed_seconds = max(0.0, now)
+
+        message = str(getattr(payload, "message", "") or "").strip()
+        if not message:
+            label = Path(self.current_source).name if self.current_source else "file operation"
+            message = f"{phase.replace('-', ' ').title()}: {label}"
+        if not self.event_log or self.event_log[-1] != message:
+            self.event_log.append(message)
+
+    def update_stall(self, *, elapsed_seconds: float, stalled_seconds: float) -> None:
+        self.elapsed_seconds = max(0.0, elapsed_seconds)
+        self.stalled_seconds = max(0.0, stalled_seconds)
+
+    @staticmethod
+    def _current_index(phase: str, completed: int, total: int) -> int:
+        if total <= 0:
+            return 0
+        normalized = phase.replace("_", "-").strip().lower()
+        if normalized in {"done", "finalizing-report"}:
+            return total
+        if normalized == "completed-item":
+            return min(total, max(1, completed))
+        return min(total, completed + 1)
 
 
 @dataclass

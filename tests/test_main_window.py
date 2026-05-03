@@ -637,10 +637,12 @@ def test_apply_progress_updates_current_action_and_log() -> None:
         )
     )
 
-    assert "Copying organisation (item 1 of 3)" in window.current_action_label.text()
+    assert "Copying organisation (current item 1 of 3" in window.current_action_label.text()
+    assert "completed 0 of 3" in window.current_action_label.text()
     assert "Destination: /tmp/dest.mp4" in window.current_action_label.text()
     assert "source.mp4" in window.current_action_label.text()
     assert window._diagnostics.events[-1]["kind"] == "organisation_apply_progress"
+    assert "Current item: 1 of 3" in window.apply_counts_label.text()
 
 
 def test_apply_heartbeat_mentions_still_working_on_current_file(monkeypatch) -> None:
@@ -661,7 +663,8 @@ def test_apply_heartbeat_mentions_still_working_on_current_file(monkeypatch) -> 
     monkeypatch.setattr("mediaflow.main_window.time.monotonic", lambda: 30.0)
     window._tick_apply()
 
-    assert "Still working on the last reported file." in window.current_action_label.text()
+    assert "Still working on the last reported file" in window.current_action_label.text()
+    assert "No new apply update" in window.current_action_label.text()
 
 
 def test_diagnostics_write_failure_becomes_visible_warning(monkeypatch) -> None:
@@ -830,6 +833,51 @@ def test_zero_compatible_plan_enters_attention_state_and_offers_safer_rebuild(tm
     assert window.rebuild_safer_button.isVisible() is True
     assert window.rebuild_safer_button.isEnabled() is True
     assert "predicted to work for 0 files" in window.start_compress_button.toolTip().lower()
+
+
+def test_risky_compression_plan_blocks_start_until_safer_rebuild(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mp4"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="hardware encoder startup failure",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="GPU", encoder_key="amf", crf=22),
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        compatible_count=1,
+        incompatible_count=1,
+        grouped_incompatibilities={"hardware encoder startup failure": 1},
+        recommendation_reason="Hardware profile has startup risk.",
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.start_compress_button.isEnabled() is False
+    assert "compatibility risk" in window.start_compress_button.toolTip().lower()
+    assert "start blocked" in window.compress_summary_label.text().lower()
 
 
 def test_completed_summary_marks_all_skipped_compression_as_degraded(tmp_path: Path) -> None:
