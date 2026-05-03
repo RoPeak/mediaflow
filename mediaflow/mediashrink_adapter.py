@@ -43,7 +43,28 @@ def prepare_compression(
             else None
         ),
     )
-    return _recover_zero_job_preparation(preparation, config)
+    return _stabilize_preparation(preparation, config)
+
+
+def prepare_safer_compression(
+    config: PipelineConfig,
+    progress_callback: Callable[[object], None] | None = None,
+) -> EncodePreparation:
+    safer_config = replace(
+        config,
+        shrink=replace(
+            config.shrink,
+            policy="highest-confidence",
+            on_file_failure="skip",
+            no_skip=True,
+        ),
+    )
+    preparation = prepare_compression(safer_config, progress_callback=progress_callback)
+    extra_messages = list(preparation.stage_messages or [])
+    extra_messages.append(
+        "Safer rebuild uses compatibility-first defaults to prefer the most reliable runnable profile."
+    )
+    return replace(preparation, stage_messages=extra_messages)
 
 
 def missing_job_sources(preparation: EncodePreparation) -> list:
@@ -187,17 +208,26 @@ def _filter_preparation_to_sources(
     )
 
 
-def _recover_zero_job_preparation(
+def _stabilize_preparation(
     preparation: EncodePreparation,
     config: PipelineConfig,
 ) -> EncodePreparation:
-    if preparation.jobs or not preparation.items:
+    if not preparation.items:
         return preparation
 
     selected_items = [item for item in preparation.items if item.recommendation == "recommended"]
     if not selected_items:
         selected_items = [item for item in preparation.items if item.recommendation == "maybe"]
     if not selected_items:
+        return preparation
+
+    current_profile = preparation.profile
+    current_usable = bool(
+        current_profile is not None
+        and getattr(current_profile, "compatible_count", 0) > 0
+        and preparation.jobs
+    )
+    if current_usable:
         return preparation
 
     planning = prepare_profile_planning(
@@ -209,14 +239,12 @@ def _recover_zero_job_preparation(
         console=None,
     )
     profiles = list(planning.profiles) if planning is not None else []
-    profile = next((candidate for candidate in profiles if candidate.is_recommended), None)
-    if profile is None and profiles:
-        profile = profiles[0]
+    profile = _choose_safe_profile(profiles)
+    messages = list(preparation.stage_messages or [])
     if profile is None:
-        messages = list(preparation.stage_messages or [])
         messages.append(
-            "Compression analysis completed, but no encoder profile could be auto-selected. "
-            "Review the plan details or rebuild the plan with different settings."
+            "Compression analysis completed, but no safe runnable profile could be selected automatically. "
+            "Review the plan details or rebuild the plan with safer settings."
         )
         return replace(preparation, stage_messages=messages)
 
@@ -230,11 +258,28 @@ def _recover_zero_job_preparation(
         ffprobe=preparation.ffprobe,
         no_skip=config.shrink.no_skip,
     )
-    messages = list(preparation.stage_messages or [])
-    if preparation.profile is None:
+    if not jobs:
         messages.append(
-            "No encoder profile was auto-selected, so mediaflow chose the first available profile "
+            f"Profile {profile.name} was selected as the safest available fallback, but no runnable jobs were produced."
+        )
+        return replace(
+            preparation,
+            profile=profile,
+            compatible_count=profile.compatible_count,
+            incompatible_count=profile.incompatible_count,
+            grouped_incompatibilities=profile.grouped_incompatibilities,
+            recommendation_reason=preparation.recommendation_reason or profile.why_choose,
+            stage_messages=messages,
+        )
+    if current_profile is None:
+        messages.append(
+            "No encoder profile was auto-selected, so mediaflow chose the safest runnable fallback "
             f"({profile.name}) to keep the recommended plan runnable."
+        )
+    elif getattr(current_profile, "compatible_count", 0) <= 0:
+        messages.append(
+            f"Selected profile {current_profile.name} was predicted to work for 0 file(s), so mediaflow switched "
+            f"to the safer runnable fallback {profile.name}."
         )
     selected_input_bytes = sum(int(getattr(item, "size_bytes", 0) or 0) for item in selected_items)
     selected_estimated_output_bytes = sum(
@@ -255,7 +300,7 @@ def _recover_zero_job_preparation(
         preparation,
         profile=profile,
         jobs=jobs,
-        selected_count=len(selected_items),
+        selected_count=len(jobs),
         selected_input_bytes=selected_input_bytes,
         selected_estimated_output_bytes=selected_estimated_output_bytes,
         estimated_total_seconds=estimated_total_seconds,
@@ -278,6 +323,24 @@ def _recover_zero_job_preparation(
     )
 
 
+def _choose_safe_profile(profiles: list[object]) -> object | None:
+    compatible = [profile for profile in profiles if int(getattr(profile, "compatible_count", 0) or 0) > 0]
+    if not compatible:
+        return None
+
+    def _rank(profile: object) -> tuple[int, int, int, int]:
+        encoder_key = str(getattr(profile, "encoder_key", "") or "").lower()
+        software_bias = 0 if encoder_key in {"fast", "faster"} else 1
+        return (
+            -int(getattr(profile, "compatible_count", 0) or 0),
+            int(getattr(profile, "incompatible_count", 0) or 0),
+            software_bias,
+            int(getattr(profile, "crf", 0) or 0),
+        )
+
+    return min(compatible, key=_rank)
+
+
 def _convert_preparation_payload(payload: object) -> object:
     if isinstance(payload, tuple) and len(payload) == 3:
         return PreparationProgress(*payload)
@@ -297,6 +360,7 @@ __all__ = [
     "EncodeProgress",
     "missing_job_sources",
     "prepare_compression",
+    "prepare_safer_compression",
     "prepare_retry_compression",
     "prepare_tools",
     "run_compression",

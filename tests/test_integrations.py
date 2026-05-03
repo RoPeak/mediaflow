@@ -103,6 +103,26 @@ def test_build_encode_result_rows_translates_container_failures() -> None:
     assert rows[0].raw_reason.startswith("[out#0/mp4]")
 
 
+def test_build_encode_result_rows_marks_skipped_compatibility_results_retry_ready() -> None:
+    source = Path("/tmp/movie.mp4")
+    rows = build_encode_result_rows(
+        [
+            SimpleNamespace(
+                job=SimpleNamespace(source=source),
+                skipped=True,
+                success=False,
+                input_size_bytes=100,
+                output_size_bytes=0,
+                skip_reason="incompatible: hardware encoder startup failure",
+            )
+        ]
+    )
+
+    assert rows[0].is_skipped is True
+    assert rows[0].retry_ready is True
+    assert "compatibility checks" in rows[0].reason.lower()
+
+
 def test_group_failure_rows_groups_shared_reasons() -> None:
     rows = [
         SimpleNamespace(is_failed=True, reason="Container compatibility blocked encoding", raw_reason="raw one"),

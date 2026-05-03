@@ -106,13 +106,16 @@ def build_compression_plan_rows(preparation: object | None) -> list[CompressionP
         selected = source in selected_sources
         issue = ""
         reason = _safe_text(getattr(item, "reason_text", None))
+        recommendation = _safe_text(getattr(item, "recommendation", None))
         if selected and not exists:
             issue = "Missing from compression root"
-        elif getattr(item, "recommendation", "") == "skip":
+        elif recommendation == "skip":
+            issue = _problem_issue_text(reason)
+        elif selected and _looks_retryable_problem(reason):
             issue = _problem_issue_text(reason)
         classification = classify_plan_item(
             codec=_safe_text(getattr(item, "codec", None)),
-            recommendation=_safe_text(getattr(item, "recommendation", None)),
+            recommendation=recommendation,
             reason=reason,
             selected=selected,
             exists=exists,
@@ -125,7 +128,7 @@ def build_compression_plan_rows(preparation: object | None) -> list[CompressionP
                 source=source,
                 display_name=display_name_for_ui(source.name),
                 codec=_safe_text(getattr(item, "codec", None)),
-                recommendation=_safe_text(getattr(item, "recommendation", None)),
+                recommendation=recommendation,
                 reason=reason,
                 plain_reason=translate_plan_reason(reason),
                 estimated_output_bytes=int(getattr(item, "estimated_output_bytes", 0) or 0),
@@ -164,6 +167,7 @@ def build_encode_result_rows(results: Iterable[object] | None) -> list[EncodeRes
             status = "Failed"
             raw_reason = _safe_text(getattr(result, "error_message", None)) or "Encoding failed"
             reason = translate_result_reason(raw_reason)
+        retry_ready = _result_is_retry_ready(skipped=skipped, success=success, raw_reason=raw_reason)
         rows.append(
             EncodeResultRow(
                 source=source,
@@ -177,7 +181,7 @@ def build_encode_result_rows(results: Iterable[object] | None) -> list[EncodeRes
                 is_encoded=success,
                 is_failed=not skipped and not success,
                 is_skipped=skipped,
-                retry_ready=(not skipped and not success),
+                retry_ready=retry_ready,
             )
         )
     return rows
@@ -287,9 +291,33 @@ def translate_result_reason(reason: str) -> str:
         return "Output/container compatibility blocked encoding; retry with compatibility-first settings."
     if "container" in lowered and "incompat" in lowered:
         return "Container compatibility blocked encoding; retry with compatibility-first settings."
+    if lowered.startswith("incompatible:") or "compatibility check failed" in lowered:
+        return "Skipped by compatibility checks; retry with compatibility-first settings."
+    if "works for 0 file" in lowered or "0 compatible" in lowered:
+        return "Selected profile was not safe for this batch; rebuild with a safer compatibility-first profile."
     if "missing" in lowered:
         return "Planned source file was missing when compression ran."
     return reason
+
+
+def _result_is_retry_ready(*, skipped: bool, success: bool, raw_reason: str) -> bool:
+    if success:
+        return False
+    if not skipped:
+        return True
+    lowered = raw_reason.lower()
+    return any(
+        token in lowered
+        for token in (
+            "incompatible:",
+            "compatibility",
+            "output header",
+            "nothing was written",
+            "0 compatible",
+            "works for 0 file",
+            "follow-up",
+        )
+    )
 
 
 def group_failure_rows(rows: Iterable[EncodeResultRow]) -> list[FailureSummaryGroup]:

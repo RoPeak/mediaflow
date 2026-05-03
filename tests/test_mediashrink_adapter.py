@@ -13,6 +13,7 @@ from mediaflow.mediashrink_adapter import (
     missing_job_sources,
     prepare_compression,
     prepare_retry_compression,
+    prepare_safer_compression,
     run_compression,
 )
 from mediaflow.config import PipelineConfig, ShrinkSettings
@@ -147,7 +148,7 @@ def test_prepare_retry_compression_filters_to_requested_sources(tmp_path: Path) 
     assert retry.stage_messages is not None
 
 
-def test_prepare_compression_recovers_jobless_plan_with_first_available_profile(tmp_path: Path) -> None:
+def test_prepare_compression_falls_back_to_safest_runnable_profile(tmp_path: Path) -> None:
     source = tmp_path / "movie.mkv"
     source.write_bytes(b"x")
     item = SimpleNamespace(
@@ -182,15 +183,25 @@ def test_prepare_compression_recovers_jobless_plan_with_first_available_profile(
     planning = SimpleNamespace(
         profiles=[
             SimpleNamespace(
-                name="Fallback",
-                encoder_key="fast",
+                name="Fastest hardware",
+                encoder_key="amf",
                 crf=20,
+                is_recommended=False,
+                compatible_count=0,
+                incompatible_count=1,
+                grouped_incompatibilities={"hardware encoder startup failure": 1},
+                why_choose="Fastest profile on this device.",
+            ),
+            SimpleNamespace(
+                name="Safer software",
+                encoder_key="fast",
+                crf=22,
                 is_recommended=False,
                 compatible_count=1,
                 incompatible_count=0,
                 grouped_incompatibilities={},
                 why_choose="Best available fallback profile.",
-            )
+            ),
         ],
         benchmark_speeds={"fast": 1.0},
         active_calibration=None,
@@ -213,9 +224,93 @@ def test_prepare_compression_recovers_jobless_plan_with_first_available_profile(
         recovered = prepare_compression(config)
 
     assert recovered.profile is not None
-    assert recovered.profile.name == "Fallback"
+    assert recovered.profile.name == "Safer software"
     assert recovered.jobs == fake_jobs
     assert recovered.selected_input_bytes == 100
     assert recovered.selected_estimated_output_bytes == 50
     assert recovered.stage_messages is not None
-    assert any("first available profile" in line for line in recovered.stage_messages)
+    assert any("safest runnable fallback" in line for line in recovered.stage_messages)
+
+
+def test_prepare_compression_reports_when_no_safe_profile_exists(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    item = SimpleNamespace(
+        source=source,
+        codec="h264",
+        size_bytes=100,
+        estimated_output_bytes=50,
+        estimated_savings_bytes=50,
+        recommendation="recommended",
+        reason_text="Strong projected savings",
+    )
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[item],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="AMF", encoder_key="amf", crf=20, compatible_count=0, incompatible_count=1),
+        jobs=[],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        stage_messages=[],
+        compatible_count=0,
+        incompatible_count=1,
+        grouped_incompatibilities={"hardware encoder startup failure": 1},
+        recommendation_reason="Likely works for 0 files.",
+    )
+    planning = SimpleNamespace(
+        profiles=[
+            SimpleNamespace(
+                name="Still bad",
+                encoder_key="amf",
+                crf=20,
+                compatible_count=0,
+                incompatible_count=1,
+                grouped_incompatibilities={"hardware encoder startup failure": 1},
+                why_choose="Not safe",
+            )
+        ],
+        benchmark_speeds={},
+        active_calibration=None,
+    )
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", return_value=prep), patch(
+        "mediaflow.mediashrink_adapter.prepare_profile_planning", return_value=planning
+    ):
+        recovered = prepare_compression(config)
+
+    assert recovered.jobs == []
+    assert recovered.stage_messages is not None
+    assert any("no safe runnable profile" in line.lower() for line in recovered.stage_messages)
+
+
+def test_prepare_safer_compression_adds_compatibility_first_note(tmp_path: Path) -> None:
+    prep = _preparation(tmp_path, [])
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_compression", return_value=prep):
+        safer = prepare_safer_compression(config)
+
+    assert safer.stage_messages is not None
+    assert any("compatibility-first defaults" in line for line in safer.stage_messages)

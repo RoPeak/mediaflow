@@ -631,15 +631,37 @@ def test_apply_progress_updates_current_action_and_log() -> None:
             phase="copying",
             current_source="/tmp/source.mp4",
             current_destination="/tmp/dest.mp4",
-            completed=1,
+            completed=0,
             total=3,
             message="Copying source.mp4",
         )
     )
 
-    assert "Copying: 1 of 3" in window.current_action_label.text()
+    assert "Copying organisation (item 1 of 3)" in window.current_action_label.text()
+    assert "Destination: /tmp/dest.mp4" in window.current_action_label.text()
     assert "source.mp4" in window.current_action_label.text()
     assert window._diagnostics.events[-1]["kind"] == "organisation_apply_progress"
+
+
+def test_apply_heartbeat_mentions_still_working_on_current_file(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    window._apply_started_at = 10.0
+    window._apply_last_update_at = 15.0
+    window._set_state(WorkflowState.APPLYING)
+    window._apply_progress = ApplyProgress(
+        phase="copying",
+        current_source="/tmp/source.mp4",
+        current_destination="/tmp/dest.mp4",
+        completed=0,
+        total=2,
+        message="Copying source.mp4",
+    )
+
+    monkeypatch.setattr("mediaflow.main_window.time.monotonic", lambda: 30.0)
+    window._tick_apply()
+
+    assert "Still working on the last reported file." in window.current_action_label.text()
 
 
 def test_diagnostics_write_failure_becomes_visible_warning(monkeypatch) -> None:
@@ -761,6 +783,79 @@ def test_zero_job_compression_plan_explains_disabled_start(tmp_path: Path) -> No
     assert "cannot start yet" in window.current_action_label.text().lower()
     assert "no encode jobs were auto-selected" in window.compress_summary_label.text().lower()
     assert "no runnable jobs were selected" in window.start_compress_button.toolTip().lower()
+
+
+def test_zero_compatible_plan_enters_attention_state_and_offers_safer_rebuild(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fastest", encoder_key="amf", crf=20),
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        compatible_count=0,
+        incompatible_count=1,
+        grouped_incompatibilities={"hardware encoder startup failure": 1},
+        recommendation_reason="Likely works for 0 file(s); try a safer fallback.",
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.summary_headline_label.text() == "Compression plan needs attention"
+    assert "not safe for this batch" in window.current_action_label.text().lower()
+    assert window.rebuild_safer_button.isVisible() is True
+    assert window.rebuild_safer_button.isEnabled() is True
+    assert "predicted to work for 0 files" in window.start_compress_button.toolTip().lower()
+
+
+def test_completed_summary_marks_all_skipped_compression_as_degraded(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    window.compress_enabled.setChecked(True)
+    window.encode_results = [
+        SimpleNamespace(
+            job=SimpleNamespace(source=source),
+            skipped=True,
+            success=False,
+            skip_reason="incompatible: hardware encoder startup failure",
+            input_size_bytes=100,
+            output_size_bytes=0,
+            error_message=None,
+        )
+    ]
+    window._retry_sources = {source}
+    window._set_state(WorkflowState.COMPLETED)
+    window._refresh_pipeline_summary()
+
+    assert "follow-up needed" in window.summary_headline_label.text().lower()
+    assert "compression produced no successful encodes" in window.summary_log.toPlainText().lower()
+    assert "compatibility checks" in window.summary_log.toPlainText().lower()
 
 
 def test_missing_file_error_is_translated_for_users() -> None:
