@@ -4,9 +4,11 @@ from collections import Counter
 from dataclasses import is_dataclass, replace
 from datetime import datetime
 import importlib
+import json
 import re
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer
@@ -93,6 +95,11 @@ from .workers import FunctionWorker
 from .workflow import WorkflowState, describe_workflow_state
 
 
+def _refine_controller_search(controller: VideoUIController, index: int, query: str) -> tuple[int, str]:
+    controller.refine_search(index, query)
+    return index, query
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, default_source: Path | None = None, default_library: Path | None = None) -> None:
         super().__init__()
@@ -156,6 +163,7 @@ class MainWindow(QMainWindow):
         self._last_apply_heartbeat_at: float = 0.0
         self._last_diagnostics_flush_at: float = 0.0
         self._activity_spinner_idx: int = 0
+        self._searching_review_index: int | None = None
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
@@ -284,6 +292,9 @@ class MainWindow(QMainWindow):
             [
                 "All items",
                 "Blocked only",
+                "No candidates",
+                "Provider failed",
+                "Low confidence/pending",
                 "Unresolved only",
                 "Accepted/manual only",
                 "Suspicious only",
@@ -351,6 +362,7 @@ class MainWindow(QMainWindow):
         self.manual_button = QPushButton("Manual Match")
         self.next_page_button = QPushButton("More Candidates")
         self.auto_accept_button = QPushButton("Auto-Accept Safe Matches")
+        self.bypass_organise_button = QPushButton("Skip Organisation And Compress")
         self.switch_button = QPushButton("Switch TV/Movie")
         self.folder_button = QPushButton("Apply To Folder")
         self.title_group_button = QPushButton("Apply To Title Group")
@@ -531,6 +543,9 @@ class MainWindow(QMainWindow):
         self.open_diagnostics_button.setVisible(False)
         self.copy_diagnostics_button = QPushButton("Copy diagnostics path")
         self.copy_diagnostics_button.setVisible(False)
+        self.bundle_diagnostics_button = QPushButton("Create diagnostics bundle")
+        self.bundle_diagnostics_button.setVisible(False)
+        self.active_bundle_diagnostics_button = QPushButton("Create diagnostics bundle")
         self.save_summary_button = QPushButton("Save run summary...")
         self.save_summary_button.setVisible(False)
         self.diagnostics_path_label = QLabel()
@@ -560,6 +575,7 @@ class MainWindow(QMainWindow):
         diagnostics_row.addWidget(self.active_diagnostics_label, stretch=1)
         diagnostics_row.addWidget(self.active_open_diagnostics_button)
         diagnostics_row.addWidget(self.active_copy_diagnostics_button)
+        diagnostics_row.addWidget(self.active_bundle_diagnostics_button)
         banner_layout.addLayout(diagnostics_row)
         layout.addWidget(banner)
 
@@ -850,6 +866,7 @@ class MainWindow(QMainWindow):
         footer_row = QHBoxLayout()
         footer_row.addWidget(self.preview_button)
         footer_row.addWidget(self.apply_button)
+        footer_row.addWidget(self.bypass_organise_button)
         left_layout.addLayout(footer_row)
         left_layout.addWidget(self.review_blocked_label)
 
@@ -1065,6 +1082,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.open_output_button)
         btn_row.addWidget(self.open_diagnostics_button)
         btn_row.addWidget(self.copy_diagnostics_button)
+        btn_row.addWidget(self.bundle_diagnostics_button)
         btn_row.addWidget(self.save_summary_button)
         btn_row.addWidget(self.retry_summary_button)
         btn_row.addStretch(1)
@@ -1122,6 +1140,7 @@ class MainWindow(QMainWindow):
         self.manual_button.clicked.connect(self._manual_select_current_item)
         self.next_page_button.clicked.connect(self._load_next_candidate_page)
         self.auto_accept_button.clicked.connect(self._auto_accept_safe_matches)
+        self.bypass_organise_button.clicked.connect(self._bypass_blocked_organisation)
         self.switch_button.clicked.connect(self._switch_current_item)
         self.folder_button.clicked.connect(self._apply_choice_to_folder)
         self.title_group_button.clicked.connect(self._apply_choice_to_title_group)
@@ -1138,6 +1157,8 @@ class MainWindow(QMainWindow):
         self.copy_diagnostics_button.clicked.connect(self._copy_diagnostics_path)
         self.active_open_diagnostics_button.clicked.connect(self._open_diagnostics_folder)
         self.active_copy_diagnostics_button.clicked.connect(self._copy_diagnostics_path)
+        self.bundle_diagnostics_button.clicked.connect(self._create_diagnostics_bundle)
+        self.active_bundle_diagnostics_button.clicked.connect(self._create_diagnostics_bundle)
         self.save_summary_button.clicked.connect(self._save_run_summary)
         self.toggle_encode_card_button.toggled.connect(self._on_toggle_encode_card)
         self.cancel_apply_button.clicked.connect(self._request_apply_cancel)
@@ -1539,7 +1560,7 @@ class MainWindow(QMainWindow):
         return -1
 
     def _diagnostics_directory_path(self) -> Path:
-        if self._last_diagnostics_path is not None and self._last_diagnostics_path.exists():
+        if self._last_diagnostics_path is not None:
             return self._last_diagnostics_path.parent
         if self._diagnostics_base_dir is not None:
             return self._diagnostics_base_dir
@@ -2101,15 +2122,21 @@ class MainWindow(QMainWindow):
         prep = self.encode_preparation
         if prep is None:
             return False
-        if not prep.items:
+        if not getattr(prep, "items", []):
             return False
         if prep.profile is None:
             return True
-        if getattr(prep, "compatible_count", 0) <= 0:
+        if self._compatibility_counts_block(prep):
             return True
         if self._compression_has_blocking_risk():
             return True
         return not bool(self._runnable_jobs(prep))
+
+    @staticmethod
+    def _compatibility_counts_block(prep: object) -> bool:
+        compatible = getattr(prep, "compatible_count", 0) or 0
+        incompatible = getattr(prep, "incompatible_count", 0) or 0
+        return compatible <= 0 and incompatible > 0
 
     def _compression_has_blocking_risk(self) -> bool:
         blocking_tokens = (
@@ -2188,12 +2215,18 @@ class MainWindow(QMainWindow):
 
     def _update_ui(self) -> None:
         busy = self._active_worker_count > 0
+        review_search_busy = self._searching_review_index is not None
         has_controller = self.controller is not None and bool(self.controller.items)
         review_index = self._current_review_index()
         has_review_selection = has_controller and review_index is not None
         has_compression_plan = self.encode_preparation is not None
         can_preview = has_controller and not busy and not self._config_dirty
-        can_apply = bool(self.preview_state and self.preview_state.can_apply and not busy and not self._config_dirty)
+        can_apply = bool(
+            self.preview_state
+            and getattr(self.preview_state, "can_apply", False)
+            and not busy
+            and not self._config_dirty
+        )
         can_start_compression = bool(
             has_compression_plan
             and self._runnable_jobs(self.encode_preparation)
@@ -2229,7 +2262,7 @@ class MainWindow(QMainWindow):
         self.prepare_compress_button.setEnabled(self.compress_enabled.isChecked() and not busy)
         self.reset_button.setEnabled(not busy)
 
-        review_actions_enabled = has_review_selection and not busy and not self._config_dirty
+        review_actions_enabled = has_review_selection and not busy and not review_search_busy and not self._config_dirty
         self.prev_item_button.setEnabled(review_actions_enabled and review_index not in {None, 0})
         self.next_item_button.setEnabled(review_actions_enabled and review_index is not None and review_index < self.review_table.rowCount() - 1)
         self.next_blocked_button.setEnabled(
@@ -2248,6 +2281,14 @@ class MainWindow(QMainWindow):
         self.auto_accept_button.setEnabled(has_controller and not busy and not self._config_dirty)
         self.preview_button.setEnabled(can_preview)
         self.apply_button.setEnabled(can_apply)
+        self.bypass_organise_button.setVisible(
+            self._guided_mode
+            and self.compress_enabled.isChecked()
+            and self.workflow_state == WorkflowState.REVIEW_BLOCKED
+        )
+        self.bypass_organise_button.setEnabled(
+            self.bypass_organise_button.isVisible() and not busy and not review_search_busy and not self._config_dirty
+        )
 
         self.start_compress_button.setEnabled(can_start_compression)
         self.start_compress_button.setToolTip(self._compression_start_tooltip())
@@ -2277,8 +2318,10 @@ class MainWindow(QMainWindow):
         diagnostics_visible = self._last_diagnostics_path is not None or self._last_diagnostics_error is not None
         self.open_diagnostics_button.setVisible(diagnostics_visible)
         self.copy_diagnostics_button.setVisible(diagnostics_visible)
+        self.bundle_diagnostics_button.setVisible(diagnostics_visible)
         self.active_open_diagnostics_button.setVisible(True)
         self.active_copy_diagnostics_button.setVisible(True)
+        self.active_bundle_diagnostics_button.setVisible(True)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
 
         show_encode_dashboard = (
@@ -2494,10 +2537,15 @@ class MainWindow(QMainWindow):
         if blocked:
             sample = blocked[0]
             grouped = self._summarize_blocked_reasons()
+            provider_failed = sum(
+                1 for item in blocked
+                if str(getattr(item, "lookup_status", "") or "") in {"provider_unavailable", "network_error"}
+            )
             self.review_blocked_label.setText(
                 f"Why apply is blocked: {len(blocked)} item(s) still need attention. "
                 f"Next blocker: {sample.item.path.name} — {sample.preview_block_reason}"
                 + (f" | Top reasons: {grouped}" if grouped else "")
+                + (f" | Provider failed: {provider_failed}" if provider_failed else "")
             )
         else:
             self.review_blocked_label.setText("All reviewed items are preview-valid.")
@@ -2543,7 +2591,7 @@ class MainWindow(QMainWindow):
             lines.append("Next action: Rebuild Safer Plan.")
         else:
             self.rebuild_safer_button.setText("Rebuild Safer Plan")
-        if prep.jobs and getattr(prep, "compatible_count", 0) <= 0:
+        if prep.jobs and self._compatibility_counts_block(prep):
             lines.append(
                 "The current profile is predicted to work for 0 file(s). Rebuild with a safer compatibility-first profile before starting."
             )
@@ -2685,6 +2733,30 @@ class MainWindow(QMainWindow):
         target = str(self._last_diagnostics_path or self._diagnostics_directory_path())
         QApplication.clipboard().setText(target)
         self._append_status(f"Copied diagnostics path: {target}")
+
+    def _create_diagnostics_bundle(self) -> None:
+        self._flush_runtime_diagnostics()
+        diagnostics_dir = self._diagnostics_directory_path()
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        bundle_path = diagnostics_dir / f"mediaflow-diagnostics-bundle-{timestamp}.zip"
+        snapshot_path = diagnostics_dir / f"mediaflow-review-snapshot-{timestamp}.json"
+        snapshot_payload = {
+            "effective_config": self._snapshot_config_for_diagnostics(),
+            "review_snapshot": self._review_diagnostics_snapshot(),
+        }
+        snapshot_path.write_text(json.dumps(snapshot_payload, indent=2, sort_keys=True), encoding="utf-8")
+        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            if self._last_diagnostics_path is not None and self._last_diagnostics_path.exists():
+                archive.write(self._last_diagnostics_path, arcname=self._last_diagnostics_path.name)
+                log_path = self._last_diagnostics_path.with_suffix(".log")
+                if log_path.exists():
+                    archive.write(log_path, arcname=log_path.name)
+            archive.write(snapshot_path, arcname=snapshot_path.name)
+        snapshot_path.unlink(missing_ok=True)
+        QApplication.clipboard().setText(str(bundle_path))
+        self._diagnostics.record_event("diagnostics_bundle_created", path=str(bundle_path))
+        self._append_status(f"Created diagnostics bundle and copied path: {bundle_path}")
 
     @staticmethod
     def _open_path(path: str) -> None:
@@ -2871,7 +2943,7 @@ class MainWindow(QMainWindow):
             lines.append("Output folder does not exist yet and will be created during organise.")
         if config.plexify.enabled and config.plexify.copy_mode:
             lines.append(
-                "Copy mode is enabled. Organisation may take time on large files, and compression will only begin after every copy finishes."
+                "Organisation copy mode is enabled. Plexify will copy files into the library/output folder before compression starts."
             )
             if config.plexify.copy_workers > 1:
                 lines.append(
@@ -2892,7 +2964,11 @@ class MainWindow(QMainWindow):
                     f"{self._format_bytes(sum(source_sizes))} total, largest {self._format_bytes(max(source_sizes))}."
                 )
             if self._same_drive(config.source, config.library):
-                lines.append("Source and output appear to be on the same drive. Move mode is usually much faster, but removes originals.")
+                lines.append("Source and output appear to be on the same drive. Organisation move mode is usually faster, but removes the source copies.")
+        elif config.plexify.enabled:
+            lines.append("Organisation move mode is enabled. Plexify will move matched source files into the library/output folder.")
+        if config.shrink.enabled and config.shrink.overwrite:
+            lines.append("Compression overwrite is enabled. Successful encodes replace originals in the compression root after validation.")
         return "\n".join(lines)
 
     @staticmethod
@@ -2920,6 +2996,7 @@ class MainWindow(QMainWindow):
             "summary_overview": self.summary_overview_label.text().strip(),
             "last_known_activity": self._strip_rich(self._current_action),
             "active_diagnostics": self._diagnostics_status_text(),
+            "review_snapshot": self._review_diagnostics_snapshot(),
         }
         failure = {"message": failure_message} if failure_message else None
         try:
@@ -2938,6 +3015,66 @@ class MainWindow(QMainWindow):
             if self._last_diagnostics_error not in self._custom_warnings:
                 self._custom_warnings.append(self._last_diagnostics_error)
         self.active_diagnostics_label.setText(self._diagnostics_status_text())
+
+    def _review_diagnostics_snapshot(self) -> list[dict[str, object]]:
+        if self.controller is None:
+            return []
+        snapshot: list[dict[str, object]] = []
+        for index, item in enumerate(self.controller.items, start=1):
+            selected = getattr(item, "selected_candidate", None)
+            manual = getattr(item, "manual_candidate", None)
+            candidates = []
+            for candidate in list(getattr(item, "candidate_states", []) or [])[:5]:
+                candidates.append(
+                    {
+                        "title": getattr(candidate, "title", ""),
+                        "year": getattr(candidate, "year", None),
+                        "source": getattr(candidate, "source", ""),
+                        "confidence": getattr(candidate, "confidence", None),
+                    }
+                )
+            snapshot.append(
+                {
+                    "index": index,
+                    "source_path": str(item.item.path),
+                    "media_type": getattr(item.item, "media_type", ""),
+                    "inferred_title": getattr(item.item, "title", ""),
+                    "lookup_title": getattr(item, "lookup_title", None) or getattr(item.item, "title", ""),
+                    "year": getattr(item.item, "year", None),
+                    "season": getattr(item.item, "season", None),
+                    "episode": getattr(item.item, "episode", None),
+                    "search_query": getattr(item, "search_query", ""),
+                    "decision_status": getattr(item, "decision_status", ""),
+                    "status_label": getattr(item, "status_label", ""),
+                    "block_reason": getattr(item, "preview_block_reason", None),
+                    "unresolved_reason": getattr(item, "unresolved_reason", None),
+                    "warning": getattr(item, "warning", None),
+                    "provider": getattr(item, "provider", None),
+                    "lookup_status": getattr(item, "lookup_status", None),
+                    "lookup_reason": getattr(item, "lookup_reason", None),
+                    "attempted_queries": list(getattr(item, "attempted_queries", []) or []),
+                    "raw_result_count": getattr(item, "raw_result_count", None),
+                    "candidate_count": getattr(item, "candidate_count", None),
+                    "filtered_count": getattr(item, "filtered_count", None),
+                    "cache_context": getattr(item, "cache_context", ""),
+                    "auto_selectable": getattr(item, "auto_selectable", False),
+                    "selected_candidate": self._candidate_snapshot(selected),
+                    "manual_candidate": self._candidate_snapshot(manual),
+                    "top_candidates": candidates,
+                }
+            )
+        return snapshot
+
+    @staticmethod
+    def _candidate_snapshot(candidate: object | None) -> dict[str, object] | None:
+        if candidate is None:
+            return None
+        return {
+            "title": getattr(candidate, "title", ""),
+            "year": getattr(candidate, "year", None),
+            "source": getattr(candidate, "source", ""),
+            "confidence": getattr(candidate, "confidence", None),
+        }
 
     def _show_error(self, message: str) -> None:
         if self._shutting_down:
@@ -3116,8 +3253,13 @@ class MainWindow(QMainWindow):
             self._checkpoint_review_diagnostics()
             return
         if self._guided_mode:
+            auto_accept_reasons = self._auto_accept_reason_counts()
             accepted = self._auto_accept_safe_matches()
-            self._append_status(f"Auto-accepted {accepted} safe match(es).")
+            reason_text = self._format_reason_counts(auto_accept_reasons)
+            self._append_status(
+                f"Auto-accepted {accepted} safe match(es)."
+                + (f" Reasons not accepted: {reason_text}." if reason_text else "")
+            )
             self._preview_plan()
             if self.preview_state is not None and self.preview_state.can_apply:
                 self._set_state(WorkflowState.READY_TO_APPLY)
@@ -3198,6 +3340,8 @@ class MainWindow(QMainWindow):
             )
             if text
         ]
+        if str(getattr(item, "lookup_status", "") or "") in {"provider_unavailable", "network_error"}:
+            warnings.append(getattr(item, "lookup_reason", None) or "Provider lookup failed.")
         if self._is_suspicious_review_match(item):
             warnings.append("Suspicious title mismatch.")
         return " | ".join(dict.fromkeys(str(warning) for warning in warnings))
@@ -3232,6 +3376,7 @@ class MainWindow(QMainWindow):
             self.details_log.clear()
             self.candidate_table.setRowCount(0)
             self.search_input.setPlaceholderText("Search query or manual title")
+            self.manual_button.setText("Manual Match")
             self._update_ui()
             return
         self.search_input.clear()
@@ -3254,6 +3399,12 @@ class MainWindow(QMainWindow):
             show = True
             if mode == "Blocked only":
                 show = item.preview_block_reason is not None
+            elif mode == "No candidates":
+                show = getattr(item, "candidate_count", len(getattr(item, "candidates", []) or [])) == 0
+            elif mode == "Provider failed":
+                show = str(getattr(item, "lookup_status", "") or "") in {"provider_unavailable", "network_error"}
+            elif mode == "Low confidence/pending":
+                show = item.decision_status == "pending" and bool(getattr(item, "candidates", []))
             elif mode == "Unresolved only":
                 show = item.decision_status == "unresolved"
             elif mode == "Accepted/manual only":
@@ -3336,12 +3487,41 @@ class MainWindow(QMainWindow):
             f"Path: {item.item.path}",
             f"Media type: {item.item.media_type}",
             f"Title: {item.item.title}",
+            f"Lookup title: {getattr(item, 'lookup_title', None) or item.item.title}",
             f"Search query: {getattr(item, 'search_query', '')}",
             f"Status: {item.status_label}",
             f"Cache context: {getattr(item, 'cache_context', '')}",
             f"Auto-selectable: {getattr(item, 'auto_selectable', False)}",
             f"Preview-valid: {'yes' if getattr(item, 'preview_valid', False) else 'no'}",
+            f"Provider: {getattr(item, 'provider', None) or '-'}",
+            f"Lookup status: {getattr(item, 'lookup_status', '') or '-'}",
         ]
+        if getattr(item, "lookup_reason", None):
+            lines.append(f"Lookup reason: {item.lookup_reason}")
+        attempted = list(getattr(item, "attempted_queries", []) or [])
+        if attempted:
+            lines.append("Attempted queries: " + " | ".join(str(query) for query in attempted))
+        raw_count = getattr(item, "raw_result_count", None)
+        candidate_count = getattr(item, "candidate_count", None)
+        filtered_count = getattr(item, "filtered_count", None)
+        if raw_count is not None or candidate_count is not None or filtered_count is not None:
+            lines.append(
+                "Lookup counts: "
+                f"raw={raw_count if raw_count is not None else '-'}, "
+                f"candidates={candidate_count if candidate_count is not None else len(getattr(item, 'candidates', []) or [])}, "
+                f"filtered={filtered_count if filtered_count is not None else '-'}"
+            )
+        timings = [
+            f"search={getattr(item, 'search_time', 0):.2f}s" if getattr(item, "search_time", None) is not None else "",
+            f"fetch={getattr(item, 'fetch_time', 0):.2f}s" if getattr(item, "fetch_time", None) is not None else "",
+            f"total={getattr(item, 'total_time', 0):.2f}s" if getattr(item, "total_time", None) is not None else "",
+        ]
+        timings = [text for text in timings if text]
+        if timings:
+            lines.append("Lookup timings: " + ", ".join(timings))
+        if getattr(item, "candidate_states", None):
+            top = item.candidate_states[0]
+            lines.append(f"Top candidate: {top.title} ({top.year or 'Unknown'}) [{top.confidence:.2f}]")
         if item.warning:
             lines.append(f"Warning: {item.warning}")
         if item.preview_block_reason:
@@ -3355,6 +3535,13 @@ class MainWindow(QMainWindow):
         if suggested_query and suggested_query.casefold() != item.item.title.casefold():
             placeholder = f"Suggested search: {suggested_query}"
         self.search_input.setPlaceholderText(placeholder)
+        lookup_status = str(getattr(item, "lookup_status", "") or "")
+        no_candidates = getattr(item, "candidate_count", len(getattr(item, "candidates", []) or [])) == 0
+        self.manual_button.setText(
+            "Manual Match Recommended"
+            if lookup_status in {"provider_unavailable", "network_error"} or no_candidates
+            else "Manual Match"
+        )
 
     def _selected_candidate_index(self) -> int:
         indexes = self.candidate_table.selectionModel().selectedRows() if self.candidate_table.selectionModel() else []
@@ -3529,6 +3716,27 @@ class MainWindow(QMainWindow):
         self._refresh_review()
         return accepted
 
+    def _auto_accept_reason_counts(self) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        if self.controller is None:
+            return counts
+        for item in self.controller.items:
+            if item.resolved:
+                counts["already resolved"] += 1
+            elif not item.candidates:
+                status = str(getattr(item, "lookup_status", "") or "")
+                if status in {"provider_unavailable", "network_error"}:
+                    counts["provider failed"] += 1
+                else:
+                    counts["no candidates"] += 1
+            elif not item.auto_selectable:
+                counts["below confidence or ambiguous"] += 1
+        return counts
+
+    @staticmethod
+    def _format_reason_counts(counts: Counter[str]) -> str:
+        return ", ".join(f"{reason}: {count}" for reason, count in counts.items() if count)
+
     def _search_current_item(self) -> None:
         if self.controller is None:
             return
@@ -3542,9 +3750,63 @@ class MainWindow(QMainWindow):
         if not query:
             self._append_status("Enter a search query first.")
             return
-        self.controller.refine_search(index, query)
-        self._append_status(f"Ran a fresh search for item {index + 1}.")
+        self._searching_review_index = index
+        self._set_current_action(f"Searching item {index + 1} for '{query}'")
+        self._append_status(f"Searching item {index + 1}: {query}")
+        self._diagnostics.record_event("review_search_started", item=index + 1, query=query)
+        worker = FunctionWorker(_refine_controller_search, self.controller, index, query)
+        worker.signals.result.connect(self._search_complete)
+        worker.signals.error.connect(self._search_failed)
+        worker.signals.finished.connect(lambda w=worker: self._release_worker_ref(w))
+        worker.signals.finished.connect(self._update_ui)
+        self._worker_refs.add(worker)
+        self.thread_pool.start(worker)
+        self._update_ui()
+
+    def _search_complete(self, result: object) -> None:
+        index, query = result if isinstance(result, tuple) and len(result) == 2 else (self._searching_review_index, "")
+        self._searching_review_index = None
+        self._complete_action("Finished review search")
+        if isinstance(index, int) and self.controller is not None and 0 <= index < len(self.controller.items):
+            item = self.controller.items[index]
+            status = self._lookup_status_message(item)
+            self._diagnostics.record_event(
+                "review_search_finished",
+                item=index + 1,
+                query=query,
+                provider=getattr(item, "provider", None),
+                lookup_status=getattr(item, "lookup_status", None),
+                lookup_reason=getattr(item, "lookup_reason", None),
+                attempted_queries=list(getattr(item, "attempted_queries", []) or []),
+                raw_result_count=getattr(item, "raw_result_count", None),
+                candidate_count=getattr(item, "candidate_count", None),
+                filtered_count=getattr(item, "filtered_count", None),
+            )
+            self._append_status(f"Search for item {index + 1}: {status}")
         self._refresh_review()
+        self._flush_runtime_diagnostics()
+
+    def _search_failed(self, message: str) -> None:
+        self._searching_review_index = None
+        self._show_error(message)
+
+    def _lookup_status_message(self, item: object) -> str:
+        status = str(getattr(item, "lookup_status", "") or "")
+        reason = str(getattr(item, "lookup_reason", "") or "").strip()
+        candidate_count = getattr(item, "candidate_count", None)
+        if candidate_count is None:
+            candidate_count = len(getattr(item, "candidates", []) or [])
+        raw_count = getattr(item, "raw_result_count", None)
+        provider = getattr(item, "provider", None) or "provider"
+        if status in {"provider_unavailable", "network_error"}:
+            return f"{provider} unavailable" + (f": {reason}" if reason else "")
+        if status == "filtered_empty":
+            return f"{raw_count or 0} raw result(s), but no usable candidates."
+        if candidate_count:
+            return f"loaded {candidate_count} candidate(s)."
+        if status == "offline_no_cache":
+            return "offline mode has no cached match."
+        return "no candidates found."
 
     def _switch_current_item(self) -> None:
         if self.controller is None:
@@ -3928,6 +4190,7 @@ class MainWindow(QMainWindow):
         if log_key == self._last_apply_log_key:
             return
         self._last_apply_log_key = log_key
+        self._append_status(status_line.replace("\n", " • "))
         self._diagnostics.record_event(
             "organisation_apply_progress",
             phase=payload.phase,
@@ -3950,7 +4213,6 @@ class MainWindow(QMainWindow):
             parallel_workers=payload.parallel_workers,
             progress_capability=payload.progress_capability,
         )
-        self._append_status(status_line.replace("\n", " • "))
         self._flush_runtime_diagnostics(progress_only=True)
 
     def _guided_compression_can_continue(self) -> bool:
@@ -3972,6 +4234,34 @@ class MainWindow(QMainWindow):
         self._guided_mode = False
         self._continue_to_compress = False
         self._start_compression_preparation("Preparing compression plan from Setup.")
+
+    def _bypass_blocked_organisation(self) -> None:
+        if self.workflow_state != WorkflowState.REVIEW_BLOCKED or not self.compress_enabled.isChecked():
+            return
+        source = self.source_input.text().strip()
+        compression_root = self.compression_root_input.text().strip()
+        library = self.library_input.text().strip()
+        target_root = source if self.link_compression_root.isChecked() and compression_root == library else compression_root
+        if QMessageBox.question(
+            self,
+            "mediaflow",
+            "Skip organisation and prepare compression instead?\n\n"
+            "Unresolved organise matches will not be moved or renamed for this run.\n"
+            f"Compression root: {target_root}",
+        ) != QMessageBox.Yes:
+            return
+        if target_root and target_root != compression_root:
+            self.link_compression_root.setChecked(False)
+            self.compression_root_input.setText(target_root)
+        self._guided_mode = False
+        self._continue_to_compress = False
+        self._diagnostics.record_event(
+            "organisation_bypassed_for_compression",
+            reason="review_blocked",
+            compression_root=target_root,
+            unresolved=(self.preview_state.unresolved_count if self.preview_state is not None else None),
+        )
+        self._start_compression_preparation("Skipped blocked organisation and prepared compression from the original source/root.")
 
     def _prepare_compression_after_apply(self) -> None:
         self._start_compression_preparation("Preparing compression plan for the organised output.")
@@ -4132,7 +4422,7 @@ class MainWindow(QMainWindow):
                 self._record_warning(warning)
                 self._append_status(f"Duplicate warning: {warning}")
         blocked_detail = None
-        if getattr(preparation, "compatible_count", 0) <= 0:
+        if self._compatibility_counts_block(preparation):
             blocked_detail = (
                 "Compression plan needs attention. The selected profile is not safe for this batch."
             )
@@ -4168,7 +4458,7 @@ class MainWindow(QMainWindow):
                 "Compression analysis finished, but no encoder profile could be auto-selected. "
                 "Review the plan details or rebuild the plan with different settings."
             )
-        if getattr(preparation, "compatible_count", 0) <= 0:
+        if self._compatibility_counts_block(preparation):
             return (
                 "Compression analysis finished, but the selected profile is not safe for this batch. "
                 "Rebuild the plan with safer compatibility-first settings before starting."
@@ -4427,7 +4717,7 @@ class MainWindow(QMainWindow):
             return "Finish preparing the compression plan before starting encoding."
         if prep.profile is None:
             return "No encoder profile is selected for this plan. Rebuild with safer settings first."
-        if getattr(prep, "compatible_count", 0) <= 0:
+        if self._compatibility_counts_block(prep):
             return "The selected profile is predicted to work for 0 files. Rebuild with a safer compatibility-first profile."
         if self._compression_has_blocking_risk():
             return "This plan has hardware or container compatibility risk. Rebuild with a safer compatibility-first profile before starting."

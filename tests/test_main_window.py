@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -622,6 +623,173 @@ def test_manual_movie_match_uses_explicit_year(monkeypatch) -> None:
     assert captured["year"] == 2019
 
 
+def test_review_details_show_lookup_diagnostics() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/movie.mp4"), media_type="movie", title="Movie", year=None, season=None, episode=None),
+        lookup_title="Custom Movie",
+        search_query="custom movie",
+        manual_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="unresolved",
+        preview_block_reason="No candidates available.",
+        unresolved_reason="No candidates available.",
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        preview_valid=False,
+        status_label="unresolved",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+        provider="Wikidata",
+        lookup_status="network_error",
+        lookup_reason="Wikidata lookups are unavailable (network error).",
+        attempted_queries=["custom movie", "movie"],
+        raw_result_count=0,
+        candidate_count=0,
+        filtered_count=0,
+        search_time=0.25,
+        fetch_time=None,
+        total_time=0.25,
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    window._populate_review_table()
+
+    details = window.details_log.toPlainText()
+    assert "Provider: Wikidata" in details
+    assert "Lookup status: network_error" in details
+    assert "Attempted queries: custom movie | movie" in details
+    assert window.manual_button.text() == "Manual Match Recommended"
+
+
+def test_search_again_runs_with_review_search_state(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/movie.mp4"), media_type="movie", title="Movie", year=None, season=None, episode=None),
+        lookup_title=None,
+        search_query="movie",
+        manual_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="unresolved",
+        preview_block_reason="No candidates available.",
+        unresolved_reason="No candidates available.",
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        preview_valid=False,
+        status_label="unresolved",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+        provider="Wikidata",
+        lookup_status="no_results",
+        lookup_reason=None,
+        attempted_queries=[],
+        raw_result_count=0,
+        candidate_count=0,
+        filtered_count=0,
+    )
+
+    def refine(index, query):
+        item.lookup_title = query
+        item.search_query = query.lower()
+        item.lookup_status = "ok"
+        item.candidate_count = 1
+
+    window.controller = SimpleNamespace(items=[item], refine_search=refine, build_preview=lambda: None)
+    window._populate_review_table()
+    window.search_input.setText("Better Movie")
+    monkeypatch.setattr(window, "_refresh_review", lambda: None)
+    monkeypatch.setattr(window.thread_pool, "start", lambda worker: worker.run())
+
+    window._search_current_item()
+
+    assert item.lookup_title == "Better Movie"
+    assert window._searching_review_index is None
+    assert window._diagnostics.events[-1]["kind"] in {"status", "review_search_finished"}
+
+
+def test_review_diagnostics_snapshot_includes_lookup_fields() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/movie.mp4"), media_type="movie", title="Movie", year=2020, season=None, episode=None),
+        lookup_title="Movie Search",
+        search_query="movie search",
+        selected_candidate=None,
+        manual_candidate=None,
+        decision_status="unresolved",
+        status_label="unresolved",
+        preview_block_reason="No candidates available.",
+        unresolved_reason="No candidates available.",
+        warning=None,
+        provider="Wikidata",
+        lookup_status="no_results",
+        lookup_reason=None,
+        attempted_queries=["movie search"],
+        raw_result_count=0,
+        candidate_count=0,
+        filtered_count=0,
+        cache_context="search result",
+        auto_selectable=False,
+        candidate_states=[],
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    snapshot = window._review_diagnostics_snapshot()
+
+    assert snapshot[0]["lookup_title"] == "Movie Search"
+    assert snapshot[0]["provider"] == "Wikidata"
+    assert snapshot[0]["attempted_queries"] == ["movie search"]
+
+
+def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    monkeypatch.setattr(window, "_diagnostics_directory_path", lambda: tmp_path)
+    monkeypatch.setattr(window, "_flush_runtime_diagnostics", lambda: None)
+
+    window._create_diagnostics_bundle()
+
+    bundles = list(tmp_path.glob("mediaflow-diagnostics-bundle-*.zip"))
+    assert len(bundles) == 1
+    with zipfile.ZipFile(bundles[0]) as archive:
+        names = archive.namelist()
+    assert any(name.startswith("mediaflow-review-snapshot-") for name in names)
+
+
+def test_bypass_blocked_organisation_prepares_compression_from_source_when_linked(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "source"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    window.source_input.setText(str(source))
+    window.library_input.setText(str(library))
+    window.compression_root_input.setText(str(library))
+    window.link_compression_root.setChecked(True)
+    window.compress_enabled.setChecked(True)
+    window._guided_mode = True
+    window.preview_state = SimpleNamespace(unresolved_count=2)
+    window._set_state(WorkflowState.REVIEW_BLOCKED)
+    started: list[str] = []
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(window, "_start_compression_preparation", started.append)
+
+    window._bypass_blocked_organisation()
+
+    assert window.compression_root_input.text() == str(source)
+    assert started
+    assert window._diagnostics.events[-1]["kind"] == "organisation_bypassed_for_compression"
+
+
 def test_apply_progress_updates_current_action_and_log() -> None:
     _app()
     window = MainWindow()
@@ -830,7 +998,7 @@ def test_zero_compatible_plan_enters_attention_state_and_offers_safer_rebuild(tm
 
     assert window.summary_headline_label.text() == "Compression plan needs attention"
     assert "not safe for this batch" in window.current_action_label.text().lower()
-    assert window.rebuild_safer_button.isVisible() is True
+    assert window.rebuild_safer_button.isHidden() is False
     assert window.rebuild_safer_button.isEnabled() is True
     assert "predicted to work for 0 files" in window.start_compress_button.toolTip().lower()
 
