@@ -51,7 +51,11 @@ from . import __version__
 from .callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
 from .compat import check_runtime_compatibility, compatibility_error_text
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
-from .diagnostics import DiagnosticsRecorder, diagnostics_dir
+from .diagnostics import (
+    DiagnosticsRecorder,
+    default_diagnostics_candidates,
+    select_diagnostics_dir,
+)
 from .integrations import (
     build_compression_plan_rows,
     build_encode_result_rows,
@@ -116,6 +120,8 @@ class MainWindow(QMainWindow):
         self._custom_warnings: list[str] = []
         self._last_diagnostics_path: Path | None = None
         self._last_diagnostics_error: str | None = None
+        self._diagnostics_base_dir: Path | None = None
+        self._diagnostics_fallback_warning: str | None = None
         self._retry_sources: set[Path] = set()
         self._compression_plan_rows: list = []
         self._summary_rows: list = []
@@ -147,6 +153,7 @@ class MainWindow(QMainWindow):
         self._apply_progress: ApplyProgress | None = None
         self._apply_cancel_requested: bool = False
         self._last_apply_log_key: tuple[str, int, int, str] | None = None
+        self._last_apply_heartbeat_at: float = 0.0
         self._last_diagnostics_flush_at: float = 0.0
         self._activity_spinner_idx: int = 0
 
@@ -161,6 +168,8 @@ class MainWindow(QMainWindow):
         if self._compression_root_linked:
             target = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
             self.compression_root_input.setText(target)
+        self._refresh_copy_worker_visibility()
+        self._ensure_diagnostics_location()
         self._set_state(WorkflowState.SETUP)
         self._set_diagnostics_provenance()
         self._flush_runtime_diagnostics()
@@ -210,6 +219,10 @@ class MainWindow(QMainWindow):
         self.apply_mode.setChecked(True)
         self.copy_mode = QCheckBox("Copy files instead of move")
         self.copy_mode.setChecked(True)
+        self.copy_workers = QSpinBox()
+        self.copy_workers.setRange(1, 4)
+        self.copy_workers.setValue(1)
+        self.copy_workers.setToolTip("Optional parallel organisation copies. 1 is safest and remains the default.")
         self.use_cache = QCheckBox("Use plexify cache")
         self.use_cache.setChecked(True)
         self.offline = QCheckBox("Offline lookup")
@@ -273,6 +286,8 @@ class MainWindow(QMainWindow):
                 "Blocked only",
                 "Unresolved only",
                 "Accepted/manual only",
+                "Suspicious only",
+                "Bulk/manual only",
                 "TV only",
             ]
         )
@@ -293,8 +308,15 @@ class MainWindow(QMainWindow):
         self.apply_destination_label.setWordWrap(True)
         self.apply_elapsed_label = QLabel("")
         self.apply_elapsed_label.setWordWrap(True)
+        self.apply_throughput_label = QLabel("")
+        self.apply_throughput_label.setWordWrap(True)
+        self.apply_throughput_label.setObjectName("muted-label")
+        self.apply_current_progress_bar = QProgressBar()
+        self.apply_current_progress_bar.setRange(0, 100)
+        self.apply_current_progress_bar.setFormat("Current file %p%")
         self.apply_progress_bar = QProgressBar()
         self.apply_progress_bar.setRange(0, 100)
+        self.apply_progress_bar.setFormat("Overall %p%")
         self.apply_log = QPlainTextEdit()
         self.apply_log.setReadOnly(True)
         self.apply_log.document().setMaximumBlockCount(300)
@@ -760,6 +782,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout(page)
         form.addRow(self.apply_mode)
         form.addRow(self.copy_mode)
+        form.addRow("Organisation copy workers", self.copy_workers)
         form.addRow(self.use_cache)
         form.addRow(self.offline)
         form.addRow("Minimum confidence", self.min_confidence)
@@ -878,6 +901,10 @@ class MainWindow(QMainWindow):
         dashboard_layout.addWidget(self.apply_current_label)
         dashboard_layout.addWidget(self.apply_destination_label)
         dashboard_layout.addWidget(self.apply_elapsed_label)
+        dashboard_layout.addWidget(self.apply_throughput_label)
+        dashboard_layout.addWidget(QLabel("Current file progress"))
+        dashboard_layout.addWidget(self.apply_current_progress_bar)
+        dashboard_layout.addWidget(QLabel("Overall apply progress"))
         dashboard_layout.addWidget(self.apply_progress_bar)
         action_row = QHBoxLayout()
         action_row.addStretch(1)
@@ -1052,6 +1079,7 @@ class MainWindow(QMainWindow):
             self.compress_enabled.toggled,
             self.apply_mode.toggled,
             self.copy_mode.toggled,
+            self.copy_workers.valueChanged,
             self.use_cache.toggled,
             self.offline.toggled,
             self.overwrite.toggled,
@@ -1068,6 +1096,7 @@ class MainWindow(QMainWindow):
             signal.connect(self._on_config_edited)
 
         self.organise_enabled.toggled.connect(self._organise_stage_toggled)
+        self.copy_mode.toggled.connect(self._refresh_copy_worker_visibility)
         self.source_input.textChanged.connect(self._source_path_changed)
         self.library_input.textChanged.connect(self._library_path_changed)
         self.compression_root_input.textEdited.connect(self._compression_root_manually_edited)
@@ -1151,6 +1180,8 @@ class MainWindow(QMainWindow):
             self.apply_mode.setChecked(saved["apply_mode"])
         if isinstance(saved.get("copy_mode"), bool):
             self.copy_mode.setChecked(saved["copy_mode"])
+        if isinstance(saved.get("copy_workers"), int):
+            self.copy_workers.setValue(max(1, min(4, int(saved["copy_workers"]))))
         if isinstance(saved.get("use_cache"), bool):
             self.use_cache.setChecked(saved["use_cache"])
         if isinstance(saved.get("offline"), bool):
@@ -1295,6 +1326,7 @@ class MainWindow(QMainWindow):
             "compress_enabled": self.compress_enabled.isChecked(),
             "apply_mode": self.apply_mode.isChecked(),
             "copy_mode": self.copy_mode.isChecked(),
+            "copy_workers": int(self.copy_workers.value()),
             "use_cache": self.use_cache.isChecked(),
             "offline": self.offline.isChecked(),
             "min_confidence": float(self.min_confidence.value()),
@@ -1374,6 +1406,13 @@ class MainWindow(QMainWindow):
         return f"{n:.1f} PB"
 
     @staticmethod
+    def _path_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
     def _strip_rich(text: str) -> str:
         """Strip Rich markup tags (e.g. [dim], [/white]) from mediashrink output."""
         return re.sub(r'\[/?[^\]]+\]', '', text)
@@ -1444,6 +1483,7 @@ class MainWindow(QMainWindow):
             self.activity_indicator_label.setText("Idle")
 
     def _set_diagnostics_provenance(self) -> None:
+        self._ensure_diagnostics_location()
         self._diagnostics.set_provenance(
             {
                 "app_version": __version__,
@@ -1451,13 +1491,21 @@ class MainWindow(QMainWindow):
                 "python_version": sys.version.split()[0],
                 "platform": sys.platform,
                 "config_dir": str(get_config_dir()),
-                "diagnostics_dir": str(diagnostics_dir()),
+                "diagnostics_dir": str(self._diagnostics_directory_path()),
                 "integrations": {
                     "plexify": self._module_origin_details("plexify"),
                     "mediashrink": self._module_origin_details("mediashrink"),
                 },
             }
         )
+
+    def _ensure_diagnostics_location(self) -> None:
+        library = Path(self.library_input.text().strip()) if self.library_input.text().strip() else None
+        selected, warning = select_diagnostics_dir(default_diagnostics_candidates(library))
+        self._diagnostics_base_dir = selected
+        self._diagnostics_fallback_warning = warning
+        if warning and warning not in self._custom_warnings:
+            self._custom_warnings.append(warning)
 
     @staticmethod
     def _module_origin_details(module_name: str) -> dict[str, object]:
@@ -1491,15 +1539,21 @@ class MainWindow(QMainWindow):
         return -1
 
     def _diagnostics_directory_path(self) -> Path:
-        if self._last_diagnostics_path is not None:
+        if self._last_diagnostics_path is not None and self._last_diagnostics_path.exists():
             return self._last_diagnostics_path.parent
+        if self._diagnostics_base_dir is not None:
+            return self._diagnostics_base_dir
         return get_config_dir() / "runs"
 
     def _diagnostics_status_text(self) -> str:
-        if self._last_diagnostics_path is not None:
+        if self._last_diagnostics_path is not None and self._last_diagnostics_path.exists():
             return f"Diagnostics file: {self._last_diagnostics_path}"
         if self._last_diagnostics_error:
             return f"Diagnostics warning: {self._last_diagnostics_error}"
+        if self._last_diagnostics_path is not None and not self._last_diagnostics_path.exists():
+            return f"Diagnostics warning: missing diagnostics file at {self._last_diagnostics_path}"
+        if self._diagnostics_fallback_warning:
+            return f"Diagnostics warning: {self._diagnostics_fallback_warning}"
         return f"Diagnostics folder: {self._diagnostics_directory_path()}"
 
     def _tick_scan(self) -> None:
@@ -1545,6 +1599,22 @@ class MainWindow(QMainWindow):
             else 0.0
         )
         self._apply_progress_model.update_stall(elapsed_seconds=elapsed, stalled_seconds=stalled_seconds)
+        self._poll_apply_destination_progress()
+        if stalled_seconds >= 10 and time.monotonic() - self._last_apply_heartbeat_at >= 30:
+            self._last_apply_heartbeat_at = time.monotonic()
+            heartbeat = self._apply_heartbeat_text(stalled_seconds)
+            self._apply_progress_model.event_log.append(heartbeat)
+            self._diagnostics.record_event(
+                "organisation_apply_stalled",
+                elapsed=round(elapsed, 1),
+                stalled_seconds=round(stalled_seconds, 1),
+                current_source=self._apply_progress_model.current_source,
+                current_destination=self._apply_progress_model.current_destination,
+                current_file_bytes_copied=self._apply_progress_model.current_file_bytes_copied,
+                completed_bytes=self._apply_progress_model.completed_bytes,
+                total_bytes=self._apply_progress_model.total_bytes,
+            )
+            self._flush_runtime_diagnostics(progress_only=True)
         self._set_current_action(
             self._format_apply_status_text(progress, elapsed=elapsed, stalled=stalled)
         )
@@ -1610,6 +1680,10 @@ class MainWindow(QMainWindow):
             self.compression_root_input.blockSignals(False)
         self._on_config_edited()
 
+    def _refresh_copy_worker_visibility(self, *_args) -> None:
+        self.copy_workers.setEnabled(self.copy_mode.isChecked())
+        self.copy_workers.setVisible(self.copy_mode.isChecked())
+
     def _compression_root_manually_edited(self, text: str) -> None:
         linked_path = self.library_input.text() if self.organise_enabled.isChecked() else self.source_input.text()
         if self._compression_root_linked and text.strip() != linked_path.strip():
@@ -1643,6 +1717,7 @@ class MainWindow(QMainWindow):
                 enabled=self.organise_enabled.isChecked(),
                 apply=self.apply_mode.isChecked(),
                 copy_mode=self.copy_mode.isChecked(),
+                copy_workers=int(self.copy_workers.value()),
                 use_cache=self.use_cache.isChecked(),
                 offline=self.offline.isChecked(),
                 min_confidence=float(self.min_confidence.value()),
@@ -1750,7 +1825,10 @@ class MainWindow(QMainWindow):
             return
         self._apply_cancel_requested = True
         self.cancel_apply_button.setEnabled(False)
-        self._append_status("Cancel requested. Organisation will stop after the current file operation.")
+        if self.copy_mode.isChecked() and self.copy_workers.value() > 1:
+            self._append_status("Cancel requested. Organisation will start no new files and will stop after active copies finish.")
+        else:
+            self._append_status("Cancel requested. Organisation will stop after the current file operation.")
         self._diagnostics.record_event("organisation_apply_cancel_requested")
         if self._apply_progress is not None:
             self._apply_progress_model.cancel_requested = True
@@ -1763,15 +1841,24 @@ class MainWindow(QMainWindow):
         model = self._apply_progress_model
         current_name = self._summarize_path(model.current_source)
         destination = model.current_destination or "(waiting for destination)"
-        if model.total_items:
+        if model.total_bytes:
+            pct = int(100 * min(model.completed_bytes, model.total_bytes) / model.total_bytes)
+        elif model.total_items:
             pct = int(100 * min(model.completed_items, model.total_items) / model.total_items)
+        else:
+            pct = 0
+        if model.total_items:
             count_text = (
                 f"Current item: {model.current_item_index} of {model.total_items}  |  "
                 f"Completed: {model.completed_items} of {model.total_items}"
             )
         else:
-            pct = 0
             count_text = "Current item: starting  |  Completed: 0"
+        if model.total_bytes:
+            count_text += (
+                f"  |  Copied: {self._format_bytes(model.completed_bytes)}"
+                f" of {self._format_bytes(model.total_bytes)}"
+            )
         size_text = (
             f"Current file size: {self._format_bytes(model.current_file_bytes)}"
             if model.current_file_bytes
@@ -1795,12 +1882,74 @@ class MainWindow(QMainWindow):
         self.apply_elapsed_label.setText(
             f"Elapsed: {self._format_elapsed(model.elapsed_seconds)}{report}"
         )
-        self.apply_progress_bar.setValue(pct)
+        if model.speed_mbps is not None:
+            eta = f"  |  ETA: {self._format_elapsed(model.eta_seconds)}" if model.eta_seconds is not None else ""
+            self.apply_throughput_label.setText(
+                f"Throughput: {model.speed_mbps:.1f} MB/s{eta}  |  "
+                f"Telemetry: {model.progress_capability or 'fallback'}  |  Workers: {model.parallel_workers}"
+            )
+        else:
+            self.apply_throughput_label.setText(
+                f"Telemetry: {model.progress_capability or 'waiting for byte progress'}  |  Workers: {model.parallel_workers}"
+            )
+        if model.current_file_bytes:
+            self.apply_current_progress_bar.setRange(0, 100)
+            self.apply_current_progress_bar.setValue(
+                int(100 * min(model.current_file_bytes_copied, model.current_file_bytes) / model.current_file_bytes)
+            )
+        elif stalled_seconds >= 10:
+            self.apply_current_progress_bar.setRange(0, 0)
+        else:
+            self.apply_current_progress_bar.setRange(0, 100)
+            self.apply_current_progress_bar.setValue(0)
+        if model.total_bytes or model.total_items:
+            self.apply_progress_bar.setRange(0, 100)
+            self.apply_progress_bar.setValue(pct)
+        elif stalled_seconds >= 10:
+            self.apply_progress_bar.setRange(0, 0)
+        else:
+            self.apply_progress_bar.setRange(0, 100)
+            self.apply_progress_bar.setValue(0)
         self.cancel_apply_button.setEnabled(
             self.workflow_state == WorkflowState.APPLYING and not self._apply_cancel_requested
         )
         if model.event_log:
             self.apply_log.setPlainText("\n".join(model.event_log))
+
+    def _poll_apply_destination_progress(self) -> None:
+        model = self._apply_progress_model
+        if not model.current_destination or not model.current_file_bytes:
+            return
+        destination = Path(model.current_destination)
+        try:
+            size = destination.stat().st_size
+        except OSError:
+            return
+        if size <= model.current_file_bytes_copied:
+            return
+        model.current_file_bytes_copied = min(size, model.current_file_bytes)
+        if model.completed_bytes < model.current_file_bytes_copied:
+            model.completed_bytes = model.current_file_bytes_copied
+        if model.elapsed_seconds > 0 and model.completed_bytes > 0:
+            model.speed_mbps = model.completed_bytes / model.elapsed_seconds / 1_048_576
+            if model.total_bytes > model.completed_bytes and model.speed_mbps > 0:
+                model.eta_seconds = (model.total_bytes - model.completed_bytes) / (model.speed_mbps * 1_048_576)
+        if not model.progress_capability or model.progress_capability == "planned":
+            model.progress_capability = "destination-size fallback"
+
+    def _apply_heartbeat_text(self, stalled_seconds: float) -> str:
+        model = self._apply_progress_model
+        pieces = [
+            f"Still working after {self._format_elapsed(model.elapsed_seconds)}",
+            f"no callback for {self._format_elapsed(stalled_seconds)}",
+        ]
+        if model.current_source:
+            pieces.append(f"file {Path(model.current_source).name}")
+        if model.current_file_bytes:
+            pieces.append(
+                f"{self._format_bytes(model.current_file_bytes_copied)} / {self._format_bytes(model.current_file_bytes)}"
+            )
+        return ". ".join(pieces) + "."
 
     def _reset_runtime_state(self, status_message: str | None = None) -> None:
         self.controller = None
@@ -1814,7 +1963,10 @@ class MainWindow(QMainWindow):
         self._retry_sources = set()
         self._last_diagnostics_path = None
         self._last_diagnostics_error = None
+        self._diagnostics_base_dir = None
+        self._diagnostics_fallback_warning = None
         self._diagnostics = DiagnosticsRecorder()
+        self._ensure_diagnostics_location()
         self._set_diagnostics_provenance()
         self._guided_mode = False
         self._continue_to_compress = False
@@ -2129,7 +2281,11 @@ class MainWindow(QMainWindow):
         self.active_copy_diagnostics_button.setVisible(True)
         self.save_summary_button.setVisible(self.workflow_state == WorkflowState.COMPLETED)
 
-        show_encode_dashboard = has_compression_plan and self.compress_stack.currentIndex() == 2
+        show_encode_dashboard = (
+            has_compression_plan
+            and bool(self.encode_preparation is not None and self._runnable_jobs(self.encode_preparation))
+            and self.compress_stack.currentIndex() == 2
+        )
         self.toggle_encode_card_button.setVisible(show_encode_dashboard)
         if show_encode_dashboard:
             self.encode_card.setVisible(not self.toggle_encode_card_button.isChecked())
@@ -2359,6 +2515,10 @@ class MainWindow(QMainWindow):
             for row in self._compression_plan_rows
             if row.source in runnable_sources
         )
+        analysed_input_bytes = sum(
+            row.estimated_output_bytes + row.estimated_savings_bytes
+            for row in self._compression_plan_rows
+        )
         selected_estimated_output_bytes = sum(
             row.estimated_output_bytes
             for row in self._compression_plan_rows
@@ -2367,18 +2527,23 @@ class MainWindow(QMainWindow):
         savings = max(selected_input_bytes - selected_estimated_output_bytes, 0)
         lines = [
             f"Compression Root: {prep.directory}",
-            f"Input:    {self._format_bytes(selected_input_bytes)} across {len(runnable_sources)} file(s)",
-            f"Output:   {self._format_bytes(selected_estimated_output_bytes)} estimated",
-            f"Savings:  {self._format_bytes(savings)} expected",
-            f"Plan:     {prep.recommended_count} recommended  |  {prep.maybe_count} maybe  |  {prep.skip_count} skipped",
-            f"Selected: {len(prep.jobs)} planned job(s)  |  {len(runnable_sources)} runnable now",
+            f"Analysed: {self._format_bytes(analysed_input_bytes)} across {len(self._compression_plan_rows)} file(s)",
+            f"Runnable input: {self._format_bytes(selected_input_bytes)} across {len(runnable_sources)} file(s)",
+            f"Runnable output: {self._format_bytes(selected_estimated_output_bytes)} estimated",
+            f"Runnable savings: {self._format_bytes(savings)} expected",
+            f"Analysis recommendation: {prep.recommended_count} recommended  |  {prep.maybe_count} maybe  |  {prep.skip_count} skipped",
+            f"Runnable jobs selected: {len(prep.jobs)} planned job(s)  |  {len(runnable_sources)} runnable now",
         ]
         if not prep.jobs:
+            self.rebuild_safer_button.setText("Rebuild Safer Plan (Recommended)")
             lines.append(
                 "No encode jobs were auto-selected from this analysis. Recommended rows are analysis results only until "
                 "a runnable profile and job set are chosen."
             )
-        elif getattr(prep, "compatible_count", 0) <= 0:
+            lines.append("Next action: Rebuild Safer Plan.")
+        else:
+            self.rebuild_safer_button.setText("Rebuild Safer Plan")
+        if prep.jobs and getattr(prep, "compatible_count", 0) <= 0:
             lines.append(
                 "The current profile is predicted to work for 0 file(s). Rebuild with a safer compatibility-first profile before starting."
             )
@@ -2508,7 +2673,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "mediaflow", message)
                 return
             target = fallback
-        self._open_path(str(target))
+        try:
+            self._open_path(str(target))
+        except OSError as exc:
+            QApplication.clipboard().setText(str(target))
+            message = f"Unable to open diagnostics folder: {target}. Path copied to clipboard. {exc}"
+            self._append_status(message)
+            QMessageBox.warning(self, "mediaflow", message)
 
     def _copy_diagnostics_path(self) -> None:
         target = str(self._last_diagnostics_path or self._diagnostics_directory_path())
@@ -2522,7 +2693,9 @@ class MainWindow(QMainWindow):
             os.startfile(path)  # noqa: S606
         else:
             import subprocess
-            subprocess.run(["xdg-open", path], check=False)  # noqa: S603, S607
+            result = subprocess.run(["xdg-open", path], check=False)  # noqa: S603, S607
+            if result.returncode != 0:
+                raise OSError(f"xdg-open exited with status {result.returncode}")
 
     def _preflight_check(self, preparation: EncodePreparation) -> str | None:
         """Return an error string if the output directory fails space or writability checks."""
@@ -2556,9 +2729,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        Path(path).write_text(self._build_summary_export_text(), encoding="utf-8")
+        redact = QMessageBox.question(
+            self,
+            "mediaflow",
+            "Redact home-folder paths from the exported summary?",
+        ) == QMessageBox.Yes
+        Path(path).write_text(self._build_summary_export_text(redact=redact), encoding="utf-8")
 
-    def _build_summary_export_text(self) -> str:
+    def _build_summary_export_text(self, *, redact: bool = False) -> str:
         sections = [
             self.summary_headline_label.text().strip(),
             self.summary_mode_label.text().strip(),
@@ -2566,7 +2744,18 @@ class MainWindow(QMainWindow):
             self.summary_overview_label.text().strip(),
             self.summary_log.toPlainText().strip(),
         ]
-        return "\n\n".join(section for section in sections if section)
+        text = "\n\n".join(section for section in sections if section)
+        return self._redact_export_text(text) if redact else text
+
+    def _redact_export_text(self, text: str) -> str:
+        replacements = [str(Path.home())]
+        user_profile = str(Path.home()).replace("/", "\\")
+        replacements.append(user_profile)
+        redacted = text
+        for value in replacements:
+            if value:
+                redacted = redacted.replace(value, "<home>")
+        return redacted
 
     def _snapshot_config_for_diagnostics(self) -> dict[str, object]:
         payload = self._ui_state_payload()
@@ -2684,6 +2873,10 @@ class MainWindow(QMainWindow):
             lines.append(
                 "Copy mode is enabled. Organisation may take time on large files, and compression will only begin after every copy finishes."
             )
+            if config.plexify.copy_workers > 1:
+                lines.append(
+                    f"Parallel copy is enabled with {config.plexify.copy_workers} workers. Cancel will stop new files after active copies finish."
+                )
             try:
                 exts = {ext.strip().lower() for ext in config.plexify.extensions.split(",") if ext.strip()}
                 source_sizes = [
@@ -2698,7 +2891,24 @@ class MainWindow(QMainWindow):
                     f"Visible source media: {len(source_sizes)} file(s), "
                     f"{self._format_bytes(sum(source_sizes))} total, largest {self._format_bytes(max(source_sizes))}."
                 )
+            if self._same_drive(config.source, config.library):
+                lines.append("Source and output appear to be on the same drive. Move mode is usually much faster, but removes originals.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _same_drive(left: Path, right: Path) -> bool:
+        left_drive = left.drive.lower()
+        right_drive = right.drive.lower()
+        if left_drive or right_drive:
+            return bool(left_drive and left_drive == right_drive)
+        left_parts = left.parts
+        right_parts = right.parts
+        if len(left_parts) > 2 and len(right_parts) > 2 and left_parts[1] == "mnt" and right_parts[1] == "mnt":
+            return left_parts[2].lower() == right_parts[2].lower()
+        try:
+            return left.resolve(strict=False).anchor == right.resolve(strict=False).anchor
+        except OSError:
+            return False
 
     def _flush_diagnostics(self, *, failure_message: str | None = None) -> None:
         summary = {
@@ -2713,7 +2923,12 @@ class MainWindow(QMainWindow):
         }
         failure = {"message": failure_message} if failure_message else None
         try:
-            self._last_diagnostics_path = self._diagnostics.write(summary=summary, failure=failure)
+            self._ensure_diagnostics_location()
+            self._last_diagnostics_path = self._diagnostics.write(
+                base_dir=self._diagnostics_directory_path(),
+                summary=summary,
+                failure=failure,
+            )
             self._last_diagnostics_error = None
             self.diagnostics_path_label.setText(f"Diagnostics: {self._last_diagnostics_path}")
         except OSError as exc:
@@ -2958,7 +3173,7 @@ class MainWindow(QMainWindow):
                 season_episode,
                 selected,
                 item.status_label,
-                item.warning or item.preview_block_reason or item.unresolved_reason or "",
+                self._review_warning_text(item),
             ]
             for column, value in enumerate(values):
                 self.review_table.setItem(row, column, QTableWidgetItem(str(value)))
@@ -2972,6 +3187,44 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, label)
         self._apply_review_filter()
         self._update_ui()
+
+    def _review_warning_text(self, item: object) -> str:
+        warnings = [
+            text
+            for text in (
+                getattr(item, "warning", None),
+                getattr(item, "preview_block_reason", None),
+                getattr(item, "unresolved_reason", None),
+            )
+            if text
+        ]
+        if self._is_suspicious_review_match(item):
+            warnings.append("Suspicious title mismatch.")
+        return " | ".join(dict.fromkeys(str(warning) for warning in warnings))
+
+    def _is_suspicious_review_match(self, item: object) -> bool:
+        status = str(getattr(item, "decision_status", "") or "")
+        if status not in {"accepted", "manual"}:
+            return False
+        selected_candidate = getattr(item, "selected_candidate", None)
+        selected_title = getattr(selected_candidate, "title", "") or ""
+        if not selected_title:
+            return False
+        source_tokens = self._title_tokens(Path(getattr(getattr(item, "item", None), "path", Path())).stem)
+        selected_tokens = self._title_tokens(str(selected_title))
+        if not source_tokens or not selected_tokens:
+            return False
+        overlap = source_tokens & selected_tokens
+        return len(overlap) == 0 and len(source_tokens) >= 2 and len(selected_tokens) >= 2
+
+    @staticmethod
+    def _title_tokens(text: str) -> set[str]:
+        stop = {"the", "a", "an", "of", "and", "in", "on", "to", "s", "e", "series", "season", "episode", "original"}
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", text.lower())
+            if len(token) > 2 and not token.isdigit() and token not in stop
+        }
 
     def _review_selection_changed(self) -> None:
         index = self._current_review_index()
@@ -3005,6 +3258,10 @@ class MainWindow(QMainWindow):
                 show = item.decision_status == "unresolved"
             elif mode == "Accepted/manual only":
                 show = item.decision_status in {"accepted", "manual"} and item.preview_block_reason is None
+            elif mode == "Suspicious only":
+                show = self._is_suspicious_review_match(item)
+            elif mode == "Bulk/manual only":
+                show = item.decision_status in {"accepted", "manual"} and not item.auto_selectable
             elif mode == "TV only":
                 show = item.item.media_type == "tv"
             if show:
@@ -3283,7 +3540,7 @@ class MainWindow(QMainWindow):
             suggested_search = getattr(self.controller, "suggested_search_query", None)
             query = suggested_search(index) if callable(suggested_search) else ""
         if not query:
-            self._show_error("Enter a search query first.")
+            self._append_status("Enter a search query first.")
             return
         self.controller.refine_search(index, query)
         self._append_status(f"Ran a fresh search for item {index + 1}.")
@@ -3337,6 +3594,8 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
+        if not self._confirm_bulk_action(index, "folder"):
+            return
         result = self.controller.apply_choice_to_folder(index)
         self._diagnostics.record_event(
             "bulk_apply",
@@ -3358,6 +3617,8 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
+        if not self._confirm_bulk_action(index, "title group"):
+            return
         result = self.controller.apply_choice_to_title_group(index)
         self._diagnostics.record_event(
             "bulk_apply",
@@ -3372,6 +3633,38 @@ class MainWindow(QMainWindow):
             f"{result.preview_valid_count} preview-valid, {result.blocked_count} blocked."
         )
         self._refresh_review()
+
+    def _confirm_bulk_action(self, index: int, mode: str) -> bool:
+        if self.controller is None:
+            return False
+        item = self.controller.items[index]
+        selected = getattr(item, "selected_candidate", None)
+        selected_title = getattr(selected, "title", None) or "(no selected title)"
+        if mode == "folder":
+            affected = [
+                other
+                for other in self.controller.items
+                if other.item.path.parent == item.item.path.parent and other.item.media_type == item.item.media_type
+            ]
+        else:
+            key = (item.item.title.strip().casefold(), item.item.media_type)
+            affected = [
+                other
+                for other in self.controller.items
+                if (other.item.title.strip().casefold(), other.item.media_type) == key
+            ]
+        suspicious = sum(
+            1
+            for other in affected
+            if not (self._title_tokens(other.item.path.stem) & self._title_tokens(str(selected_title)))
+        )
+        text = (
+            f"Apply the current selection to this {mode}?\n\n"
+            f"Selected title: {selected_title}\n"
+            f"Affected rows: {len(affected)}\n"
+            f"Potential title mismatches: {suspicious}"
+        )
+        return QMessageBox.question(self, "mediaflow", text) == QMessageBox.Yes
 
     def _render_preview_summary(self) -> None:
         if self.preview_state is None:
@@ -3471,6 +3764,34 @@ class MainWindow(QMainWindow):
             )
         return None
 
+    def _export_pre_apply_plan(self, preflight_lines: list[str]) -> None:
+        if self.preview_state is None:
+            return
+        try:
+            target_dir = self._diagnostics_directory_path()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = target_dir / f"mediaflow-pre-apply-{datetime.now().strftime('%Y%m%dT%H%M%S')}.txt"
+            lines = [
+                "Mediaflow pre-apply organisation plan",
+                f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+                f"Operation: {'copy' if self.copy_mode.isChecked() else 'move'}",
+                f"Conflict policy: {self.conflict_mode.currentText()}",
+                f"Copy workers: {self.copy_workers.value() if self.copy_mode.isChecked() else 1}",
+                "",
+                *preflight_lines,
+                "",
+                "Operations",
+            ]
+            for index, plan in enumerate(self.preview_state.plans, start=1):
+                lines.append(
+                    f"{index}. {plan.source} -> {plan.destination} "
+                    f"({self._format_bytes(self._path_size(plan.source))})"
+                )
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self._diagnostics.record_event("pre_apply_plan_exported", path=str(path), planned=len(self.preview_state.plans))
+        except OSError as exc:
+            self._record_warning(f"Unable to export pre-apply plan: {exc}")
+
     def _apply_plan(self) -> None:
         if self.controller is None:
             self._show_error("No organise review is loaded.")
@@ -3493,6 +3814,7 @@ class MainWindow(QMainWindow):
             confirm_text += f"\n... {len(preflight_lines) - 18} more planned operation(s)"
         if QMessageBox.question(self, "mediaflow", confirm_text) != QMessageBox.Yes:
             return
+        self._export_pre_apply_plan(preflight_lines)
         self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
         self._diagnostics.record_event(
@@ -3502,10 +3824,27 @@ class MainWindow(QMainWindow):
         self._append_status("Applying organisation plan...")
         self._apply_started_at = time.monotonic()
         self._apply_last_update_at = self._apply_started_at
+        first_plan = next(iter(self.preview_state.plans), None) if self.preview_state is not None else None
+        first_size = 0
+        total_bytes = 0
+        if self.preview_state is not None:
+            for plan in self.preview_state.plans:
+                size = self._path_size(plan.source)
+                total_bytes += size
+                if plan is first_plan:
+                    first_size = size
         self._apply_progress = ApplyProgress(
             phase="starting",
+            current_source=str(first_plan.source) if first_plan is not None else None,
+            current_destination=str(first_plan.destination) if first_plan is not None else None,
             completed=0,
             total=self.preview_state.planned_count if self.preview_state is not None else 0,
+            source_size_bytes=first_size or None,
+            current_file_bytes_copied=0,
+            completed_bytes=0,
+            total_bytes=total_bytes or None,
+            parallel_workers=int(self.copy_workers.value()) if self.copy_mode.isChecked() else 1,
+            progress_capability="planned",
             message="Opening organise report and starting file operations.",
         )
         self._apply_progress_model.reset()
@@ -3515,6 +3854,7 @@ class MainWindow(QMainWindow):
             self.apply_log.appendPlainText(line)
             self._apply_progress_model.event_log.append(line)
         self._apply_progress_model.update_from_progress(self._apply_progress, now=0.0)
+        self._last_apply_heartbeat_at = self._apply_started_at
         self._last_apply_log_key = None
         self._refresh_apply_dashboard()
         self._apply_timer.start()
@@ -3603,6 +3943,12 @@ class MainWindow(QMainWindow):
             conflict_action=payload.conflict_action,
             error=payload.error,
             cancel_requested=payload.cancel_requested,
+            current_file_bytes_copied=payload.current_file_bytes_copied,
+            completed_bytes=payload.completed_bytes,
+            total_bytes=payload.total_bytes,
+            active_files=payload.active_files,
+            parallel_workers=payload.parallel_workers,
+            progress_capability=payload.progress_capability,
         )
         self._append_status(status_line.replace("\n", " • "))
         self._flush_runtime_diagnostics(progress_only=True)

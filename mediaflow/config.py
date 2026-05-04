@@ -11,6 +11,7 @@ class PlexifySettings:
     enabled: bool = True
     apply: bool = True
     copy_mode: bool = True
+    copy_workers: int = 1
     use_cache: bool = True
     offline: bool = False
     min_confidence: float = 0.90
@@ -60,6 +61,8 @@ class PipelineConfig:
                 raise ValueError("Compression root must exist.")
         if self.plexify.min_confidence < 0 or self.plexify.min_confidence > 1:
             raise ValueError("Minimum confidence must be between 0 and 1.")
+        if self.plexify.copy_workers < 1 or self.plexify.copy_workers > 4:
+            raise ValueError("Organisation copy workers must be between 1 and 4.")
         if self.plexify.enabled:
             try:
                 ensure_non_overlapping_paths(

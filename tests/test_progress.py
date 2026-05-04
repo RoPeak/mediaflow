@@ -154,3 +154,33 @@ def test_apply_progress_model_tracks_current_and_completed_counts() -> None:
     assert model.completed_items == 0
     assert model.total_items == 7
     assert model.current_file_bytes == 100
+
+
+def test_apply_progress_model_tracks_byte_progress_and_eta() -> None:
+    model = ApplyProgressModel()
+
+    model.update_from_progress(
+        SimpleNamespace(
+            phase="copying",
+            completed=0,
+            total=2,
+            current_source="/tmp/source.mp4",
+            current_destination="/tmp/dest.mp4",
+            source_size_bytes=100,
+            current_file_bytes_copied=50,
+            completed_bytes=50,
+            total_bytes=200,
+            parallel_workers=2,
+            progress_capability="byte-copy",
+            message="Copying source.mp4",
+        ),
+        now=10.0,
+    )
+
+    assert model.current_file_bytes_copied == 50
+    assert model.completed_bytes == 50
+    assert model.total_bytes == 200
+    assert model.parallel_workers == 2
+    assert model.progress_capability == "byte-copy"
+    assert model.speed_mbps is not None
+    assert model.eta_seconds is not None

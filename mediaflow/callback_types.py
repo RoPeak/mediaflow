@@ -41,6 +41,12 @@ class ApplyProgress:
     operation: str | None = None
     source_size_bytes: int | None = None
     bytes_copied: int | None = None
+    current_file_bytes_copied: int | None = None
+    completed_bytes: int | None = None
+    total_bytes: int | None = None
+    active_files: int | None = None
+    parallel_workers: int | None = None
+    progress_capability: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
     report_path: str | None = None

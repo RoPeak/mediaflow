@@ -114,6 +114,13 @@ class ApplyProgressModel:
     current_file_bytes: int = 0
     total_bytes: int = 0
     bytes_copied: int = 0
+    current_file_bytes_copied: int = 0
+    completed_bytes: int = 0
+    active_files: int = 0
+    parallel_workers: int = 1
+    progress_capability: str = ""
+    speed_mbps: float | None = None
+    eta_seconds: float | None = None
     elapsed_seconds: float = 0.0
     stalled_seconds: float = 0.0
     report_path: str = ""
@@ -130,6 +137,13 @@ class ApplyProgressModel:
         self.current_file_bytes = 0
         self.total_bytes = 0
         self.bytes_copied = 0
+        self.current_file_bytes_copied = 0
+        self.completed_bytes = 0
+        self.active_files = 0
+        self.parallel_workers = 1
+        self.progress_capability = ""
+        self.speed_mbps = None
+        self.eta_seconds = None
         self.elapsed_seconds = 0.0
         self.stalled_seconds = 0.0
         self.report_path = ""
@@ -144,7 +158,11 @@ class ApplyProgressModel:
         current_destination = str(getattr(payload, "current_destination", "") or "")
         current_size = int(getattr(payload, "source_size_bytes", 0) or 0)
         bytes_copied = int(getattr(payload, "bytes_copied", 0) or 0)
+        current_file_bytes_copied = int(getattr(payload, "current_file_bytes_copied", 0) or 0)
+        completed_bytes = int(getattr(payload, "completed_bytes", 0) or 0)
+        total_bytes = int(getattr(payload, "total_bytes", 0) or 0)
         report_path = str(getattr(payload, "report_path", "") or "")
+        new_source = bool(current_source and current_source != self.current_source)
 
         self.phase = phase
         self.completed_items = min(completed, total) if total else completed
@@ -153,10 +171,20 @@ class ApplyProgressModel:
         self.current_destination = current_destination or self.current_destination
         self.current_file_bytes = current_size or self.current_file_bytes
         self.bytes_copied = max(self.bytes_copied, bytes_copied)
+        self.current_file_bytes_copied = max(0 if new_source else self.current_file_bytes_copied, current_file_bytes_copied)
+        self.completed_bytes = max(self.completed_bytes, completed_bytes, self.bytes_copied)
+        self.total_bytes = max(self.total_bytes, total_bytes)
+        self.active_files = max(0, int(getattr(payload, "active_files", 0) or 0))
+        self.parallel_workers = max(1, int(getattr(payload, "parallel_workers", 1) or 1))
+        self.progress_capability = str(getattr(payload, "progress_capability", "") or self.progress_capability)
         self.report_path = report_path or self.report_path
         self.cancel_requested = self.cancel_requested or bool(getattr(payload, "cancel_requested", False))
         self.current_item_index = self._current_index(phase, self.completed_items, self.total_items)
         self.elapsed_seconds = max(0.0, now)
+        if self.elapsed_seconds > 0 and self.completed_bytes > 0:
+            self.speed_mbps = self.completed_bytes / self.elapsed_seconds / 1_048_576
+            if self.total_bytes > self.completed_bytes and self.speed_mbps > 0:
+                self.eta_seconds = (self.total_bytes - self.completed_bytes) / (self.speed_mbps * 1_048_576)
 
         message = str(getattr(payload, "message", "") or "").strip()
         if not message:
