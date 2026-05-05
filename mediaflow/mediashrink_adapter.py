@@ -12,12 +12,14 @@ from mediashrink.analysis import (
 from mediashrink.gui_api import (
     EncodePreparation,
     EncodeProgress,
+    EncodeRunResults,
     prepare_encode_run,
     prepare_tools,
     run_encode_plan,
 )
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 from mediashrink.scanner import build_jobs
+from mediashrink.session import find_resumable_session, get_session_path
 from mediashrink.wizard import prepare_profile_planning
 
 from .config import PipelineConfig
@@ -71,9 +73,38 @@ def missing_job_sources(preparation: EncodePreparation) -> list:
     return [job.source for job in preparation.jobs if not job.source.exists()]
 
 
+def resumable_session_status(preparation: EncodePreparation) -> dict[str, object] | None:
+    jobs = list(preparation.jobs)
+    if not jobs:
+        return None
+    session = find_resumable_session(
+        preparation.directory,
+        None,
+        jobs[0].preset,
+        jobs[0].crf,
+    )
+    if session is None:
+        return None
+    job_sources = {str(job.source) for job in jobs}
+    session_sources = {entry.source for entry in session.entries}
+    if not job_sources.issubset(session_sources):
+        return None
+    counts: dict[str, int] = {}
+    for entry in session.entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+    return {
+        "path": str(get_session_path(preparation.directory, None)),
+        "counts": counts,
+        "completed": counts.get("success", 0),
+        "pending": counts.get("pending", 0) + counts.get("failed", 0) + counts.get("in_progress", 0),
+    }
+
+
 def run_compression(
     preparation: EncodePreparation,
     progress_callback: Callable[[object], None] | None = None,
+    session_path: Path | None = None,
+    resume: bool = False,
 ) -> list[EncodeResult]:
     missing_results: list[EncodeResult] = []
     runnable_jobs: list[EncodeJob] = []
@@ -92,8 +123,15 @@ def run_compression(
         on_progress=progress_callback,
         on_file_failure=preparation.on_file_failure,
         use_calibration=preparation.use_calibration,
+        session_path=session_path,
+        resume=resume,
     )
-    return missing_results + list(results)
+    return EncodeRunResults(
+        missing_results + list(results),
+        session_path=getattr(results, "session_path", session_path),
+        resumed_from_session=bool(getattr(results, "resumed_from_session", False)),
+        session_status=dict(getattr(results, "session_status", {}) or {}),
+    )
 
 
 def prepare_retry_compression(
@@ -378,5 +416,6 @@ __all__ = [
     "prepare_safer_compression",
     "prepare_retry_compression",
     "prepare_tools",
+    "resumable_session_status",
     "run_compression",
 ]

@@ -224,6 +224,8 @@ class EncodeProgressModel:
     eta_seconds: float | None = None
     speed_mbps: float | None = None
     eta_confident: bool = False
+    eta_status: str = "collecting progress samples"
+    total_files: int = 0
     _history: deque[tuple[float, int]] = field(default_factory=lambda: deque(maxlen=24))
 
     def reset(self) -> None:
@@ -240,6 +242,8 @@ class EncodeProgressModel:
         self.eta_seconds = None
         self.speed_mbps = None
         self.eta_confident = False
+        self.eta_status = "collecting progress samples"
+        self.total_files = 0
         self._history.clear()
 
     def update_from_progress(
@@ -254,8 +258,13 @@ class EncodeProgressModel:
         bytes_processed: int,
         total_bytes: int,
         now: float,
+        total_files: int | None = None,
+        current_file_index: int | None = None,
     ) -> None:
-        new_file = current_file_name != self.current_file_name
+        old_file_name = self.current_file_name
+        new_file = current_file_name != old_file_name
+        previous_completed = self.completed_files
+        previous_remaining = self.remaining_files
         if new_file:
             self.current_file_name = current_file_name
             self.current_file_progress = max(0.0, min(current_file_progress, 1.0))
@@ -267,8 +276,26 @@ class EncodeProgressModel:
             )
         self.phase = phase
         self.overall_progress = max(self.overall_progress, max(0.0, min(overall_progress, 1.0)))
-        self.completed_files = completed_files
-        self.remaining_files = remaining_files
+        observed_total = total_files if total_files is not None else completed_files + remaining_files
+        if observed_total <= 0:
+            observed_total = self.total_files
+        self.total_files = max(self.total_files, observed_total, completed_files + remaining_files)
+
+        inferred_completed = completed_files
+        if current_file_index is not None and current_file_index >= 0:
+            inferred_completed = max(inferred_completed, current_file_index)
+        elif new_file and old_file_name:
+            inferred_completed = max(inferred_completed, previous_completed + 1)
+        if self.total_files > 0:
+            inferred_completed = min(inferred_completed, self.total_files)
+        self.completed_files = max(previous_completed, inferred_completed)
+
+        inferred_remaining = remaining_files
+        if self.total_files > 0:
+            inferred_remaining = max(self.total_files - self.completed_files, 0)
+        elif previous_remaining > 0 and self.completed_files > previous_completed:
+            inferred_remaining = max(previous_remaining - (self.completed_files - previous_completed), 0)
+        self.remaining_files = inferred_remaining
         self.bytes_processed = max(self.bytes_processed, bytes_processed)
         self.total_bytes = max(total_bytes, self.total_bytes)
         self._history.append((now, self.bytes_processed))
@@ -288,11 +315,14 @@ class EncodeProgressModel:
             remaining_bytes = self.total_bytes - self.bytes_processed
             target_eta = remaining_bytes / (self.speed_mbps * 1_048_576)
             self.eta_seconds = self._smooth_eta(target_eta)
-        elif self.eta_confident and self.overall_progress >= 0.15 and self.elapsed_seconds >= 60:
+            self.eta_status = "estimated from current throughput"
+        elif self.eta_confident and self.overall_progress > 0 and self.elapsed_seconds >= 60:
             target_eta = self.elapsed_seconds / self.overall_progress * (1 - self.overall_progress)
             self.eta_seconds = self._smooth_eta(target_eta)
+            self.eta_status = "estimated from batch progress"
         else:
             self.eta_seconds = None
+            self.eta_status = self._eta_waiting_status()
 
     def _rolling_speed_mbps(self) -> float | None:
         if len(self._history) < 2:
@@ -314,7 +344,16 @@ class EncodeProgressModel:
             return False
         if self.overall_progress < 0.05 and self.completed_files <= 0:
             return False
-        return self.speed_mbps is not None or self.overall_progress >= 0.15
+        return self.speed_mbps is not None or self.overall_progress >= 0.15 or self.completed_files > 0
+
+    def _eta_waiting_status(self) -> str:
+        if len(self._history) < 4:
+            return "collecting progress samples"
+        if self.elapsed_seconds < 45:
+            return "stabilizing early estimate"
+        if self.overall_progress < 0.05 and self.completed_files <= 0:
+            return "waiting for measurable batch progress"
+        return "waiting for stable throughput"
 
     def _smooth_eta(self, target_eta: float) -> float:
         target_eta = max(0.0, target_eta)

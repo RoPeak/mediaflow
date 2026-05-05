@@ -87,6 +87,36 @@ def test_run_compression_returns_missing_result_without_crashing(tmp_path: Path)
     assert "missing" in (missing_result.error_message or "").lower()
 
 
+def test_run_compression_preserves_session_metadata(tmp_path: Path) -> None:
+    existing = _job(tmp_path, "existing.mkv")
+    existing.source.write_bytes(b"x")
+    prep = _preparation(tmp_path, [existing])
+    fake_result = SimpleNamespace(
+        job=existing,
+        skipped=False,
+        success=True,
+        input_size_bytes=100,
+        output_size_bytes=50,
+        error_message=None,
+    )
+    from mediashrink.gui_api import EncodeRunResults
+
+    with patch(
+        "mediaflow.mediashrink_adapter.run_encode_plan",
+        return_value=EncodeRunResults(
+            [fake_result],
+            session_path=tmp_path / ".mediashrink-session.json",
+            resumed_from_session=True,
+            session_status={"success": 1},
+        ),
+    ):
+        results = run_compression(prep, resume=True)
+
+    assert getattr(results, "session_path") == tmp_path / ".mediashrink-session.json"
+    assert getattr(results, "resumed_from_session") is True
+    assert getattr(results, "session_status") == {"success": 1}
+
+
 def test_convert_preparation_payload_maps_stage_updates() -> None:
     payload = ("stage", "benchmarking", "Benchmarking profiles...", 1, 3, "")
 

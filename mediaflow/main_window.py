@@ -74,6 +74,7 @@ from .mediashrink_adapter import (
     prepare_compression,
     prepare_safer_compression,
     prepare_retry_compression,
+    resumable_session_status,
     run_compression,
 )
 from .pipeline import build_pipeline_summary
@@ -164,6 +165,15 @@ class MainWindow(QMainWindow):
         self._last_diagnostics_flush_at: float = 0.0
         self._activity_spinner_idx: int = 0
         self._searching_review_index: int | None = None
+        self._active_encode_jobs: list = []
+        self._encode_file_metrics: dict[str, dict[str, object]] = {}
+        self._current_encode_metric_key: str | None = None
+        self._last_encode_diagnostics: dict[str, object] | None = None
+        self._last_encode_diagnostics_at: float = 0.0
+        self._suppressed_encode_progress_events: int = 0
+        self._compression_session_path: Path | None = None
+        self._compression_resumed_from_session: bool = False
+        self._compression_session_status: dict[str, object] = {}
 
         self._build_widgets(default_source=default_source, default_library=default_library)
         self._build_ui()
@@ -520,9 +530,9 @@ class MainWindow(QMainWindow):
         self.summary_filter_status_label = QLabel("")
         self.summary_filter_status_label.setWordWrap(True)
         self.summary_filter_status_label.setObjectName("muted-label")
-        self.summary_table = QTableWidget(0, 7)
+        self.summary_table = QTableWidget(0, 8)
         self.summary_table.setHorizontalHeaderLabels(
-            ["File", "Status", "Original", "Final", "Saved", "Reason", "Location"]
+            ["File", "Status", "Original", "Final", "Saved", "Time", "Reason", "Location"]
         )
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1437,6 +1447,90 @@ class MainWindow(QMainWindow):
     def _strip_rich(text: str) -> str:
         """Strip Rich markup tags (e.g. [dim], [/white]) from mediashrink output."""
         return re.sub(r'\[/?[^\]]+\]', '', text)
+
+    def _encode_progress_identity(self, current_file: str) -> tuple[str, int | None]:
+        cleaned = display_name_for_ui(self._strip_rich(current_file))
+        lowered = cleaned.lower()
+        for index, job in enumerate(self._active_encode_jobs):
+            source = getattr(job, "source", None)
+            if source is None:
+                continue
+            source_name = display_name_for_ui(Path(source).name)
+            if source_name.lower() == lowered or Path(source).name.lower() in lowered:
+                return source_name, index
+        return cleaned, None
+
+    def _track_encode_file_metric(self, file_name: str, now: float) -> None:
+        if not file_name:
+            return
+        if self._current_encode_metric_key == file_name:
+            metric = self._encode_file_metrics.setdefault(file_name, {"file": file_name, "started_at": now})
+            metric["last_seen_at"] = now
+            return
+        if self._current_encode_metric_key is not None:
+            previous = self._encode_file_metrics.get(self._current_encode_metric_key)
+            if previous is not None and "finished_at" not in previous:
+                previous["finished_at"] = now
+                previous["elapsed_seconds"] = max(0.0, now - float(previous.get("started_at", now)))
+        metric = self._encode_file_metrics.setdefault(file_name, {"file": file_name, "started_at": now})
+        metric.setdefault("started_at", now)
+        metric["last_seen_at"] = now
+        self._current_encode_metric_key = file_name
+
+    def _finalize_encode_metrics_from_results(self) -> None:
+        now = time.monotonic()
+        if self._current_encode_metric_key is not None:
+            metric = self._encode_file_metrics.get(self._current_encode_metric_key)
+            if metric is not None and "finished_at" not in metric:
+                metric["finished_at"] = now
+                metric["elapsed_seconds"] = max(0.0, now - float(metric.get("started_at", now)))
+        for result in self.encode_results:
+            job = getattr(result, "job", None)
+            source = getattr(job, "source", None)
+            if source is None:
+                continue
+            key = display_name_for_ui(Path(source).name)
+            metric = self._encode_file_metrics.setdefault(key, {"file": key})
+            input_bytes = int(getattr(result, "input_size_bytes", 0) or 0)
+            output_bytes = int(getattr(result, "output_size_bytes", 0) or 0)
+            duration = float(getattr(result, "duration_seconds", 0.0) or 0.0)
+            metric.update(
+                source=str(source),
+                output=str(getattr(job, "output", "")),
+                success=bool(getattr(result, "success", False)),
+                skipped=bool(getattr(result, "skipped", False)),
+                input_bytes=input_bytes,
+                output_bytes=output_bytes,
+                saved_bytes=max(input_bytes - output_bytes, 0),
+                elapsed_seconds=duration or metric.get("elapsed_seconds", 0.0),
+                estimated_output_bytes=int(getattr(job, "estimated_output_bytes", 0) or 0),
+            )
+            elapsed = float(metric.get("elapsed_seconds", 0.0) or 0.0)
+            if elapsed > 0 and input_bytes > 0:
+                metric["average_mbps"] = input_bytes / elapsed / 1_048_576
+
+    def _encode_metrics_snapshot(self) -> list[dict[str, object]]:
+        return [dict(metric) for metric in self._encode_file_metrics.values()]
+
+    def _result_metric_line(self, result: object) -> str:
+        job = getattr(result, "job", None)
+        source = getattr(job, "source", None)
+        key = display_name_for_ui(Path(source).name) if source is not None else ""
+        metric = self._encode_file_metrics.get(key, {})
+        elapsed = float(metric.get("elapsed_seconds", 0.0) or getattr(result, "duration_seconds", 0.0) or 0.0)
+        speed = metric.get("average_mbps")
+        if not elapsed:
+            return ""
+        line = f"  time:     {self._format_elapsed(elapsed)}"
+        if isinstance(speed, (int, float)) and speed > 0:
+            line += f" at {speed:.1f} MB/s avg"
+        estimated = int(metric.get("estimated_output_bytes", 0) or 0)
+        actual = int(metric.get("output_bytes", 0) or getattr(result, "output_size_bytes", 0) or 0)
+        if estimated > 0 and actual > 0:
+            delta = actual - estimated
+            sign = "+" if delta >= 0 else "-"
+            line += f" • estimate delta {sign}{self._format_bytes(abs(delta))}"
+        return line
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -2997,6 +3091,19 @@ class MainWindow(QMainWindow):
             "last_known_activity": self._strip_rich(self._current_action),
             "active_diagnostics": self._diagnostics_status_text(),
             "review_snapshot": self._review_diagnostics_snapshot(),
+            "compression": {
+                "session_path": str(self._compression_session_path) if self._compression_session_path else None,
+                "resumed_from_session": self._compression_resumed_from_session,
+                "session_status": self._compression_session_status,
+                "suppressed_progress_events": self._suppressed_encode_progress_events,
+                "normalized_progress": {
+                    "completed_files": self._encode_progress_model.completed_files,
+                    "remaining_files": self._encode_progress_model.remaining_files,
+                    "total_files": self._encode_progress_model.total_files,
+                    "overall_progress": round(self._encode_progress_model.overall_progress, 4),
+                },
+                "file_metrics": self._encode_metrics_snapshot(),
+            },
         }
         failure = {"message": failure_message} if failure_message else None
         try:
@@ -4565,8 +4672,8 @@ class MainWindow(QMainWindow):
         for row_index in range(self.summary_table.rowCount()):
             status = (self.summary_table.item(row_index, 1).text() if self.summary_table.item(row_index, 1) else "")
             retry_ready = (
-                self.summary_table.item(row_index, 5).data(Qt.UserRole)
-                if self.summary_table.item(row_index, 5)
+                self.summary_table.item(row_index, 6).data(Qt.UserRole)
+                if self.summary_table.item(row_index, 6)
                 else False
             )
             hide = False
@@ -4815,10 +4922,12 @@ class MainWindow(QMainWindow):
             self.encode_projection_bar.setFormat("Projected retained size")
 
     def _log_encode_milestones(self, progress: EncodeProgress) -> None:
-        total = progress.completed_files + progress.remaining_files
-        file_name = display_name_for_ui(self._strip_rich(progress.current_file))
-        phase = self._normalize_heartbeat_state(progress.heartbeat_state)
-        bucket = self._progress_bucket(progress.current_file_progress)
+        total = self._encode_progress_model.total_files or (
+            self._encode_progress_model.completed_files + self._encode_progress_model.remaining_files
+        )
+        file_name = self._encode_progress_model.current_file_name or display_name_for_ui(self._strip_rich(progress.current_file))
+        phase = self._encode_progress_model.phase
+        bucket = self._progress_bucket(self._encode_progress_model.current_file_progress)
 
         if file_name != self._last_encode_file:
             self._last_encode_file = file_name
@@ -4834,15 +4943,54 @@ class MainWindow(QMainWindow):
             if 0 < pct < 100:
                 self._append_status(f"{file_name} reached {pct}%.")
 
-        log_key = (progress.completed_files, phase)
+        log_key = (self._encode_progress_model.completed_files, phase)
         if log_key != self._last_encode_log_key:
             self._last_encode_log_key = log_key
             self._append_status(
-                f"Progress update: {progress.completed_files} complete • {progress.remaining_files} remaining • phase {phase.lower()}."
+                f"Progress update: {self._encode_progress_model.completed_files} complete • {self._encode_progress_model.remaining_files} remaining • phase {phase.lower()}."
             )
 
-        if total and progress.completed_files >= total:
+        if total and self._encode_progress_model.completed_files >= total:
             self._append_status("Compression complete.")
+
+    def _record_encode_progress_diagnostics(self, *, file_name: str, phase: str, now: float) -> None:
+        model = self._encode_progress_model
+        snapshot = {
+            "current_file": file_name,
+            "phase": phase,
+            "current_pct": int(model.current_file_progress * 100),
+            "overall_pct": int(model.overall_progress * 100),
+            "completed": model.completed_files,
+            "remaining": model.remaining_files,
+        }
+        previous = self._last_encode_diagnostics
+        should_record = previous is None or now - self._last_encode_diagnostics_at >= 60
+        if previous is not None:
+            should_record = should_record or any(
+                previous.get(key) != snapshot[key]
+                for key in ("current_file", "phase", "current_pct", "overall_pct", "completed", "remaining")
+            )
+        if not should_record:
+            self._suppressed_encode_progress_events += 1
+            return
+        suppressed = self._suppressed_encode_progress_events
+        self._suppressed_encode_progress_events = 0
+        self._last_encode_diagnostics = snapshot
+        self._last_encode_diagnostics_at = now
+        self._diagnostics.record_event(
+            "encode_progress",
+            current_file=file_name,
+            phase=phase,
+            current_file_progress=round(model.current_file_progress, 2),
+            overall_progress=round(model.overall_progress, 2),
+            completed_files=model.completed_files,
+            remaining_files=model.remaining_files,
+            total_files=model.total_files,
+            bytes_processed=model.bytes_processed,
+            total_bytes=model.total_bytes,
+            eta_status=model.eta_status,
+            suppressed_progress_events=suppressed,
+        )
 
     def _start_compression(self) -> None:
         if self.encode_preparation is None:
@@ -4875,6 +5023,14 @@ class MainWindow(QMainWindow):
             self._append_status(
                 f"Skipping {len(missing_sources)} missing file(s) before compression starts."
             )
+        resume_status = resumable_session_status(runnable_preparation)
+        resume_text = ""
+        if resume_status is not None:
+            resume_text = (
+                "\n\nA compatible Mediashrink session was found. Mediaflow will resume remaining work from that session "
+                f"({resume_status.get('completed', 0)} already complete, {resume_status.get('pending', 0)} remaining).\n"
+                f"Session: {resume_status.get('path')}"
+            )
         if self.overwrite.isChecked():
             job_count = len(runnable_preparation.jobs)
             input_size = self._format_bytes(runnable_preparation.selected_input_bytes)
@@ -4886,9 +5042,10 @@ class MainWindow(QMainWindow):
                 f"Estimated output: {projected}\n\n"
                 "WARNING: Originals will be replaced in-place after each successful encode. "
                 "Keep the compression root unchanged during the run."
+                f"{resume_text}"
             )
         else:
-            confirm_msg = "Start compression with the current plan?"
+            confirm_msg = f"Start compression with the current plan?{resume_text}"
         if QMessageBox.question(self, "mediaflow", confirm_msg) != QMessageBox.Yes:
             return
         self.file_progress.setValue(0)
@@ -4898,6 +5055,15 @@ class MainWindow(QMainWindow):
         self._append_status("Starting compression.")
         self._compression_start = time.monotonic()
         self._encode_progress_model.reset()
+        self._active_encode_jobs = list(runnable_preparation.jobs)
+        self._encode_file_metrics = {}
+        self._current_encode_metric_key = None
+        self._last_encode_diagnostics = None
+        self._last_encode_diagnostics_at = 0.0
+        self._suppressed_encode_progress_events = 0
+        self._compression_session_path = None
+        self._compression_resumed_from_session = False
+        self._compression_session_status = {}
         self._last_encode_log_key = (-1, "")
         self._last_encode_bucket = -1
         self._last_encode_file = ""
@@ -4917,11 +5083,12 @@ class MainWindow(QMainWindow):
             jobs=len(runnable_preparation.jobs),
             selected_input_bytes=runnable_preparation.selected_input_bytes,
             selected_estimated_output_bytes=runnable_preparation.selected_estimated_output_bytes,
+            resume_session=resume_status,
             deferred_risky=[str(path) for path in sorted({row.source for row in self._plan_classification.risky_follow_up} - self._runnable_sources())],
         )
         self._flush_runtime_diagnostics()
         self._compression_timer.start()
-        worker = FunctionWorker(run_compression, runnable_preparation)
+        worker = FunctionWorker(run_compression, runnable_preparation, session_path=None, resume=True)
         self._start_worker(worker, self._compression_complete, self._encode_progress)
 
     def _encode_progress(self, progress: object) -> None:
@@ -4930,8 +5097,9 @@ class MainWindow(QMainWindow):
         if self._first_progress_delay is None and self._compression_start > 0:
             self._first_progress_delay = time.monotonic() - self._compression_start
         now = time.monotonic()
-        file_name = display_name_for_ui(self._strip_rich(progress.current_file))
+        file_name, file_index = self._encode_progress_identity(progress.current_file)
         phase = self._normalize_heartbeat_state(progress.heartbeat_state)
+        self._track_encode_file_metric(file_name, now)
         self._encode_progress_model.update_from_progress(
             current_file_name=file_name,
             phase=phase,
@@ -4942,32 +5110,31 @@ class MainWindow(QMainWindow):
             bytes_processed=int(getattr(progress, "bytes_processed", 0) or 0),
             total_bytes=int(getattr(progress, "total_bytes", 0) or 0),
             now=now,
+            total_files=len(self._active_encode_jobs) or None,
+            current_file_index=file_index,
         )
         self._encode_progress_model.tick(now, now - self._compression_start)
         self.file_progress.setValue(int(self._encode_progress_model.displayed_file_progress * 100))
         self.overall_progress.setValue(int(self._encode_progress_model.overall_progress * 100))
-        total = progress.completed_files + progress.remaining_files
-        self.run_stats_label.setText(f"Files: {progress.completed_files} done / {total} total")
+        total = self._encode_progress_model.total_files or (
+            self._encode_progress_model.completed_files + self._encode_progress_model.remaining_files
+        )
+        self.run_stats_label.setText(f"Files: {self._encode_progress_model.completed_files} done / {total} total")
         self._set_current_action(
-            f"{file_name}\nCompleted: {progress.completed_files}  |  Remaining: {progress.remaining_files}  |  Phase: {phase}"
+            f"{file_name}\nCompleted: {self._encode_progress_model.completed_files}  |  "
+            f"Remaining: {self._encode_progress_model.remaining_files}  |  Phase: {phase}"
         )
-        self._diagnostics.record_event(
-            "encode_progress",
-            current_file=file_name,
-            phase=phase,
-            current_file_progress=round(progress.current_file_progress, 2),
-            overall_progress=round(progress.overall_progress, 2),
-            completed_files=progress.completed_files,
-            remaining_files=progress.remaining_files,
-            bytes_processed=int(getattr(progress, "bytes_processed", 0) or 0),
-            total_bytes=getattr(progress, "total_bytes", 0),
-        )
+        self._record_encode_progress_diagnostics(file_name=file_name, phase=phase, now=now)
         self._update_encode_dashboard(progress)
         self._log_encode_milestones(progress)
 
     def _compression_complete(self, results: list) -> None:
         self._compression_timer.stop()
+        self._compression_session_path = getattr(results, "session_path", None)
+        self._compression_resumed_from_session = bool(getattr(results, "resumed_from_session", False))
+        self._compression_session_status = dict(getattr(results, "session_status", {}) or {})
         self.encode_results = list(results)
+        self._finalize_encode_metrics_from_results()
         self._complete_action("Compression stage complete")
         self._set_current_action("Compression finished")
         missing_count = 0
@@ -4985,6 +5152,11 @@ class MainWindow(QMainWindow):
             failed=sum(1 for row in build_encode_result_rows(self.encode_results) if row.is_failed),
             skipped=sum(1 for row in build_encode_result_rows(self.encode_results) if row.is_skipped),
             retry_sources=[str(path) for path in sorted(self._retry_sources)],
+            session_path=str(self._compression_session_path) if self._compression_session_path else None,
+            resumed_from_session=self._compression_resumed_from_session,
+            session_status=self._compression_session_status,
+            suppressed_progress_events=self._suppressed_encode_progress_events,
+            file_metrics=self._encode_metrics_snapshot(),
         )
         self._append_status("Compression stage complete.")
         self._update_encode_dashboard(None)
@@ -5036,16 +5208,16 @@ class MainWindow(QMainWindow):
 
         if self._encode_progress_model.eta_seconds is not None:
             eta = self._encode_progress_model.eta_seconds
-            self.eta_label.setText(f"ETA: {self._format_elapsed(eta)}")
+            self.eta_label.setText(f"ETA: {self._format_elapsed(eta)} ({self._encode_progress_model.eta_status})")
             if self._encode_progress_model.speed_mbps is not None:
                 self.encode_speed_label.setText(f"~{self._encode_progress_model.speed_mbps:.1f} MB/s")
             self.encode_counts_label.setText(
                 f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA {self._format_elapsed(eta)}"
             )
         else:
-            self.eta_label.setText("ETA: settling...")
+            self.eta_label.setText(f"ETA: settling - {self._encode_progress_model.eta_status}")
             self.encode_counts_label.setText(
-                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA settling"
+                f"{self.run_stats_label.text()} • Elapsed {self._format_elapsed(elapsed)} • ETA settling - {self._encode_progress_model.eta_status}"
             )
 
     def _tick_preparation(self) -> None:
@@ -5121,6 +5293,8 @@ class MainWindow(QMainWindow):
             lines.append(f"Diagnostics:     {self._last_diagnostics_path}")
         elif self._last_diagnostics_error:
             lines.append(f"Diagnostics:     {self._last_diagnostics_error}")
+        if self._compression_session_path is not None:
+            lines.append(f"Resume session:  {self._compression_session_path}")
 
         self.summary_overview_label.setText("\n".join(lines))
         if self._last_diagnostics_path is not None:
@@ -5165,18 +5339,25 @@ class MainWindow(QMainWindow):
                 saved_str = f"{self._format_bytes(result.saved_bytes)} ({pct:.1f}%)"
             else:
                 saved_str = ""
+            metric = self._encode_file_metrics.get(result.display_name, {})
+            elapsed = float(metric.get("elapsed_seconds", 0.0) or 0.0)
+            avg_speed = metric.get("average_mbps")
+            time_str = self._format_elapsed(elapsed) if elapsed > 0 else ""
+            if isinstance(avg_speed, (int, float)) and avg_speed > 0:
+                time_str = f"{time_str} ({avg_speed:.1f} MB/s)"
             values = [
                 result.display_name,
                 result.status,
                 orig,
                 final,
                 saved_str,
+                time_str,
                 result.reason,
                 str(result.source),
             ]
             for col, val in enumerate(values):
                 cell = QTableWidgetItem(val)
-                if col == 5:
+                if col == 6:
                     cell.setData(Qt.UserRole, result.retry_ready)
                     if result.raw_reason and result.raw_reason != result.reason:
                         cell.setToolTip(f"{result.reason}\n\nRaw detail:\n{result.raw_reason}")
@@ -5258,6 +5439,9 @@ class MainWindow(QMainWindow):
                         size_line = "  encoded"
                     details.append(f"- {display_name_for_ui(result.job.source.name)}")
                     details.append(size_line)
+                    metric_line = self._result_metric_line(result)
+                    if metric_line:
+                        details.append(metric_line)
                     if profile_name:
                         details.append(f"  profile:  {profile_name}")
                     details.append(f"  location: {result.job.source}")

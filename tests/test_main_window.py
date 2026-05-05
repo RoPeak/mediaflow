@@ -520,6 +520,60 @@ def test_progress_model_does_not_lose_current_file_progress_between_ticks() -> N
     assert window.overall_progress.value() == 25
 
 
+def test_encode_progress_uses_normalized_counts_when_raw_counts_stall() -> None:
+    _app()
+    window = MainWindow()
+    first = SimpleNamespace(source=Path("/tmp/first.mkv"))
+    second = SimpleNamespace(source=Path("/tmp/second.mkv"))
+    window._active_encode_jobs = [first, second]
+    window._compression_start = 1.0
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+        window._encode_progress(
+            EncodeProgress(
+                current_file="Current file (Primary batch): second.mkv",
+                current_file_progress=0.10,
+                overall_progress=0.55,
+                completed_files=0,
+                remaining_files=2,
+                bytes_processed=550,
+                total_bytes=1000,
+                heartbeat_state="active",
+            )
+        )
+
+    assert "Files: 1 done / 2 total" in window.run_stats_label.text()
+    assert "Completed: 1" in window.current_action_label.text()
+    assert "Remaining: 1" in window.current_action_label.text()
+
+
+def test_encode_progress_diagnostics_are_compacted() -> None:
+    _app()
+    window = MainWindow()
+    window._active_encode_jobs = [SimpleNamespace(source=Path("/tmp/movie.mkv"))]
+    window._compression_start = 1.0
+    progress = EncodeProgress(
+        current_file="movie.mkv",
+        current_file_progress=0.10,
+        overall_progress=0.10,
+        completed_files=0,
+        remaining_files=1,
+        bytes_processed=100,
+        total_bytes=1000,
+        heartbeat_state="active",
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+        window._encode_progress(progress)
+        window._encode_progress(progress)
+
+    progress_events = [event for event in window._diagnostics.events if event["kind"] == "encode_progress"]
+    assert len(progress_events) == 1
+    assert window._suppressed_encode_progress_events == 1
+
+
 def test_encode_progress_cleans_display_name_and_shows_eta_settling() -> None:
     _app()
     window = MainWindow()
@@ -543,6 +597,57 @@ def test_encode_progress_cleans_display_name_and_shows_eta_settling() -> None:
     assert "In progress:" not in window.encode_filename_label.text()
     assert "Unknown Year" not in window.encode_filename_label.text()
     assert "settling" in window.eta_label.text().lower()
+
+
+def test_compression_complete_records_session_and_file_metrics(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    job = SimpleNamespace(source=source, output=source, estimated_output_bytes=40)
+    result = SimpleNamespace(
+        job=job,
+        skipped=False,
+        success=True,
+        input_size_bytes=100,
+        output_size_bytes=50,
+        duration_seconds=5.0,
+        error_message=None,
+    )
+    from mediashrink.gui_api import EncodeRunResults
+
+    results = EncodeRunResults(
+        [result],
+        session_path=tmp_path / ".mediashrink-session.json",
+        resumed_from_session=True,
+        session_status={"success": 1},
+    )
+    window.encode_preparation = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[job],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=40,
+        estimated_total_seconds=5.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_complete(results)
+
+    assert window._compression_resumed_from_session is True
+    assert window._compression_session_status == {"success": 1}
+    assert window._encode_file_metrics["movie.mkv"]["average_mbps"] > 0
+    assert "time:" in window.summary_log.toPlainText()
 
 
 def test_preparing_compression_uses_preparing_view() -> None:

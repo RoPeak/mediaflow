@@ -134,6 +134,76 @@ def test_encode_progress_model_produces_eta_once_history_is_stable() -> None:
     assert model.eta_confident is True
 
 
+def test_encode_progress_model_normalizes_stale_file_counts_from_current_index() -> None:
+    model = EncodeProgressModel()
+
+    model.update_from_progress(
+        current_file_name="first.mkv",
+        phase="Encoding",
+        current_file_progress=0.50,
+        overall_progress=0.10,
+        completed_files=0,
+        remaining_files=3,
+        bytes_processed=100,
+        total_bytes=1000,
+        now=1.0,
+        total_files=3,
+        current_file_index=0,
+    )
+    model.update_from_progress(
+        current_file_name="second.mkv",
+        phase="Encoding",
+        current_file_progress=0.05,
+        overall_progress=0.35,
+        completed_files=0,
+        remaining_files=3,
+        bytes_processed=350,
+        total_bytes=1000,
+        now=2.0,
+        total_files=3,
+        current_file_index=1,
+    )
+    model.update_from_progress(
+        current_file_name="second.mkv",
+        phase="Encoding",
+        current_file_progress=0.10,
+        overall_progress=0.36,
+        completed_files=0,
+        remaining_files=3,
+        bytes_processed=360,
+        total_bytes=1000,
+        now=3.0,
+        total_files=3,
+        current_file_index=1,
+    )
+
+    assert model.completed_files == 1
+    assert model.remaining_files == 2
+
+
+def test_encode_progress_model_uses_completed_file_fallback_for_eta() -> None:
+    model = EncodeProgressModel()
+    for now, processed in [(1.0, 100), (20.0, 100), (50.0, 100), (80.0, 100)]:
+        model.update_from_progress(
+            current_file_name="second.mkv",
+            phase="Encoding",
+            current_file_progress=0.02,
+            overall_progress=0.10,
+            completed_files=1,
+            remaining_files=9,
+            bytes_processed=processed,
+            total_bytes=1000,
+            now=now,
+            total_files=10,
+            current_file_index=1,
+        )
+
+    model.tick(80.0, 79.0)
+
+    assert model.eta_seconds is not None
+    assert model.eta_status == "estimated from batch progress"
+
+
 def test_apply_progress_model_tracks_current_and_completed_counts() -> None:
     model = ApplyProgressModel()
 
