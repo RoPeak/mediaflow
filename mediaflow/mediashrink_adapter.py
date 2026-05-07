@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -29,6 +30,7 @@ from .callback_types import PreparationProgress, PreparationStageUpdate
 def prepare_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
+    source_paths: Collection[Path] | None = None,
 ) -> EncodePreparation:
     preparation = prepare_encode_run(
         directory=config.compression_root,
@@ -39,6 +41,7 @@ def prepare_compression(
         on_file_failure=config.shrink.on_file_failure,
         use_calibration=config.shrink.use_calibration,
         duplicate_policy=config.shrink.duplicate_policy,
+        source_paths=source_paths,
         progress_callback=(
             (lambda payload: progress_callback(_convert_preparation_payload(payload)))
             if progress_callback is not None
@@ -149,7 +152,11 @@ def prepare_retry_compression(
             duplicate_policy="prefer-mkv",
         ),
     )
-    preparation = prepare_compression(retry_config, progress_callback=progress_callback)
+    preparation = prepare_compression(
+        retry_config,
+        progress_callback=progress_callback,
+        source_paths=retry_sources,
+    )
     filtered = _filter_preparation_to_sources(preparation, retry_sources)
     extra_messages = list(filtered.stage_messages or [])
     extra_messages.append(

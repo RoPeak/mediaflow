@@ -178,6 +178,28 @@ def test_prepare_retry_compression_filters_to_requested_sources(tmp_path: Path) 
     assert retry.stage_messages is not None
 
 
+def test_prepare_compression_passes_source_allowlist_to_mediashrink(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+    selected = {tmp_path / "movie.mkv"}
+    prep = _preparation(tmp_path, [])
+    captured: dict[str, object] = {}
+
+    def fake_prepare_encode_run(**kwargs):
+        captured.update(kwargs)
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", side_effect=fake_prepare_encode_run):
+        result = prepare_compression(config, source_paths=selected)
+
+    assert result is prep
+    assert captured["source_paths"] == selected
+
+
 def test_prepare_compression_falls_back_to_safest_runnable_profile(tmp_path: Path) -> None:
     source = tmp_path / "movie.mkv"
     source.write_bytes(b"x")

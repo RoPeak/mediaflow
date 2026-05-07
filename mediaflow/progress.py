@@ -246,6 +246,22 @@ class EncodeProgressModel:
         self.total_files = 0
         self._history.clear()
 
+    def mark_complete(self, *, total_files: int | None = None, now: float | None = None) -> None:
+        total = max(self.total_files, total_files or 0, self.completed_files + self.remaining_files)
+        self.total_files = total
+        self.completed_files = total
+        self.remaining_files = 0
+        self.current_file_progress = 1.0 if total else self.current_file_progress
+        self.displayed_file_progress = self.current_file_progress
+        self.overall_progress = 1.0 if total else self.overall_progress
+        self.eta_seconds = 0.0
+        self.eta_confident = True
+        self.eta_status = "complete"
+        self.phase = "Complete"
+        if now is not None and self.total_bytes > 0:
+            self.bytes_processed = max(self.bytes_processed, self.total_bytes)
+            self._history.append((now, self.bytes_processed))
+
     def update_from_progress(
         self,
         *,

@@ -24,6 +24,7 @@ def _app() -> QApplication:
 def _isolate_persisted_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("mediaflow.main_window.load_ui_state", lambda: {})
     monkeypatch.setattr("mediaflow.main_window.save_ui_state", lambda _payload: None)
+    monkeypatch.setattr("mediaflow.main_window.MainWindow._diagnostics_directory_path", lambda _self: tmp_path)
 
     def _fake_write(self, *, base_dir=None, summary=None, failure=None):
         self.written_path = tmp_path / "run.json"
@@ -361,6 +362,61 @@ def test_guided_pipeline_resets_filters_to_defaults(monkeypatch, tmp_path: Path)
     assert window.compression_filter_combo.currentText() == "All plan items"
 
 
+def test_guided_apply_prepares_compression_for_current_organised_batch(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    destination = tmp_path / "library" / "Movie (2020).mkv"
+    destination.parent.mkdir()
+    destination.write_bytes(b"x")
+    window.compression_root_input.setText(str(tmp_path / "library"))
+    window._guided_mode = True
+    window._continue_to_compress = True
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(window, "_guided_compression_can_continue", lambda: True)
+    monkeypatch.setattr(
+        window,
+        "_start_compression_preparation",
+        lambda status, **kwargs: captured.update({"status": status, **kwargs}),
+    )
+    result = SimpleNamespace(
+        result=SimpleNamespace(moved=[SimpleNamespace(destination=destination)], skipped=[], errors=[]),
+        warnings=[],
+        summary_lines=[],
+    )
+
+    window._apply_complete(result)
+
+    assert captured["scope"] == "guided-organised-batch"
+    assert captured["source_paths"] == [destination]
+    assert destination.resolve(strict=False) in window._guided_batch_paths
+
+
+def test_guided_apply_falls_back_to_root_when_batch_destinations_missing(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    window.compression_root_input.setText(str(tmp_path))
+    window._guided_mode = True
+    window._continue_to_compress = True
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(window, "_guided_compression_can_continue", lambda: True)
+    monkeypatch.setattr(
+        window,
+        "_start_compression_preparation",
+        lambda status, **kwargs: captured.update({"status": status, **kwargs}),
+    )
+    result = SimpleNamespace(
+        result=SimpleNamespace(moved=[], skipped=[], errors=[]),
+        warnings=[],
+        summary_lines=[],
+    )
+
+    window._apply_complete(result)
+
+    assert captured["scope"] == "guided-root-fallback"
+    assert captured["source_paths"] is None
+    assert "falling back" in window._compression_scope_warning
+
+
 def test_review_filter_banner_explains_hidden_rows() -> None:
     _app()
     window = MainWindow()
@@ -646,7 +702,14 @@ def test_compression_complete_records_session_and_file_metrics(tmp_path: Path) -
 
     assert window._compression_resumed_from_session is True
     assert window._compression_session_status == {"success": 1}
+    assert window._encode_progress_model.completed_files == 1
+    assert window._encode_progress_model.remaining_files == 0
+    assert window._encode_progress_model.overall_progress == 1.0
     assert window._encode_file_metrics["movie.mkv"]["average_mbps"] > 0
+    assert window._overwrite_audit_manifest_path is not None
+    assert window._overwrite_audit_manifest_path.exists()
+    assert "Compression session:" in window.summary_overview_label.text()
+    assert "Overwrite audit manifest:" in window.summary_log.toPlainText()
     assert "time:" in window.summary_log.toPlainText()
 
 
