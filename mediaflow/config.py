@@ -29,6 +29,8 @@ class ShrinkSettings:
     on_file_failure: str = "retry"
     use_calibration: bool = True
     duplicate_policy: str = "prefer-mkv"
+    quarantine_originals: bool = True
+    quarantine_retention_days: int = 14
 
 
 @dataclass(frozen=True)

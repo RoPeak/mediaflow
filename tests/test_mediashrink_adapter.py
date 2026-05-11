@@ -10,6 +10,7 @@ from mediashrink.models import EncodeJob
 from mediaflow.callback_types import PreparationProgress, PreparationStageUpdate
 from mediaflow.mediashrink_adapter import (
     _convert_preparation_payload,
+    incomplete_session_status,
     missing_job_sources,
     prepare_compression,
     prepare_retry_compression,
@@ -108,13 +109,106 @@ def test_run_compression_preserves_session_metadata(tmp_path: Path) -> None:
             session_path=tmp_path / ".mediashrink-session.json",
             resumed_from_session=True,
             session_status={"success": 1},
+            stopped_early=True,
+            interrupted=True,
         ),
-    ):
-        results = run_compression(prep, resume=True)
+    ) as run_encode_plan:
+        def cancel_callback() -> bool:
+            return False
+
+        results = run_compression(prep, resume=True, cancel_callback=cancel_callback)
 
     assert getattr(results, "session_path") == tmp_path / ".mediashrink-session.json"
     assert getattr(results, "resumed_from_session") is True
     assert getattr(results, "session_status") == {"success": 1}
+    assert getattr(results, "stopped_early") is True
+    assert getattr(results, "interrupted") is True
+    assert run_encode_plan.call_args.kwargs["cancel_callback"] is cancel_callback
+
+
+def test_incomplete_session_status_reports_retryable_counts(tmp_path: Path) -> None:
+    from mediashrink.session import build_session, get_session_path, save_session, update_session_entry
+
+    first = _job(tmp_path, "done.mkv")
+    second = _job(tmp_path, "retry.mkv")
+    for job in (first, second):
+        job.source.write_bytes(b"x")
+    session = build_session(
+        tmp_path,
+        "faster",
+        22,
+        overwrite=True,
+        output_dir=None,
+        jobs=[first, second],
+    )
+    update_session_entry(session, first.source, status="success", output=first.output)
+    update_session_entry(
+        session,
+        second.source,
+        status="failed",
+        error="boom",
+        last_progress_pct=12.5,
+        last_progress_at="2026-05-07T09:00:00",
+    )
+    save_session(session, get_session_path(tmp_path, None))
+
+    status = incomplete_session_status(tmp_path)
+
+    assert status is not None
+    assert status["completed"] == 1
+    assert status["pending"] == 1
+    assert status["current_file"] == str(second.source)
+    assert status["source_paths"] == [str(first.source), str(second.source)]
+
+
+def test_incomplete_session_status_filters_to_prepared_source_set(tmp_path: Path) -> None:
+    from mediashrink.session import build_session, get_session_path, save_session, update_session_entry
+
+    first = _job(tmp_path, "first.mkv")
+    second = _job(tmp_path, "second.mkv")
+    for job in (first, second):
+        job.source.write_bytes(b"x")
+    session = build_session(
+        tmp_path,
+        "faster",
+        22,
+        overwrite=True,
+        output_dir=None,
+        jobs=[first, second],
+    )
+    update_session_entry(session, first.source, status="failed", error="old root run")
+    update_session_entry(session, second.source, status="pending")
+    save_session(session, get_session_path(tmp_path, None))
+
+    status = incomplete_session_status(tmp_path, source_paths={second.source})
+
+    assert status is not None
+    assert status["pending"] == 1
+    assert status["current_file"] == str(second.source)
+    assert status["source_paths"] == [str(second.source)]
+
+
+def test_incomplete_session_status_ignores_unrelated_prepared_plan(tmp_path: Path) -> None:
+    from mediashrink.session import build_session, get_session_path, save_session, update_session_entry
+
+    session_job = _job(tmp_path, "session.mkv")
+    planned_job = _job(tmp_path, "planned.mkv")
+    for job in (session_job, planned_job):
+        job.source.write_bytes(b"x")
+    session = build_session(
+        tmp_path,
+        "faster",
+        22,
+        overwrite=True,
+        output_dir=None,
+        jobs=[session_job],
+    )
+    update_session_entry(session, session_job.source, status="failed", error="old root run")
+    save_session(session, get_session_path(tmp_path, None))
+
+    status = incomplete_session_status(tmp_path, source_paths={planned_job.source})
+
+    assert status is None
 
 
 def test_convert_preparation_payload_maps_stage_updates() -> None:

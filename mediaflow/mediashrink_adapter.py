@@ -20,7 +20,7 @@ from mediashrink.gui_api import (
 )
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 from mediashrink.scanner import build_jobs
-from mediashrink.session import find_resumable_session, get_session_path
+from mediashrink.session import find_resumable_session, get_session_path, load_session
 from mediashrink.wizard import prepare_profile_planning
 
 from .config import PipelineConfig
@@ -103,11 +103,61 @@ def resumable_session_status(preparation: EncodePreparation) -> dict[str, object
     }
 
 
+def session_path_for_preparation(preparation: EncodePreparation) -> Path:
+    return get_session_path(preparation.directory, None)
+
+
+def incomplete_session_status(
+    directory: Path,
+    source_paths: Collection[Path] | None = None,
+) -> dict[str, object] | None:
+    path = get_session_path(directory, None)
+    session = load_session(path)
+    if session is None:
+        return None
+    requested_sources = (
+        {str(Path(path).resolve(strict=False)) for path in source_paths}
+        if source_paths is not None
+        else None
+    )
+    relevant_entries = [
+        entry
+        for entry in session.entries
+        if requested_sources is None or str(Path(entry.source).resolve(strict=False)) in requested_sources
+    ]
+    if not relevant_entries:
+        return None
+    counts: dict[str, int] = {}
+    for entry in relevant_entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+    pending = counts.get("pending", 0) + counts.get("failed", 0) + counts.get("in_progress", 0)
+    if pending <= 0:
+        return None
+    current = next((entry for entry in relevant_entries if entry.status in {"failed", "in_progress"}), None)
+    if current is None:
+        current = next((entry for entry in relevant_entries if entry.status == "pending"), None)
+    return {
+        "path": str(path),
+        "counts": counts,
+        "completed": counts.get("success", 0),
+        "pending": pending,
+        "source_paths": [entry.source for entry in relevant_entries],
+        "current_file": current.source if current is not None else None,
+        "last_progress_pct": getattr(current, "last_progress_pct", None) if current is not None else None,
+        "last_progress_at": getattr(current, "last_progress_at", None) if current is not None else None,
+        "compatible_with_source_paths": requested_sources is not None,
+    }
+
+
 def run_compression(
     preparation: EncodePreparation,
     progress_callback: Callable[[object], None] | None = None,
     session_path: Path | None = None,
     resume: bool = False,
+    cancel_callback: Callable[[], bool] | None = None,
+    quarantine_originals: bool = False,
+    quarantine_dir: Path | None = None,
+    quarantine_retention_days: int | None = None,
 ) -> list[EncodeResult]:
     missing_results: list[EncodeResult] = []
     runnable_jobs: list[EncodeJob] = []
@@ -128,12 +178,19 @@ def run_compression(
         use_calibration=preparation.use_calibration,
         session_path=session_path,
         resume=resume,
+        cancel_callback=cancel_callback,
+        stop_mode="graceful",
+        quarantine_originals=quarantine_originals,
+        quarantine_dir=quarantine_dir,
+        quarantine_retention_days=quarantine_retention_days,
     )
     return EncodeRunResults(
         missing_results + list(results),
         session_path=getattr(results, "session_path", session_path),
         resumed_from_session=bool(getattr(results, "resumed_from_session", False)),
         session_status=dict(getattr(results, "session_status", {}) or {}),
+        stopped_early=bool(getattr(results, "stopped_early", False)),
+        interrupted=bool(getattr(results, "interrupted", False)),
     )
 
 

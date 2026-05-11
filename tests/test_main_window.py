@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QHeaderView
 
 from mediaflow.main_window import MainWindow
 from mediaflow.callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
@@ -630,7 +630,7 @@ def test_encode_progress_diagnostics_are_compacted() -> None:
     assert window._suppressed_encode_progress_events == 1
 
 
-def test_encode_progress_cleans_display_name_and_shows_eta_settling() -> None:
+def test_encode_progress_cleans_display_name_and_shows_eta_collecting_samples() -> None:
     _app()
     window = MainWindow()
     progress = EncodeProgress(
@@ -652,7 +652,104 @@ def test_encode_progress_cleans_display_name_and_shows_eta_settling() -> None:
 
     assert "In progress:" not in window.encode_filename_label.text()
     assert "Unknown Year" not in window.encode_filename_label.text()
-    assert "settling" in window.eta_label.text().lower()
+    assert "collecting samples" in window.eta_label.text().lower()
+
+
+def test_compression_tick_throttles_live_counts_detail_text() -> None:
+    _app()
+    window = MainWindow()
+    window._active_encode_jobs = [SimpleNamespace(source=Path("/tmp/movie.mkv"))]
+    window._compression_start = 0.0
+    progress = EncodeProgress(
+        current_file="movie.mkv",
+        current_file_progress=0.10,
+        overall_progress=0.10,
+        completed_files=0,
+        remaining_files=1,
+        bytes_processed=100,
+        total_bytes=1000,
+        heartbeat_state="active",
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+        window._encode_progress(progress)
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 13.0)
+        window._tick_compression()
+        first_detail = window.encode_counts_label.text()
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 14.0)
+        window._tick_compression()
+        throttled_detail = window.encode_counts_label.text()
+        mp.setattr("mediaflow.main_window.time.monotonic", lambda: 34.0)
+        window._tick_compression()
+
+    assert "Elapsed 13s" in first_detail
+    assert throttled_detail == first_detail
+    assert "Elapsed 34s" in window.encode_counts_label.text()
+
+
+def test_start_compression_records_session_before_worker(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    job = SimpleNamespace(source=item_source, preset="faster", crf=22)
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[job],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(window, "_confirm_compression_start", lambda **_kwargs: True)
+    monkeypatch.setattr(window, "_start_worker", lambda worker, *_args: captured.update({"worker": worker}))
+
+    window._compression_prepared(prep)
+    window._start_compression()
+
+    worker = captured["worker"]
+    assert window._compression_session_path == tmp_path / ".mediashrink-session.json"
+    assert worker.kwargs["session_path"] == window._compression_session_path
+    assert worker.kwargs["cancel_callback"]() is False
+    assert window._diagnostics.events[-1]["kind"] == "compression_started"
+    assert window._diagnostics.events[-1]["session_path"] == str(window._compression_session_path)
+
+
+def test_stop_compression_requests_graceful_cancel(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    window._compression_session_path = tmp_path / ".mediashrink-session.json"
+    window._set_state(WorkflowState.COMPRESSING)
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+
+    window._request_compression_stop()
+
+    assert window._compression_stop_requested is True
+    assert window._compression_cancel_requested() is True
+    assert "Stopping after current FFmpeg process" in window.current_action_label.text()
+    assert window._diagnostics.events[-1]["kind"] == "compression_stop_requested"
 
 
 def test_compression_complete_records_session_and_file_metrics(tmp_path: Path) -> None:
@@ -711,6 +808,58 @@ def test_compression_complete_records_session_and_file_metrics(tmp_path: Path) -
     assert "Compression session:" in window.summary_overview_label.text()
     assert "Overwrite audit manifest:" in window.summary_log.toPlainText()
     assert "time:" in window.summary_log.toPlainText()
+
+
+def test_interrupted_compression_uses_attention_summary(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    job = SimpleNamespace(source=source, output=source, estimated_output_bytes=40)
+    result = SimpleNamespace(
+        job=job,
+        skipped=False,
+        success=False,
+        input_size_bytes=100,
+        output_size_bytes=0,
+        duration_seconds=2.0,
+        error_message="Stopped by user",
+    )
+    from mediashrink.gui_api import EncodeRunResults
+
+    results = EncodeRunResults(
+        [result],
+        session_path=tmp_path / ".mediashrink-session.json",
+        session_status={"pending": 1},
+        stopped_early=True,
+        interrupted=True,
+    )
+    window.encode_preparation = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[job],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=40,
+        estimated_total_seconds=5.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_complete(results)
+
+    assert window.summary_headline_label.text() == "Compression interrupted"
+    assert "remaining jobs can be resumed" in window.current_action_label.text().lower()
+    assert "Completed files remain replaced" in window.summary_log.toPlainText()
+    assert any(event["kind"] == "compression_interrupted" for event in window._diagnostics.events)
 
 
 def test_preparing_compression_uses_preparing_view() -> None:
@@ -922,6 +1071,9 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     window = MainWindow()
     monkeypatch.setattr(window, "_diagnostics_directory_path", lambda: tmp_path)
     monkeypatch.setattr(window, "_flush_runtime_diagnostics", lambda: None)
+    session_path = tmp_path / ".mediashrink-session.json"
+    session_path.write_text('{"entries": []}', encoding="utf-8")
+    window._compression_session_path = session_path
 
     window._create_diagnostics_bundle()
 
@@ -930,6 +1082,7 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     with zipfile.ZipFile(bundles[0]) as archive:
         names = archive.namelist()
     assert any(name.startswith("mediaflow-review-snapshot-") for name in names)
+    assert ".mediashrink-session.json" in names
 
 
 def test_bypass_blocked_organisation_prepares_compression_from_source_when_linked(monkeypatch, tmp_path: Path) -> None:
@@ -1252,3 +1405,135 @@ def test_missing_file_error_is_translated_for_users() -> None:
 
     assert "planned compression file is missing" in summary.lower()
     assert "Point Break" in summary
+
+
+def test_major_tables_use_interactive_resizable_headers() -> None:
+    _app()
+    window = MainWindow()
+
+    for table in (window.review_table, window.candidate_table, window.compression_table, window.summary_table):
+        header = table.horizontalHeader()
+        assert header.sectionResizeMode(0) == QHeaderView.Interactive
+        assert header.sectionsMovable() is True
+
+
+def test_persisted_table_widths_restore(monkeypatch) -> None:
+    saved_state = {
+        "table_layouts": {
+            "version": 1,
+            "tables": {
+                "review": {
+                    "widths": [321, 70, 180, 115, 190, 90, 240],
+                    "visual_order": [0, 1, 2, 3, 4, 5, 6],
+                }
+            },
+        }
+    }
+    monkeypatch.setattr("mediaflow.main_window.load_ui_state", lambda: saved_state)
+
+    _app()
+    window = MainWindow()
+
+    assert window.review_table.columnWidth(0) == 321
+
+
+def test_review_cells_expose_full_value_tooltips() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(
+            path=Path("/tmp/very-long-source-name-that-would-be-truncated.mkv"),
+            media_type="movie",
+            title="Very Long Movie Title That Needs A Tooltip",
+            season=None,
+            episode=None,
+        ),
+        manual_candidate=None,
+        selected_candidate=SimpleNamespace(title="Very Long Movie Title That Needs A Tooltip", year=2020),
+        selected_candidate_index=0,
+        candidates=[],
+        decision_status="accepted",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning="subtitle missing from candidate",
+        cache_context="search result",
+        auto_selectable=False,
+        status_label="accepted",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    window._populate_review_table()
+
+    assert "very-long-source-name" in window.review_table.item(0, 0).toolTip()
+    assert "subtitle missing" in window.review_table.item(0, 6).toolTip()
+
+
+def test_compression_ordering_can_sort_runnable_jobs_by_savings(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    small = tmp_path / "small.mkv"
+    large = tmp_path / "large.mkv"
+    small.write_bytes(b"x")
+    large.write_bytes(b"x")
+    small_job = SimpleNamespace(source=small)
+    large_job = SimpleNamespace(source=large)
+    window._compression_plan_rows = [
+        SimpleNamespace(source=small, selected=True, exists=True, classification="recommended", estimated_output_bytes=100, estimated_savings_bytes=10),
+        SimpleNamespace(source=large, selected=True, exists=True, classification="recommended", estimated_output_bytes=100, estimated_savings_bytes=500),
+    ]
+    prep = SimpleNamespace(jobs=[small_job, large_job])
+
+    window._set_combo_value(window.compression_order_combo, "Largest savings first")
+
+    assert window._runnable_jobs(prep) == [large_job, small_job]
+
+
+def test_review_duration_stops_when_pipeline_leaves_review(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/movie.mkv"), title="Movie"),
+        status_label="accepted",
+        decision_status="accepted",
+        preview_block_reason=None,
+        warning=None,
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    monkeypatch.setattr("mediaflow.main_window.time.monotonic", lambda: 10.0)
+    window._start_review_item_timer(0)
+    monkeypatch.setattr("mediaflow.main_window.time.monotonic", lambda: 25.0)
+    window._set_state(WorkflowState.PREPARING_COMPRESSION)
+    snapshot = window._review_duration_snapshot()
+
+    assert snapshot[0]["duration_seconds"] == 15.0
+
+
+def test_quarantine_restore_moves_current_output_aside_and_restores_original(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    output = tmp_path / "movie.mkv"
+    quarantine = tmp_path / "quarantine" / "movie.original.mkv"
+    quarantine.parent.mkdir()
+    output.write_bytes(b"encoded")
+    quarantine.write_bytes(b"original")
+    audit = tmp_path / "audit.json"
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.information", lambda *_args, **_kwargs: None)
+
+    window._perform_quarantine_restore(
+        {
+            "output_path": str(output),
+            "quarantine_path": str(quarantine),
+        },
+        audit_path=audit,
+    )
+
+    assert output.read_bytes() == b"original"
+    recovery_files = list(tmp_path.glob("movie.mkv.mediaflow-replaced-*"))
+    assert len(recovery_files) == 1
+    assert recovery_files[0].read_bytes() == b"encoded"
+    assert any(event["kind"] == "quarantine_restore_completed" for event in window._diagnostics.events)
