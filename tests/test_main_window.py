@@ -3,6 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 
@@ -48,6 +49,7 @@ def test_initial_window_state_guides_user_through_setup() -> None:
     assert "compression root" in window.setup_summary_label.text().lower()
     assert "Diagnostics:" in window.diagnostics_path_label.text()
     assert window.font().pointSizeF() > 0
+    assert window.title_group_button.text() == "Apply To Filename Show Group"
 
 
 def test_library_path_updates_compression_root_while_linked() -> None:
@@ -362,6 +364,64 @@ def test_guided_pipeline_resets_filters_to_defaults(monkeypatch, tmp_path: Path)
     assert window.compression_filter_combo.currentText() == "All plan items"
 
 
+def test_guided_preflight_surfaces_scoped_compression_capability_warning(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow(default_source=tmp_path / "source", default_library=tmp_path / "library")
+    (tmp_path / "source").mkdir()
+    (tmp_path / "library").mkdir()
+    window.compression_root_input.setText(str(tmp_path / "library"))
+    monkeypatch.setattr("mediaflow.main_window.supports_prepare_source_paths", lambda: False)
+    monkeypatch.setattr("mediaflow.main_window.supports_encode_run_results", lambda: False)
+    config = window._current_config()
+
+    text = window._guided_preflight_text(config)
+
+    assert "prepare_encode_run(source_paths=...)" in text
+    assert "EncodeRunResults" in text
+
+
+def test_review_action_timestamps_are_timezone_aware_utc() -> None:
+    _app()
+    window = MainWindow()
+
+    window._record_review_action("example")
+
+    timestamp = window._review_action_timeline[-1]["timestamp"]
+    parsed = datetime.fromisoformat(timestamp)
+    assert parsed.tzinfo is not None
+    assert timestamp.endswith("+00:00")
+
+
+def test_source_paths_type_error_has_dependency_guidance() -> None:
+    _app()
+    window = MainWindow()
+
+    summary, technical = window._summarise_error(
+        "TypeError: prepare_encode_run() got an unexpected keyword argument 'source_paths'"
+    )
+
+    assert technical is None
+    assert "mediashrink is too old" in summary
+    assert "prepare_encode_run(source_paths=...)" in summary
+
+
+def test_copy_space_preflight_includes_compression_quarantine_headroom(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x" * 1024)
+    window.copy_mode.setChecked(True)
+    window.compress_enabled.setChecked(True)
+    window.overwrite.setChecked(True)
+    window.quarantine_originals.setChecked(True)
+    window.preview_state = SimpleNamespace(plans=[SimpleNamespace(source=source, destination=tmp_path / "out" / "movie.mkv")])
+
+    lines = window._organisation_preflight_lines()
+
+    assert any("Compression/quarantine headroom estimate" in line for line in lines)
+    assert any("Estimated total temporary space risk" in line for line in lines)
+
+
 def test_guided_apply_prepares_compression_for_current_organised_batch(monkeypatch, tmp_path: Path) -> None:
     _app()
     window = MainWindow()
@@ -415,6 +475,216 @@ def test_guided_apply_falls_back_to_root_when_batch_destinations_missing(monkeyp
     assert captured["scope"] == "guided-root-fallback"
     assert captured["source_paths"] is None
     assert "falling back" in window._compression_scope_warning
+
+
+def test_title_group_uses_tv_filename_group_when_inferred_titles_are_generic() -> None:
+    _app()
+    window = MainWindow()
+
+    def review_item(filename: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            item=SimpleNamespace(
+                path=Path("/tmp/iPlayer Recordings") / filename,
+                media_type="tv",
+                title="iPlayer Recordings",
+                season=None,
+                episode=None,
+            )
+        )
+
+    half_man = review_item("Half_Man_Series_1_-_02._Episode_2_m002w06w_editorial.mp4")
+    scot_squad = review_item("Scot_Squad_Series_2_-_06._Episode_6_b06pdw8k_original.mp4")
+    young_1 = review_item("The_Young_Offenders_Series_5_-_02._Episode_2_m002tfsl_editorial.mp4")
+    young_2 = review_item("The_Young_Offenders_Series_5_-_03._Episode_3_m002tfsm_editorial.mp4")
+    window.controller = SimpleNamespace(items=[half_man, scot_squad, young_1, young_2])
+
+    affected = window._title_group_items(2)
+
+    assert affected == [young_1, young_2]
+
+
+def test_review_table_shows_filename_group_for_iplayer_rows() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(
+            path=Path("/tmp/iPlayer Recordings/Half_Man_Series_1_-_02._Episode_2_m002w06w_editorial.mp4"),
+            media_type="tv",
+            title="iPlayer Recordings",
+            season=1,
+            episode=2,
+        ),
+        manual_candidate=None,
+        selected_candidate=None,
+        selected_candidate_index=None,
+        candidates=[],
+        decision_status="unresolved",
+        preview_block_reason=None,
+        unresolved_reason="No candidates available.",
+        warning=None,
+        cache_context="search result",
+        auto_selectable=False,
+        status_label="unresolved",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    window._populate_review_table()
+
+    assert window.review_table.item(0, 1).text() == "half man"
+    assert "Filename group: half man" in window.review_table.item(0, 1).toolTip()
+
+
+def test_unresolved_groups_filter_surfaces_grouped_tv_rows() -> None:
+    _app()
+    window = MainWindow()
+    grouped = []
+    for filename in [
+        "Half_Man_Series_1_-_02._Episode_2_m002w06w_editorial.mp4",
+        "Half_Man_Series_1_-_03._Episode_3_m002w8zg_editorial.mp4",
+    ]:
+        grouped.append(
+            SimpleNamespace(
+                item=SimpleNamespace(path=Path("/tmp/iPlayer Recordings") / filename, media_type="tv", title="iPlayer Recordings", season=None, episode=None),
+                manual_candidate=None,
+                selected_candidate=None,
+                selected_candidate_index=None,
+                candidates=[],
+                decision_status="unresolved",
+                preview_block_reason=None,
+                unresolved_reason="No candidates available.",
+                warning=None,
+                cache_context="search result",
+                auto_selectable=False,
+                status_label="unresolved",
+                has_more=False,
+                candidate_states=[],
+                skipped=False,
+            )
+        )
+    grouped.append(
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/movie.mkv"), media_type="movie", title="Movie", season=None, episode=None),
+            manual_candidate=None,
+            selected_candidate=None,
+            selected_candidate_index=None,
+            candidates=[],
+            decision_status="unresolved",
+            preview_block_reason=None,
+            unresolved_reason="No candidates available.",
+            warning=None,
+            cache_context="search result",
+            auto_selectable=False,
+            status_label="unresolved",
+            has_more=False,
+            candidate_states=[],
+            skipped=False,
+        )
+    )
+    window.controller = SimpleNamespace(items=grouped)
+
+    window._populate_review_table()
+    window._set_combo_value(window.review_filter_combo, "Unresolved groups")
+    window._apply_review_filter()
+
+    assert window.review_table.isRowHidden(0) is False
+    assert window.review_table.isRowHidden(1) is False
+    assert window.review_table.isRowHidden(2) is True
+    assert "half man: 2" in window.review_filter_status_label.text()
+
+
+def test_bulk_confirmation_table_includes_affected_row_details() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/Half_Man_Series_1_-_02.mp4"), media_type="tv", title="Half Man", season=1, episode=2),
+        manual_candidate=None,
+        selected_candidate=SimpleNamespace(title="Half Man"),
+        selected_candidate_index=0,
+        candidates=[SimpleNamespace(title="Half Man")],
+        decision_status="accepted",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+        cache_context="search result",
+        auto_selectable=True,
+        status_label="accepted",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(items=[item])
+
+    table = window._bulk_confirmation_table([0], "Half Man", "half man")
+
+    assert table.item(0, 1).text() == "Half_Man_Series_1_-_02.mp4"
+    assert table.item(0, 2).text() == "half man"
+    assert table.item(0, 4).text() == "Half Man"
+
+
+def test_suspicious_bulk_apply_is_blocked_without_changing_review_state(monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    warnings: list[str] = []
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.warning", lambda *_args, **_kwargs: warnings.append("shown"))
+    source = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/Half_Man_Series_1_-_02.mp4"), media_type="tv", title="iPlayer Recordings", season=1, episode=2),
+        selected_candidate=SimpleNamespace(title="The Young Offenders"),
+        decision_status="accepted",
+        status_label="accepted",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+    )
+    other = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/Scot_Squad_Series_2_-_06.mp4"), media_type="tv", title="iPlayer Recordings", season=2, episode=6),
+        selected_candidate=None,
+        decision_status="unresolved",
+        status_label="unresolved",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+    )
+    window.controller = SimpleNamespace(items=[source, other])
+
+    assert window._confirm_bulk_action(0, "filename show group", [0, 1]) is False
+
+    assert warnings == ["shown"]
+    assert any(event["kind"] == "bulk_apply_blocked" for event in window._diagnostics.events)
+
+
+def test_bulk_undo_restores_affected_review_rows() -> None:
+    _app()
+    window = MainWindow()
+    item = SimpleNamespace(
+        item=SimpleNamespace(path=Path("/tmp/Half_Man_Series_1_-_02.mp4"), media_type="tv", title="Half Man", season=1, episode=2),
+        selected_candidate=SimpleNamespace(title="Half Man"),
+        selected_candidate_index=0,
+        candidates=[SimpleNamespace(title="Half Man")],
+        manual_candidate=None,
+        decision_status="accepted",
+        status_label="accepted",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+        candidate_states=[],
+        has_more=False,
+        auto_selectable=True,
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(items=[item])
+    window._populate_review_table()
+    window._store_bulk_undo([0], "filename show group")
+    window.controller.items[0].decision_status = "manual"
+    window.controller.items[0].selected_candidate = SimpleNamespace(title="Wrong")
+
+    window._undo_last_bulk_action()
+
+    assert window.controller.items[0].decision_status == "accepted"
+    assert window.controller.items[0].selected_candidate.title == "Half Man"
+    assert window._last_bulk_undo is None
 
 
 def test_review_filter_banner_explains_hidden_rows() -> None:
@@ -1423,8 +1693,8 @@ def test_persisted_table_widths_restore(monkeypatch) -> None:
             "version": 1,
             "tables": {
                 "review": {
-                    "widths": [321, 70, 180, 115, 190, 90, 240],
-                    "visual_order": [0, 1, 2, 3, 4, 5, 6],
+                    "widths": [321, 150, 70, 180, 115, 190, 90, 240],
+                    "visual_order": [0, 1, 2, 3, 4, 5, 6, 7],
                 }
             },
         }
@@ -1468,7 +1738,7 @@ def test_review_cells_expose_full_value_tooltips() -> None:
     window._populate_review_table()
 
     assert "very-long-source-name" in window.review_table.item(0, 0).toolTip()
-    assert "subtitle missing" in window.review_table.item(0, 6).toolTip()
+    assert "subtitle missing" in window.review_table.item(0, 7).toolTip()
 
 
 def test_compression_ordering_can_sort_runnable_jobs_by_savings(tmp_path: Path) -> None:

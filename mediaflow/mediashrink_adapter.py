@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import replace
+import inspect
 from pathlib import Path
 from typing import Callable
 
@@ -13,11 +14,32 @@ from mediashrink.analysis import (
 from mediashrink.gui_api import (
     EncodePreparation,
     EncodeProgress,
-    EncodeRunResults,
     prepare_encode_run,
     prepare_tools,
     run_encode_plan,
 )
+try:
+    from mediashrink.gui_api import EncodeRunResults
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = True
+except ImportError:
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = False
+    class EncodeRunResults(list):
+        def __init__(
+            self,
+            results,
+            *,
+            session_path=None,
+            resumed_from_session=False,
+            session_status=None,
+            stopped_early=False,
+            interrupted=False,
+        ):
+            super().__init__(results)
+            self.session_path = session_path
+            self.resumed_from_session = resumed_from_session
+            self.session_status = session_status or {}
+            self.stopped_early = stopped_early
+            self.interrupted = interrupted
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 from mediashrink.scanner import build_jobs
 from mediashrink.session import find_resumable_session, get_session_path, load_session
@@ -32,22 +54,32 @@ def prepare_compression(
     progress_callback: Callable[[object], None] | None = None,
     source_paths: Collection[Path] | None = None,
 ) -> EncodePreparation:
-    preparation = prepare_encode_run(
-        directory=config.compression_root,
-        recursive=config.shrink.recursive,
-        overwrite=config.shrink.overwrite,
-        no_skip=config.shrink.no_skip,
-        policy=config.shrink.policy,
-        on_file_failure=config.shrink.on_file_failure,
-        use_calibration=config.shrink.use_calibration,
-        duplicate_policy=config.shrink.duplicate_policy,
-        source_paths=source_paths,
-        progress_callback=(
+    kwargs = {
+        "directory": config.compression_root,
+        "recursive": config.shrink.recursive,
+        "overwrite": config.shrink.overwrite,
+        "no_skip": config.shrink.no_skip,
+        "policy": config.shrink.policy,
+        "on_file_failure": config.shrink.on_file_failure,
+        "use_calibration": config.shrink.use_calibration,
+        "duplicate_policy": config.shrink.duplicate_policy,
+        "progress_callback": (
             (lambda payload: progress_callback(_convert_preparation_payload(payload)))
             if progress_callback is not None
             else None
         ),
-    )
+    }
+    if source_paths is not None and _supports_prepare_source_paths():
+        kwargs["source_paths"] = source_paths
+    try:
+        preparation = prepare_encode_run(**kwargs)
+    except TypeError as exc:
+        if "source_paths" not in kwargs or "source_paths" not in str(exc):
+            raise
+        kwargs.pop("source_paths", None)
+        preparation = prepare_encode_run(**kwargs)
+    if source_paths is not None and "source_paths" not in kwargs:
+        preparation = _filter_preparation_to_sources(preparation, set(source_paths))
     return _stabilize_preparation(preparation, config)
 
 
@@ -279,9 +311,16 @@ def _filter_preparation_to_sources(
             selected_estimated_output_bytes=0,
         )
 
-    items = [item for item in preparation.items if item.source in retry_sources]
-    jobs = [job for job in preparation.jobs if job.source in retry_sources]
-    selected_sources = {job.source for job in jobs}
+    normalized_sources = {Path(path).resolve(strict=False) for path in retry_sources}
+    items = [
+        item for item in preparation.items
+        if Path(item.source).resolve(strict=False) in normalized_sources
+    ]
+    jobs = [
+        job for job in preparation.jobs
+        if _job_source(job).resolve(strict=False) in normalized_sources
+    ]
+    selected_sources = {_job_source(job) for job in jobs}
     recommended_count = sum(1 for item in items if item.recommendation == "recommended")
     maybe_count = sum(1 for item in items if item.recommendation == "maybe")
     skip_count = sum(1 for item in items if item.recommendation == "skip")
@@ -308,6 +347,29 @@ def _filter_preparation_to_sources(
         selected_input_bytes=selected_input_bytes,
         selected_estimated_output_bytes=selected_estimated_output_bytes,
     )
+
+
+def _job_source(job: object) -> Path:
+    return Path(getattr(job, "source", job))
+
+
+def _supports_prepare_source_paths() -> bool:
+    try:
+        signature = inspect.signature(prepare_encode_run)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "source_paths"
+        for name, parameter in signature.parameters.items()
+    )
+
+
+def supports_prepare_source_paths() -> bool:
+    return _supports_prepare_source_paths()
+
+
+def supports_encode_run_results() -> bool:
+    return _HAS_NATIVE_ENCODE_RUN_RESULTS
 
 
 def _stabilize_preparation(
@@ -482,4 +544,6 @@ __all__ = [
     "prepare_tools",
     "resumable_session_status",
     "run_compression",
+    "supports_encode_run_results",
+    "supports_prepare_source_paths",
 ]

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from dataclasses import is_dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import re
@@ -10,6 +11,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
@@ -79,6 +81,8 @@ from .mediashrink_adapter import (
     resumable_session_status,
     run_compression,
     session_path_for_preparation,
+    supports_encode_run_results,
+    supports_prepare_source_paths,
 )
 from .pipeline import build_pipeline_summary
 from .plexify_adapter import (
@@ -196,6 +200,7 @@ class MainWindow(QMainWindow):
         self._last_progress_payload: EncodeProgress | None = None
         self._overwrite_audit_manifest_path: Path | None = None
         self._review_action_timeline: list[dict[str, object]] = []
+        self._last_bulk_undo: dict[str, object] | None = None
         self._review_item_started_at: dict[int, float] = {}
         self._review_item_durations: dict[int, float] = {}
         self._last_review_index: int | None = None
@@ -346,6 +351,7 @@ class MainWindow(QMainWindow):
                 "Suspicious only",
                 "Bulk/manual only",
                 "TV only",
+                "Unresolved groups",
             ]
         )
         self.review_filter_status_label = QLabel("")
@@ -378,9 +384,9 @@ class MainWindow(QMainWindow):
         self.apply_log.setReadOnly(True)
         self.apply_log.document().setMaximumBlockCount(300)
         self.cancel_apply_button = QPushButton("Cancel after current file")
-        self.review_table = QTableWidget(0, 7)
+        self.review_table = QTableWidget(0, 8)
         self.review_table.setHorizontalHeaderLabels(
-            ["Source", "Type", "Title", "Season/Episode", "Selected", "Status", "Warning"]
+            ["Source", "Filename group", "Type", "Title", "Season/Episode", "Selected", "Status", "Warning"]
         )
         self.review_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.review_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -388,7 +394,7 @@ class MainWindow(QMainWindow):
         self._configure_table(
             self.review_table,
             "review",
-            default_widths=[150, 70, 180, 115, 190, 90, 240],
+            default_widths=[210, 150, 70, 180, 115, 190, 90, 240],
         )
         self.candidate_table = QTableWidget(0, 4)
         self.candidate_table.setHorizontalHeaderLabels(["Title", "Year", "Source", "Confidence"])
@@ -419,7 +425,8 @@ class MainWindow(QMainWindow):
         self.bypass_organise_button = QPushButton("Skip Organisation And Compress")
         self.switch_button = QPushButton("Switch TV/Movie")
         self.folder_button = QPushButton("Apply To Folder")
-        self.title_group_button = QPushButton("Apply To Title Group")
+        self.title_group_button = QPushButton("Apply To Filename Show Group")
+        self.undo_bulk_button = QPushButton("Undo Bulk Action")
         self.preview_button = QPushButton("Build Preview")
         self.apply_button = QPushButton("Apply Organisation")
 
@@ -932,6 +939,7 @@ class MainWindow(QMainWindow):
         extra_row.addWidget(self.switch_button)
         extra_row.addWidget(self.folder_button)
         extra_row.addWidget(self.title_group_button)
+        extra_row.addWidget(self.undo_bulk_button)
         extra_row.addWidget(self.next_page_button)
         left_layout.addLayout(extra_row)
 
@@ -1230,6 +1238,7 @@ class MainWindow(QMainWindow):
         self.switch_button.clicked.connect(self._switch_current_item)
         self.folder_button.clicked.connect(self._apply_choice_to_folder)
         self.title_group_button.clicked.connect(self._apply_choice_to_title_group)
+        self.undo_bulk_button.clicked.connect(self._undo_last_bulk_action)
         self.preview_button.clicked.connect(self._preview_plan)
         self.apply_button.clicked.connect(self._apply_plan)
         self.start_compress_button.clicked.connect(self._start_compression)
@@ -1712,7 +1721,7 @@ class MainWindow(QMainWindow):
         elif index is not None:
             item_payload = {"item": index + 1}
         event = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "action": action,
             **item_payload,
             **payload,
@@ -2608,6 +2617,7 @@ class MainWindow(QMainWindow):
         self._guided_mode = False
         self._continue_to_compress = False
         self._config_dirty = False
+        self._last_bulk_undo = None
         self.review_table.setRowCount(0)
         self.candidate_table.setRowCount(0)
         self.compression_table.setRowCount(0)
@@ -2927,6 +2937,13 @@ class MainWindow(QMainWindow):
         self.switch_button.setEnabled(review_actions_enabled)
         self.folder_button.setEnabled(review_actions_enabled)
         self.title_group_button.setEnabled(review_actions_enabled)
+        self.undo_bulk_button.setEnabled(
+            bool(self._last_bulk_undo)
+            and has_controller
+            and not busy
+            and not review_search_busy
+            and not self._config_dirty
+        )
         self.next_page_button.setEnabled(review_actions_enabled and current_has_more)
         self.auto_accept_button.setEnabled(has_controller and not busy and not self._config_dirty)
         self.preview_button.setEnabled(can_preview)
@@ -3371,6 +3388,12 @@ class MainWindow(QMainWindow):
 
     def _translate_common_error(self, text: str) -> str:
         lowered = text.lower()
+        if "prepare_encode_run" in lowered and "source_paths" in lowered and "unexpected keyword argument" in lowered:
+            return (
+                "Installed mediashrink is too old for scoped batch compression. "
+                "Update mediashrink or retry whole-root compression. "
+                "Failing capability: prepare_encode_run(source_paths=...)."
+            )
         if "cannot find the file specified" in lowered:
             match = re.search(r"'([^']+)'", text)
             path_text = match.group(1) if match else None
@@ -3924,9 +3947,13 @@ class MainWindow(QMainWindow):
                     f"{self._format_bytes(sum(source_sizes))} total, largest {self._format_bytes(max(source_sizes))}."
                 )
             if self._same_drive(config.source, config.library):
-                lines.append("Source and output appear to be on the same drive. Organisation move mode is usually faster, but removes the source copies.")
+                lines.append(
+                    "Important: source and output appear to be on the same drive. Move mode will usually be much faster and use far less temporary space when it is safe to remove the source copies."
+                )
         elif config.plexify.enabled:
             lines.append("Organisation move mode is enabled. Plexify will move matched source files into the library/output folder.")
+        if config.shrink.enabled:
+            lines.extend(self._dependency_capability_preflight_lines(scoped=config.plexify.enabled))
         if config.shrink.enabled and config.shrink.overwrite:
             lines.append("Compression overwrite is enabled. Successful encodes replace originals in the compression root after validation.")
             if config.shrink.quarantine_originals:
@@ -3934,6 +3961,19 @@ class MainWindow(QMainWindow):
                     f"Original quarantine is enabled. Restore metadata is retained for {config.shrink.quarantine_retention_days} day(s); cleanup is manual."
                 )
         return "\n".join(lines)
+
+    def _dependency_capability_preflight_lines(self, *, scoped: bool) -> list[str]:
+        lines: list[str] = []
+        if scoped and not supports_prepare_source_paths():
+            lines.append(
+                "Dependency warning: installed mediashrink does not advertise prepare_encode_run(source_paths=...). "
+                "Guided scoped compression may use a whole-root scan plus local filtering; update mediashrink for efficient scoped batch preparation."
+            )
+        if not supports_encode_run_results():
+            lines.append(
+                "Dependency warning: installed mediashrink does not provide EncodeRunResults; mediaflow will use a compatibility result wrapper."
+            )
+        return lines
 
     @staticmethod
     def _same_drive(left: Path, right: Path) -> bool:
@@ -4284,6 +4324,14 @@ class MainWindow(QMainWindow):
             return
         if not self._ensure_compatibility():
             return
+        capability_warnings = self._dependency_capability_preflight_lines(scoped=config.plexify.enabled and config.shrink.enabled)
+        if capability_warnings:
+            self._diagnostics.record_event(
+                "dependency_capability_preflight",
+                warnings=capability_warnings,
+                supports_source_paths=supports_prepare_source_paths(),
+                supports_encode_run_results=supports_encode_run_results(),
+            )
         if QMessageBox.question(
             self,
             "mediaflow",
@@ -4407,6 +4455,7 @@ class MainWindow(QMainWindow):
                 season_episode = f"S{item.item.season:02d}E{item.item.episode:02d}"
             values = [
                 item.item.path.name,
+                self._display_filename_group(item),
                 item.item.media_type,
                 item.item.title,
                 season_episode,
@@ -4418,6 +4467,7 @@ class MainWindow(QMainWindow):
                 cell = QTableWidgetItem(str(value))
                 tooltip_lines = [
                     f"Source: {item.item.path}",
+                    f"Filename group: {self._display_filename_group(item) or '-'}",
                     f"Title: {item.item.title}",
                     f"Selected: {selected or '-'}",
                     f"Status: {item.status_label}",
@@ -4437,6 +4487,29 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, label)
         self._apply_review_filter()
         self._update_ui()
+
+    def _display_filename_group(self, item: object) -> str:
+        key = self._filename_show_group_key_for_item(item)
+        if not key:
+            return ""
+        return re.sub(r"\s+", " ", str(key).replace("_", " ")).strip()
+
+    def _filename_show_group_key_for_item(self, item: object) -> str | None:
+        if self.controller is not None:
+            index = next((idx for idx, candidate in enumerate(self.controller.items) if candidate is item), -1)
+            if index >= 0:
+                controller_key = getattr(self.controller, "filename_show_group_key", None)
+                if callable(controller_key):
+                    try:
+                        key = controller_key(index)
+                    except (TypeError, ValueError):
+                        key = None
+                    if key:
+                        return str(key)
+        key = self._safe_title_group_key(item)
+        if key is None:
+            return None
+        return key[0]
 
     def _review_warning_text(self, item: object) -> str:
         warnings = [
@@ -4525,6 +4598,12 @@ class MainWindow(QMainWindow):
                 show = item.decision_status in {"accepted", "manual"} and not item.auto_selectable
             elif mode == "TV only":
                 show = item.item.media_type == "tv"
+            elif mode == "Unresolved groups":
+                show = (
+                    item.item.media_type == "tv"
+                    and item.decision_status in {"unresolved", "pending"}
+                    and bool(self._filename_show_group_key_for_item(item))
+                )
             if show:
                 matches.append(idx)
         return matches
@@ -4545,6 +4624,19 @@ class MainWindow(QMainWindow):
                 f"Filtered view: '{mode}' is hiding every review row. Switch back to 'All items' to see the full review."
             )
         elif not self._is_default_review_filter(mode):
+            if mode == "Unresolved groups":
+                groups = Counter(
+                    self._display_filename_group(self.controller.items[idx])
+                    for idx in matches
+                    if self.controller is not None
+                )
+                group_text = ", ".join(f"{group}: {count}" for group, count in groups.items() if group)
+                suffix = f" Groups: {group_text}." if group_text else ""
+                self.review_filter_status_label.setText(
+                    f"Filtered view: showing {visible} unresolved grouped row(s).{suffix}"
+                )
+                self._update_review_summary()
+                return
             self.review_filter_status_label.setText(
                 f"Filtered view: showing {visible} of {self.review_table.rowCount()} review row(s) with '{mode}'."
             )
@@ -5003,8 +5095,10 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
-        if not self._confirm_bulk_action(index, "folder"):
+        affected_indexes = self._folder_group_indexes(index)
+        if not self._confirm_bulk_action(index, "folder", affected_indexes):
             return
+        self._store_bulk_undo(affected_indexes, "folder")
         result = self.controller.apply_choice_to_folder(index)
         self._diagnostics.record_event(
             "bulk_apply",
@@ -5026,54 +5120,237 @@ class MainWindow(QMainWindow):
         index = self._current_review_index()
         if index is None:
             return
-        if not self._confirm_bulk_action(index, "title group"):
+        affected_indexes = self._title_group_indexes(index)
+        if not self._confirm_bulk_action(index, "filename show group", affected_indexes):
             return
-        result = self.controller.apply_choice_to_title_group(index)
+        self._store_bulk_undo(affected_indexes, "filename show group")
+        result = self._apply_choice_to_safe_title_group(index)
         self._diagnostics.record_event(
             "bulk_apply",
-            mode="title-group",
+            mode="filename-show-group",
             item=index + 1,
             affected=result.affected_count,
             preview_valid=result.preview_valid_count,
             blocked=result.blocked_count,
         )
         self._append_status(
-            f"Applied the current decision to {result.affected_count} title-group item(s): "
+            f"Applied the current decision to {result.affected_count} filename-show-group item(s): "
             f"{result.preview_valid_count} preview-valid, {result.blocked_count} blocked."
         )
         self._refresh_review()
 
-    def _confirm_bulk_action(self, index: int, mode: str) -> bool:
+    def _apply_choice_to_safe_title_group(self, index: int):
+        if self.controller is None:
+            raise RuntimeError("No organise review is loaded.")
+        bulk_apply = getattr(self.controller, "bulk_apply_to_filename_show_group", None)
+        if callable(bulk_apply):
+            return bulk_apply(index)
+        affected = self._title_group_items(index)
+        copy_decision = getattr(self.controller, "_copy_video_decision", None)
+        if not callable(copy_decision):
+            return self.controller.apply_choice_to_title_group(index)
+        source = self.controller.items[index]
+        affected_count = 0
+        for target in affected:
+            copy_decision(source, target)
+            affected_count += 1
+        preview = build_preview(self.controller)
+        return SimpleNamespace(
+            affected_count=affected_count,
+            preview_valid_count=sum(1 for item in self.controller.items if getattr(item, "preview_valid", False)),
+            blocked_count=getattr(preview, "unresolved_count", 0),
+        )
+
+    def _folder_group_indexes(self, index: int) -> list[int]:
+        if self.controller is None:
+            return []
+        item = self.controller.items[index]
+        return [
+            idx
+            for idx, other in enumerate(self.controller.items)
+            if other.item.path.parent == item.item.path.parent and other.item.media_type == item.item.media_type
+        ]
+
+    def _title_group_indexes(self, index: int) -> list[int]:
+        if self.controller is None:
+            return []
+        items_in_group = getattr(self.controller, "items_in_filename_show_group", None)
+        if callable(items_in_group):
+            try:
+                indexes = list(items_in_group(index))
+            except (TypeError, ValueError):
+                indexes = []
+            if indexes:
+                return [idx for idx in indexes if 0 <= idx < len(self.controller.items)]
+        affected_ids = {id(item) for item in self._title_group_items(index)}
+        return [idx for idx, item in enumerate(self.controller.items) if id(item) in affected_ids]
+
+    def _title_group_items(self, index: int) -> list[object]:
+        if self.controller is None:
+            return []
+        item = self.controller.items[index]
+        key = self._safe_title_group_key(item)
+        if key is None:
+            return []
+        return [other for other in self.controller.items if self._safe_title_group_key(other) == key]
+
+    def _safe_title_group_key(self, item: object) -> tuple[str, str] | None:
+        media_type = str(getattr(getattr(item, "item", None), "media_type", "") or "")
+        path = Path(getattr(getattr(item, "item", None), "path", Path()))
+        if media_type == "tv":
+            filename_title = self._tv_filename_group_title(path)
+            if filename_title:
+                return (filename_title, media_type)
+        title = str(getattr(getattr(item, "item", None), "title", "") or "").strip().casefold()
+        if not title:
+            return None
+        return (title, media_type)
+
+    @staticmethod
+    def _tv_filename_group_title(path: Path) -> str | None:
+        stem = path.stem
+        patterns = [
+            r"^(?P<title>.+?)[\s_.-]+(?:Series|Season)[\s_.-]*(?P<season>\d+)(?:[\s_.-]+|$)",
+            r"^(?P<title>.+?)[\s_.-]+S(?P<season>\d{1,2})E\d{1,4}(?:[\s_.-]+|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, stem, flags=re.IGNORECASE)
+            if not match:
+                continue
+            title = re.sub(r"[\s_.-]+", " ", match.group("title")).strip().casefold()
+            if title:
+                return title
+        return None
+
+    def _bulk_mismatch_rows(self, affected_indexes: list[int], selected_title: str, group_key: str | None) -> list[tuple[int, str]]:
+        if self.controller is None:
+            return []
+        mismatches: list[tuple[int, str]] = []
+        selected_tokens = self._title_tokens(selected_title)
+        for idx in affected_indexes:
+            item = self.controller.items[idx]
+            item_group = self._filename_show_group_key_for_item(item)
+            if group_key and item_group and item_group != group_key:
+                mismatches.append((idx, f"filename group '{item_group}' differs from '{group_key}'"))
+                continue
+            if selected_tokens and not (self._title_tokens(item.item.path.stem) & selected_tokens):
+                mismatches.append((idx, "selected title has no token overlap with filename"))
+        return mismatches
+
+    def _confirm_bulk_action(self, index: int, mode: str, affected_indexes: list[int] | None = None) -> bool:
         if self.controller is None:
             return False
         item = self.controller.items[index]
         selected = getattr(item, "selected_candidate", None)
         selected_title = getattr(selected, "title", None) or "(no selected title)"
-        if mode == "folder":
-            affected = [
-                other
-                for other in self.controller.items
-                if other.item.path.parent == item.item.path.parent and other.item.media_type == item.item.media_type
-            ]
-        else:
-            key = (item.item.title.strip().casefold(), item.item.media_type)
-            affected = [
-                other
-                for other in self.controller.items
-                if (other.item.title.strip().casefold(), other.item.media_type) == key
-            ]
-        suspicious = sum(
-            1
-            for other in affected
-            if not (self._title_tokens(other.item.path.stem) & self._title_tokens(str(selected_title)))
+        affected_indexes = affected_indexes if affected_indexes is not None else (
+            self._folder_group_indexes(index) if mode == "folder" else self._title_group_indexes(index)
         )
-        text = (
+        group_key = self._filename_show_group_key_for_item(item)
+        mismatches = self._bulk_mismatch_rows(affected_indexes, str(selected_title), group_key)
+        if mismatches:
+            rows = ", ".join(f"{idx + 1}: {reason}" for idx, reason in mismatches[:8])
+            message = (
+                f"Bulk apply blocked because {len(mismatches)} affected row(s) look suspicious. "
+                f"Resolve them manually or use a narrower filename group.\n\nConflicts: {rows}"
+            )
+            self._diagnostics.record_event(
+                "bulk_apply_blocked",
+                mode=mode,
+                item=index + 1,
+                affected=len(affected_indexes),
+                suspicious=len(mismatches),
+                conflicts=[{"row": idx + 1, "reason": reason} for idx, reason in mismatches],
+            )
+            self._record_warning(message.replace("\n\n", " "))
+            QMessageBox.warning(self, "mediaflow", message)
+            return False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confirm Bulk Review Action")
+        dialog.resize(980, 520)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
             f"Apply the current selection to this {mode}?\n\n"
-            f"Selected title: {selected_title}\n"
-            f"Affected rows: {len(affected)}\n"
-            f"Potential title mismatches: {suspicious}"
+            f"Selected title/show: {selected_title}\n"
+            f"Affected rows: {len(affected_indexes)}\n"
+            f"Filename-derived group: {group_key or '(none)'}\n"
+            "Suspicious mismatches: 0"
         )
-        return QMessageBox.question(self, "mediaflow", text) == QMessageBox.Yes
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        table = self._bulk_confirmation_table(affected_indexes, str(selected_title), group_key)
+        layout.addWidget(table, stretch=1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        return dialog.exec() == QDialog.Accepted
+
+    def _bulk_confirmation_table(
+        self,
+        affected_indexes: list[int],
+        selected_title: str,
+        group_key: str | None,
+    ) -> QTableWidget:
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["Row", "Basename", "Filename group", "Inferred title", "Selected title", "Warning"])
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._configure_table_interactions(table)
+        for section, width in enumerate([60, 320, 160, 170, 170, 260]):
+            table.setColumnWidth(section, width)
+        if self.controller is None:
+            return table
+        for idx in affected_indexes:
+            item = self.controller.items[idx]
+            row = table.rowCount()
+            table.insertRow(row)
+            warning = self._review_warning_text(item)
+            item_group = self._filename_show_group_key_for_item(item)
+            if group_key and item_group and item_group != group_key:
+                warning = f"group mismatch: {item_group}"
+            values = [
+                str(idx + 1),
+                item.item.path.name,
+                item_group or "",
+                item.item.title,
+                selected_title,
+                warning,
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setToolTip(str(value))
+                table.setItem(row, column, cell)
+        return table
+
+    def _store_bulk_undo(self, affected_indexes: list[int], mode: str) -> None:
+        if self.controller is None:
+            return
+        current = self._current_review_index()
+        self._last_bulk_undo = {
+            "mode": mode,
+            "selection": current,
+            "items": [(idx, deepcopy(self.controller.items[idx])) for idx in affected_indexes],
+        }
+        self._diagnostics.record_event("bulk_undo_snapshot", mode=mode, affected=len(affected_indexes))
+
+    def _undo_last_bulk_action(self) -> None:
+        if self.controller is None or not self._last_bulk_undo:
+            return
+        restored = 0
+        for idx, item_state in self._last_bulk_undo.get("items", []):
+            if 0 <= idx < len(self.controller.items):
+                self.controller.items[idx] = item_state
+                restored += 1
+        selection = self._last_bulk_undo.get("selection")
+        mode = self._last_bulk_undo.get("mode")
+        self._last_bulk_undo = None
+        self._record_review_action("bulk_action_undone", restored=restored, mode=mode)
+        self._refresh_review()
+        if isinstance(selection, int) and self.review_table.rowCount():
+            self.review_table.selectRow(min(selection, self.review_table.rowCount() - 1))
+        self._append_status(f"Undid the last bulk action and restored {restored} review row(s).")
 
     def _render_preview_summary(self) -> None:
         if self.preview_state is None:
@@ -5142,7 +5419,15 @@ class MainWindow(QMainWindow):
             if suspicious:
                 lines.append(f"Suspicious matches needing attention: {suspicious}")
         if self.copy_mode.isChecked():
-            lines.append(f"Estimated destination space required: {self._format_bytes(total_bytes)}")
+            estimates = self._organisation_space_estimates(total_bytes)
+            lines.append(f"Estimated destination space required: {self._format_bytes(estimates['copy_bytes'])}")
+            if estimates["compression_headroom_bytes"]:
+                lines.append(
+                    "Compression/quarantine headroom estimate: "
+                    f"{self._format_bytes(estimates['compression_headroom_bytes'])} "
+                    "(overwrite + quarantine can temporarily retain originals and encoded outputs)."
+                )
+            lines.append(f"Estimated total temporary space risk: {self._format_bytes(estimates['total_risk_bytes'])}")
         lines.append("")
         lines.append("Plan:")
         for index, plan in enumerate(plans[:12], start=1):
@@ -5156,6 +5441,16 @@ class MainWindow(QMainWindow):
                 f"({self._format_bytes(size)}, {destination_state})"
             )
         return lines
+
+    def _organisation_space_estimates(self, copy_bytes: int) -> dict[str, int]:
+        compression_headroom = 0
+        if self.compress_enabled.isChecked() and self.overwrite.isChecked() and self.quarantine_originals.isChecked():
+            compression_headroom = copy_bytes + 1024 * 1024 * 1024
+        return {
+            "copy_bytes": copy_bytes,
+            "compression_headroom_bytes": compression_headroom,
+            "total_risk_bytes": copy_bytes + compression_headroom,
+        }
 
     def _organisation_preflight_error(self) -> str | None:
         if self.preview_state is None or not self.copy_mode.isChecked():
@@ -5176,12 +5471,14 @@ class MainWindow(QMainWindow):
             usage = shutil.disk_usage(usage_root)
         except OSError as exc:
             return f"Organisation output folder is not writable: {exc}"
+        estimates = self._organisation_space_estimates(required)
         headroom = 512 * 1024 * 1024
-        if usage.free < required + headroom:
+        required_with_headroom = estimates["total_risk_bytes"] + headroom
+        if usage.free < required_with_headroom:
             return (
-                "The organisation output folder may not have enough free space for copy mode. "
+                "The organisation output folder may not have enough free space for copy mode plus compression/quarantine headroom. "
                 f"Available: {self._format_bytes(usage.free)}. "
-                f"Required plus headroom: {self._format_bytes(required + headroom)}."
+                f"Estimated required plus headroom: {self._format_bytes(required_with_headroom)}."
             )
         return None
 
@@ -5286,6 +5583,7 @@ class MainWindow(QMainWindow):
             return
         if not self._confirm_organisation_apply(preflight_lines):
             return
+        self._last_bulk_undo = None
         self._export_pre_apply_plan(preflight_lines)
         self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
@@ -5529,7 +5827,15 @@ class MainWindow(QMainWindow):
             source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
             organised_batch_count=len(self._guided_batch_paths),
             fallback_warning=self._compression_scope_warning,
+            supports_source_paths=supports_prepare_source_paths(),
+            supports_encode_run_results=supports_encode_run_results(),
         )
+        if self._compression_source_paths is not None and not supports_prepare_source_paths():
+            self._compression_scope_warning = (
+                "Installed mediashrink does not support native scoped source_paths preparation; "
+                "mediaflow will scan the whole compression root and filter to the current organised batch locally."
+            )
+            self._record_warning(self._compression_scope_warning)
         self._apply_progress = None
         self._retry_sources = set()
         if self._config_dirty and self.encode_preparation is not None:
@@ -5548,6 +5854,9 @@ class MainWindow(QMainWindow):
         self._preparation_duration = None
         self.prepare_log.clear()
         self.prepare_log.appendPlainText("Preparing compression plan...")
+        if self._compression_scope_warning:
+            self.prepare_log.appendPlainText(self._compression_scope_warning)
+        self.compress_hint_label.setText(self._compression_scope_banner_text())
         self._set_current_action(f"Scanning compression root {config.compression_root}")
         self._set_state(WorkflowState.PREPARING_COMPRESSION)
         self._switch_tab("compress")
@@ -5630,6 +5939,7 @@ class MainWindow(QMainWindow):
         self.include_risky_jobs.setChecked(False)
         self._populate_compression_table(preparation)
         self._config_dirty = False
+        self.compress_hint_label.setText(self._compression_scope_banner_text())
         self._refresh_pipeline_summary()
         self._switch_tab("compress")
         self._complete_action("Compression plan prepared")
@@ -5724,6 +6034,17 @@ class MainWindow(QMainWindow):
                 "Recommended rows are available for review, but the current plan cannot start yet."
             )
         return "Compression plan contains no selected jobs."
+
+    def _compression_scope_banner_text(self) -> str:
+        if self._compression_source_paths is not None:
+            text = f"Compression scope: current organised batch ({len(self._compression_source_paths)} file(s))."
+        elif self._compression_scope == "guided-root-fallback":
+            text = "Compression scope: whole-root fallback."
+        else:
+            text = "Compression scope: whole compression root."
+        if self._compression_scope_warning:
+            text += f" {self._compression_scope_warning}"
+        return text
 
     def _populate_compression_table(self, preparation: EncodePreparation | None) -> None:
         self.compression_table.setRowCount(0)

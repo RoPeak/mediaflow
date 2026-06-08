@@ -16,6 +16,8 @@ from mediaflow.mediashrink_adapter import (
     prepare_retry_compression,
     prepare_safer_compression,
     run_compression,
+    supports_encode_run_results,
+    supports_prepare_source_paths,
 )
 from mediaflow.config import PipelineConfig, ShrinkSettings
 
@@ -100,7 +102,7 @@ def test_run_compression_preserves_session_metadata(tmp_path: Path) -> None:
         output_size_bytes=50,
         error_message=None,
     )
-    from mediashrink.gui_api import EncodeRunResults
+    from mediaflow.mediashrink_adapter import EncodeRunResults
 
     with patch(
         "mediaflow.mediashrink_adapter.run_encode_plan",
@@ -292,6 +294,47 @@ def test_prepare_compression_passes_source_allowlist_to_mediashrink(tmp_path: Pa
 
     assert result is prep
     assert captured["source_paths"] == selected
+
+
+def test_mediashrink_capability_helpers_reflect_adapter_dependencies() -> None:
+    assert supports_prepare_source_paths() in {True, False}
+    assert supports_encode_run_results() in {True, False}
+
+
+def test_prepare_compression_filters_sources_when_mediashrink_lacks_allowlist(tmp_path: Path) -> None:
+    first = tmp_path / "first.mkv"
+    second = tmp_path / "second.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+    first_job = _job(tmp_path, "first.mkv")
+    second_job = _job(tmp_path, "second.mkv")
+    prep = _preparation(tmp_path, [first_job, second_job])
+
+    def fake_prepare_encode_run(
+        *,
+        directory,
+        recursive=True,
+        overwrite=True,
+        no_skip=False,
+        policy="fastest-wall-clock",
+        on_file_failure="retry",
+        use_calibration=True,
+        duplicate_policy="prefer-mkv",
+        progress_callback=None,
+    ):
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", side_effect=fake_prepare_encode_run):
+        result = prepare_compression(config, source_paths={second})
+
+    assert [job.source for job in result.jobs] == [second]
+    assert result.selected_count == 1
 
 
 def test_prepare_compression_falls_back_to_safest_runnable_profile(tmp_path: Path) -> None:
