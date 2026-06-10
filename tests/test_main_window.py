@@ -167,6 +167,49 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert "Benchmarking complete." in window.compress_status_log.toPlainText()
 
 
+def test_slow_compression_plan_offers_faster_rebuild(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="mpeg2video",
+                recommendation="recommended",
+                reason_text="legacy codec with strong projected space savings",
+                size_bytes=100,
+                estimated_output_bytes=40,
+                estimated_savings_bytes=60,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=40,
+        estimated_total_seconds=5 * 3600,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.rebuild_speed_button.isHidden() is False
+    assert window.rebuild_speed_button.isEnabled() is True
+    assert "projected runtime is long" in window.current_action_label.text().lower()
+    assert "Laptop Speed" in window.compress_status_log.toPlainText()
+
+
 def test_compression_plan_defers_risky_jobs_by_default(tmp_path: Path) -> None:
     _app()
     window = MainWindow()
@@ -368,7 +411,7 @@ def test_guided_preflight_surfaces_scoped_compression_capability_warning(monkeyp
     _app()
     window = MainWindow(default_source=tmp_path / "source", default_library=tmp_path / "library")
     (tmp_path / "source").mkdir()
-    (tmp_path / "library").mkdir()
+    (tmp_path / "library").mkdir(exist_ok=True)
     window.compression_root_input.setText(str(tmp_path / "library"))
     monkeypatch.setattr("mediaflow.main_window.supports_prepare_source_paths", lambda: False)
     monkeypatch.setattr("mediaflow.main_window.supports_encode_run_results", lambda: False)

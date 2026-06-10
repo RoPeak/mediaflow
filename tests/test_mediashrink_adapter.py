@@ -15,6 +15,7 @@ from mediaflow.mediashrink_adapter import (
     prepare_compression,
     prepare_retry_compression,
     prepare_safer_compression,
+    prepare_speed_compression,
     run_compression,
     supports_encode_run_results,
     supports_prepare_source_paths,
@@ -503,3 +504,58 @@ def test_prepare_safer_compression_adds_compatibility_first_note(tmp_path: Path)
 
     assert safer.stage_messages is not None
     assert any("compatibility-first defaults" in line for line in safer.stage_messages)
+
+
+def test_prepare_speed_compression_rebuilds_with_ultrafast_profile(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    item = SimpleNamespace(
+        source=source,
+        codec="mpeg2video",
+        size_bytes=100,
+        estimated_output_bytes=40,
+        estimated_savings_bytes=60,
+        recommendation="recommended",
+        reason_text="Strong projected savings",
+    )
+    prep = _preparation(tmp_path, [_job(tmp_path, "movie.mkv")])
+    prep = prep.__class__(
+        **{
+            **prep.__dict__,
+            "items": [item],
+            "recommended_count": 1,
+            "selected_input_bytes": 100,
+            "selected_estimated_output_bytes": 40,
+        }
+    )
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+    fake_job = EncodeJob(
+        source=source,
+        output=source,
+        tmp_output=source.with_name(".tmp_movie.mkv"),
+        crf=22,
+        preset="ultrafast",
+        dry_run=False,
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_compression", return_value=prep), patch(
+        "mediaflow.mediashrink_adapter.build_jobs", return_value=[fake_job]
+    ), patch("mediaflow.mediashrink_adapter.estimate_analysis_encode_seconds", return_value=30.0), patch(
+        "mediaflow.mediashrink_adapter.estimate_size_confidence", return_value="Medium"
+    ), patch("mediaflow.mediashrink_adapter.estimate_time_confidence", return_value="Low"):
+        speed = prepare_speed_compression(config, source_paths={source})
+
+    assert speed.profile is not None
+    assert speed.profile.name == "Laptop Speed"
+    assert speed.profile.encoder_key == "ultrafast"
+    assert speed.profile.crf == 22
+    assert speed.jobs == [fake_job]
+    assert speed.selected_input_bytes == 100
+    assert speed.selected_estimated_output_bytes == 40
+    assert speed.stage_messages is not None
+    assert any("Laptop Speed" in line for line in speed.stage_messages)

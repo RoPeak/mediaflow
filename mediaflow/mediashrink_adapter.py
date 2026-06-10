@@ -4,6 +4,7 @@ from collections.abc import Collection
 from dataclasses import replace
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 from mediashrink.analysis import (
@@ -102,6 +103,19 @@ def prepare_safer_compression(
         "Safer rebuild uses compatibility-first defaults to prefer the most reliable runnable profile."
     )
     return replace(preparation, stage_messages=extra_messages)
+
+
+def prepare_speed_compression(
+    config: PipelineConfig,
+    progress_callback: Callable[[object], None] | None = None,
+    source_paths: Collection[Path] | None = None,
+) -> EncodePreparation:
+    preparation = prepare_compression(
+        config,
+        progress_callback=progress_callback,
+        source_paths=source_paths,
+    )
+    return _apply_laptop_speed_profile(preparation, config)
 
 
 def missing_job_sources(preparation: EncodePreparation) -> list:
@@ -351,6 +365,95 @@ def _filter_preparation_to_sources(
 
 def _job_source(job: object) -> Path:
     return Path(getattr(job, "source", job))
+
+
+def _apply_laptop_speed_profile(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+) -> EncodePreparation:
+    if not preparation.items:
+        return preparation
+
+    selected_items = [item for item in preparation.items if item.recommendation == "recommended"]
+    if not selected_items:
+        selected_items = [item for item in preparation.items if item.recommendation == "maybe"]
+    if not selected_items:
+        return preparation
+
+    preset = "ultrafast"
+    crf = 22
+    profile = SimpleNamespace(
+        name="Laptop Speed",
+        encoder_key=preset,
+        crf=crf,
+        compatible_count=len(selected_items),
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose=(
+            "Speed-first software profile for CPU-limited laptops. It keeps CRF 22 but uses x265 ultrafast "
+            "to reduce wall-clock time, usually at the cost of larger output files."
+        ),
+    )
+    jobs = build_jobs(
+        files=[item.source for item in selected_items],
+        output_dir=None,
+        overwrite=config.shrink.overwrite,
+        crf=crf,
+        preset=preset,
+        dry_run=False,
+        ffprobe=preparation.ffprobe,
+        no_skip=config.shrink.no_skip,
+    )
+    selected_sources = {_job_source(job) for job in jobs}
+    selected_input_bytes = sum(
+        int(getattr(item, "size_bytes", 0) or 0)
+        for item in selected_items
+        if item.source in selected_sources
+    )
+    selected_estimated_output_bytes = sum(
+        int(getattr(item, "estimated_output_bytes", 0) or 0)
+        for item in selected_items
+        if item.source in selected_sources and int(getattr(item, "estimated_output_bytes", 0) or 0) > 0
+    )
+    estimated_total_seconds = estimate_analysis_encode_seconds(
+        [item for item in selected_items if item.source in selected_sources],
+        preset=preset,
+        crf=crf,
+        ffmpeg=preparation.ffmpeg,
+        known_speed=None,
+        use_calibration=preparation.use_calibration,
+        calibration_store=None,
+    )
+    messages = list(preparation.stage_messages or [])
+    messages.append(
+        "Laptop Speed rebuild selected x265 ultrafast at CRF 22. Expect faster encodes, but larger outputs "
+        "and less reliable size estimates than the default Fast profile."
+    )
+    return replace(
+        preparation,
+        profile=profile,
+        jobs=jobs,
+        selected_count=len(jobs),
+        selected_input_bytes=selected_input_bytes,
+        selected_estimated_output_bytes=selected_estimated_output_bytes,
+        estimated_total_seconds=estimated_total_seconds,
+        size_confidence=estimate_size_confidence(
+            [item for item in selected_items if item.source in selected_sources],
+            preset=preset,
+            use_calibration=preparation.use_calibration,
+        ),
+        time_confidence=estimate_time_confidence(
+            [item for item in selected_items if item.source in selected_sources],
+            benchmarked_files=0,
+            preset=preset,
+            use_calibration=preparation.use_calibration,
+        ),
+        compatible_count=len(jobs),
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        recommendation_reason=profile.why_choose,
+        stage_messages=messages,
+    )
 
 
 def _supports_prepare_source_paths() -> bool:

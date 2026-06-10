@@ -77,6 +77,7 @@ from .mediashrink_adapter import (
     missing_job_sources,
     prepare_compression,
     prepare_safer_compression,
+    prepare_speed_compression,
     prepare_retry_compression,
     resumable_session_status,
     run_compression,
@@ -452,6 +453,8 @@ class MainWindow(QMainWindow):
         self.include_risky_jobs.setChecked(False)
         self.rebuild_safer_button = QPushButton("Rebuild Safer Plan")
         self.rebuild_safer_button.setVisible(False)
+        self.rebuild_speed_button = QPushButton("Rebuild Faster Plan")
+        self.rebuild_speed_button.setVisible(False)
         self.prepare_followup_button = QPushButton("Prepare Follow-up Plan")
         self.prepare_followup_button.setVisible(False)
         self.retry_failed_button = QPushButton("Prepare Retry Plan")
@@ -1072,6 +1075,7 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout()
         action_row.addWidget(self.start_compress_button)
         action_row.addWidget(self.rebuild_safer_button)
+        action_row.addWidget(self.rebuild_speed_button)
         action_row.addWidget(self.prepare_followup_button)
         action_row.addWidget(self.retry_failed_button)
         action_row.addWidget(self.stop_compression_button)
@@ -1243,6 +1247,7 @@ class MainWindow(QMainWindow):
         self.apply_button.clicked.connect(self._apply_plan)
         self.start_compress_button.clicked.connect(self._start_compression)
         self.rebuild_safer_button.clicked.connect(self._prepare_safer_plan)
+        self.rebuild_speed_button.clicked.connect(self._prepare_speed_plan)
         self.prepare_followup_button.clicked.connect(self._prepare_followup_plan)
         self.retry_failed_button.clicked.connect(self._prepare_retry_plan)
         self.retry_summary_button.clicked.connect(self._prepare_retry_plan)
@@ -2064,6 +2069,12 @@ class MainWindow(QMainWindow):
         s = int(seconds)
         if s < 60:
             return f"{s}s"
+        if s >= 3600:
+            hours = s // 3600
+            minutes = (s % 3600) // 60
+            if minutes:
+                return f"{hours}h {minutes}m"
+            return f"{hours}h"
         return f"{s // 60}m {s % 60}s"
 
     @staticmethod
@@ -2972,6 +2983,9 @@ class MainWindow(QMainWindow):
         )
         self.rebuild_safer_button.setVisible(bool(has_compression_plan))
         self.rebuild_safer_button.setEnabled(can_rebuild_safer)
+        can_rebuild_speed = bool(has_compression_plan and not busy and not self._config_dirty)
+        self.rebuild_speed_button.setVisible(bool(has_compression_plan))
+        self.rebuild_speed_button.setEnabled(can_rebuild_speed)
         followup_sources = self._followup_sources()
         maybe_sources = self._maybe_followup_sources()
         if maybe_sources and followup_sources == maybe_sources:
@@ -4898,7 +4912,8 @@ class MainWindow(QMainWindow):
         self._populate_review_table()
         if current is not None and self.review_table.rowCount() > 0:
             self.review_table.selectRow(min(current, self.review_table.rowCount() - 1))
-        self._preview_plan(rebuild_only=True)
+        if hasattr(self.controller, "build_preview"):
+            self._preview_plan(rebuild_only=True)
 
     def _accept_selected_candidate(self) -> None:
         if self.controller is None:
@@ -5995,7 +6010,18 @@ class MainWindow(QMainWindow):
             )
         elif not self._runnable_jobs(preparation):
             blocked_detail = self._compression_zero_jobs_message(preparation)
-        self._set_current_action(blocked_detail or "Compression plan is ready to review")
+        speed_warning = self._compression_speed_warning(preparation)
+        if speed_warning:
+            self._append_status(speed_warning)
+        self._set_current_action(
+            blocked_detail
+            or (
+                "Compression plan is ready, but projected runtime is long. "
+                "Consider Rebuild Faster Plan on this laptop."
+                if speed_warning
+                else "Compression plan is ready to review"
+            )
+        )
         self._append_status(
             f"Prepared compression plan for {preparation.selected_count} file(s) from {preparation.directory}."
         )
@@ -6012,6 +6038,7 @@ class MainWindow(QMainWindow):
             missing_items=len(self._plan_classification.missing_items),
             scope=self._compression_scope,
             source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
+            speed_warning=speed_warning,
         )
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
@@ -6268,6 +6295,44 @@ class MainWindow(QMainWindow):
         worker = FunctionWorker(prepare_safer_compression, config)
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
+    def _prepare_speed_plan(self) -> None:
+        if self.encode_preparation is None:
+            self._show_error("Prepare a compression plan before rebuilding it.")
+            return
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        try:
+            config = self._current_config()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._persist_ui_state()
+        source_paths = set(self._compression_source_paths) if self._compression_source_paths is not None else None
+        self._diagnostics.record_event(
+            "speed_preparation_started",
+            compression_root=str(config.compression_root),
+            source_paths=[str(path) for path in sorted(source_paths or set())],
+            previous_profile=(
+                self.encode_preparation.profile.name if self.encode_preparation.profile is not None else None
+            ),
+        )
+        self.prepare_progress.setRange(0, 0)
+        self.prepare_log.clear()
+        self.prepare_log.appendPlainText("Rebuilding compression plan with laptop speed defaults...")
+        self.compress_preparing_label.setText("Rebuilding compression plan for laptop speed...")
+        self.prepare_stage_label.setText("Discovering files...")
+        self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
+        self._preparation_model = PreparationProgressModel()
+        self._set_current_action("Rebuilding compression plan for faster laptop encodes")
+        self._set_state(WorkflowState.PREPARING_COMPRESSION)
+        self._switch_tab("compress")
+        self._preparation_start = time.monotonic()
+        self._preparation_last_update_at = self._preparation_start
+        self._preparation_timer.start()
+        self._flush_runtime_diagnostics()
+        worker = FunctionWorker(prepare_speed_compression, config, source_paths=source_paths)
+        self._start_worker(worker, self._compression_prepared, self._preparation_progress)
+
     def _prepare_followup_plan(self) -> None:
         sources = self._followup_sources()
         if not sources:
@@ -6438,6 +6503,26 @@ class MainWindow(QMainWindow):
         if not self._runnable_jobs(prep):
             return "No runnable jobs are selected in the current view. Include risky follow-up jobs or rebuild the plan."
         return "Start the current compression plan."
+
+    def _compression_speed_warning(self, preparation: EncodePreparation | None) -> str | None:
+        if preparation is None:
+            return None
+        jobs = len(getattr(preparation, "jobs", []) or [])
+        if jobs <= 0:
+            return None
+        seconds = float(getattr(preparation, "estimated_total_seconds", 0.0) or 0.0)
+        if seconds <= 0:
+            return None
+        per_file = seconds / jobs
+        if seconds < 4 * 3600 and per_file < 45 * 60:
+            return None
+        profile = getattr(preparation, "profile", None)
+        profile_name = getattr(profile, "name", "selected profile") if profile is not None else "selected profile"
+        return (
+            f"Runtime warning: {jobs} file(s) are estimated at {self._format_elapsed(seconds)} "
+            f"with {profile_name}. On CPU-limited laptops, use Rebuild Faster Plan to switch to "
+            "Laptop Speed (x265 ultrafast, CRF 22). It should run faster but may produce larger files."
+        )
 
     def _build_runnable_preparation(self, preparation: EncodePreparation) -> EncodePreparation:
         jobs = self._runnable_jobs(preparation)
@@ -6746,6 +6831,9 @@ class MainWindow(QMainWindow):
                     f"Quarantine: originals are moved to {self._quarantine_directory_path()} before replacement. "
                     f"Retention metadata: {self.quarantine_retention_days.value()} day(s); cleanup is manual."
                 )
+        speed_warning = self._compression_speed_warning(runnable_preparation)
+        if speed_warning:
+            warning_lines.append(speed_warning)
         if resume_text:
             warning_lines.append(resume_text.strip())
         if not self._confirm_compression_start(
