@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QHeaderView
 
 from mediaflow.main_window import MainWindow
 from mediaflow.callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
+from mediaflow.mediashrink_adapter import profile_id_for
 from mediaflow.workflow import WorkflowState
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
 
@@ -165,6 +166,163 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert "Fast" in window.compress_summary_label.text()
     assert "Fast profile covers the selected file." in window.compress_summary_label.text()
     assert "Benchmarking complete." in window.compress_status_log.toPlainText()
+
+
+def test_overwrite_compression_requires_profile_review_when_options_exist(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    fast = SimpleNamespace(
+        name="Fast",
+        encoder_key="faster",
+        sw_preset="faster",
+        crf=22,
+        quality_label="Good",
+        intent_label="Speed and size balance",
+        estimated_output_bytes=400,
+        estimated_encode_seconds=120.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Fast default.",
+    )
+    balanced = SimpleNamespace(
+        name="Balanced",
+        encoder_key="slow",
+        sw_preset="slow",
+        crf=20,
+        quality_label="Better",
+        intent_label="Quality first",
+        estimated_output_bytes=520,
+        estimated_encode_seconds=240.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Keeps more movie detail.",
+    )
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="mpeg2video",
+                recommendation="recommended",
+                reason_text="legacy codec with strong projected savings",
+                estimated_output_bytes=520,
+                estimated_savings_bytes=480,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=balanced,
+        jobs=[SimpleNamespace(source=item_source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=520,
+        estimated_total_seconds=240.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        profile_options=[fast, balanced],
+        recommended_profile_id=profile_id_for(fast),
+        selected_profile_id=profile_id_for(balanced),
+        profile_selection_method="quality-aware-default",
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.profile_review_group.isHidden() is False
+    assert window.profile_table.rowCount() == 2
+    assert window.start_compress_button.isEnabled() is False
+    assert "profile review required" in window.compress_summary_label.text().lower()
+    assert "Review and accept" in window.start_compress_button.toolTip()
+    assert "Keeps more movie detail" in window.profile_table.item(1, 7).toolTip()
+
+    window._accept_selected_profile()
+
+    assert window.start_compress_button.isEnabled() is True
+    assert "Profile reviewed" in window.compress_summary_label.text()
+
+
+def test_profile_selection_change_rebuilds_plan_before_start(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    fast = SimpleNamespace(
+        name="Fast",
+        encoder_key="faster",
+        sw_preset="faster",
+        crf=22,
+        quality_label="Good",
+        intent_label="Fast",
+        estimated_output_bytes=400,
+        estimated_encode_seconds=120.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Fast default.",
+    )
+    balanced = SimpleNamespace(
+        name="Balanced",
+        encoder_key="slow",
+        sw_preset="slow",
+        crf=20,
+        quality_label="Better",
+        intent_label="Quality",
+        estimated_output_bytes=520,
+        estimated_encode_seconds=240.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Quality-first.",
+    )
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=source,
+                codec="mpeg2video",
+                recommendation="recommended",
+                reason_text="legacy codec with strong projected savings",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=fast,
+        jobs=[SimpleNamespace(source=source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=120.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        profile_options=[fast, balanced],
+        recommended_profile_id=profile_id_for(fast),
+        selected_profile_id=profile_id_for(fast),
+        profile_selection_method="recommended",
+    )
+    started: list[str] = []
+    monkeypatch.setattr(window, "_start_profile_rebuild", started.append)
+
+    window._compression_prepared(prep)
+    window.profile_table.selectRow(1)
+    window._accept_selected_profile()
+
+    assert started == [profile_id_for(balanced)]
+    assert window.start_compress_button.isEnabled() is False
 
 
 def test_slow_compression_plan_offers_faster_rebuild(tmp_path: Path) -> None:

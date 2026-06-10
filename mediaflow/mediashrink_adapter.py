@@ -20,6 +20,10 @@ from mediashrink.gui_api import (
     run_encode_plan,
 )
 try:
+    from mediashrink.gui_api import profile_id_for as _native_profile_id_for
+except ImportError:
+    _native_profile_id_for = None
+try:
     from mediashrink.gui_api import EncodeRunResults
     _HAS_NATIVE_ENCODE_RUN_RESULTS = True
 except ImportError:
@@ -54,6 +58,7 @@ def prepare_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
     source_paths: Collection[Path] | None = None,
+    selected_profile_id: str | None = None,
 ) -> EncodePreparation:
     kwargs = {
         "directory": config.compression_root,
@@ -72,16 +77,28 @@ def prepare_compression(
     }
     if source_paths is not None and _supports_prepare_source_paths():
         kwargs["source_paths"] = source_paths
-    try:
-        preparation = prepare_encode_run(**kwargs)
-    except TypeError as exc:
-        if "source_paths" not in kwargs or "source_paths" not in str(exc):
+    if selected_profile_id is not None and _supports_prepare_selected_profile():
+        kwargs["selected_profile_id"] = selected_profile_id
+    while True:
+        try:
+            preparation = prepare_encode_run(**kwargs)
+            break
+        except TypeError as exc:
+            if "selected_profile_id" in kwargs and "selected_profile_id" in str(exc):
+                kwargs.pop("selected_profile_id", None)
+                continue
+            if "source_paths" in kwargs and "source_paths" in str(exc):
+                kwargs.pop("source_paths", None)
+                continue
             raise
-        kwargs.pop("source_paths", None)
-        preparation = prepare_encode_run(**kwargs)
     if source_paths is not None and "source_paths" not in kwargs:
         preparation = _filter_preparation_to_sources(preparation, set(source_paths))
-    return _stabilize_preparation(preparation, config)
+    preparation = _with_laptop_speed_option(preparation, config)
+    if selected_profile_id is not None:
+        preparation = _apply_profile_id(preparation, config, selected_profile_id, selection_method="manual")
+    else:
+        preparation = _apply_quality_default_if_needed(preparation, config)
+    return _with_laptop_speed_option(_stabilize_preparation(preparation, config), config)
 
 
 def prepare_safer_compression(
@@ -367,33 +384,132 @@ def _job_source(job: object) -> Path:
     return Path(getattr(job, "source", job))
 
 
-def _apply_laptop_speed_profile(
-    preparation: EncodePreparation,
-    config: PipelineConfig,
-) -> EncodePreparation:
-    if not preparation.items:
-        return preparation
+def profile_id_for(profile: object | None) -> str | None:
+    if _native_profile_id_for is not None:
+        return _native_profile_id_for(profile)
+    if profile is None:
+        return None
+    existing = getattr(profile, "profile_id", None)
+    if existing:
+        return str(existing)
+    parts = [
+        str(getattr(profile, "name", "") or ""),
+        str(getattr(profile, "encoder_key", "") or ""),
+        str(getattr(profile, "sw_preset", "") or ""),
+        str(getattr(profile, "crf", "") or ""),
+    ]
+    return "::".join(part.replace("::", "/") for part in parts)
 
+
+def _selected_analysis_items(preparation: EncodePreparation) -> list:
     selected_items = [item for item in preparation.items if item.recommendation == "recommended"]
     if not selected_items:
         selected_items = [item for item in preparation.items if item.recommendation == "maybe"]
+    return selected_items
+
+
+def _profile_options(preparation: EncodePreparation) -> list[object]:
+    return list(getattr(preparation, "profile_options", None) or [])
+
+
+def _replace_preparation(preparation: EncodePreparation, **changes) -> EncodePreparation:
+    try:
+        return replace(preparation, **changes)
+    except TypeError:
+        allowed = {key: value for key, value in changes.items() if hasattr(preparation, key)}
+        return replace(preparation, **allowed)
+
+
+def _estimated_output_for_profile(profile: object, selected_items: list[object]) -> int:
+    profile_estimate = int(getattr(profile, "estimated_output_bytes", 0) or 0)
+    if profile_estimate > 0:
+        return profile_estimate
+    return sum(
+        int(getattr(item, "estimated_output_bytes", 0) or 0)
+        for item in selected_items
+        if int(getattr(item, "estimated_output_bytes", 0) or 0) > 0
+    )
+
+
+def _item_size_bytes(item: object) -> int:
+    size = int(getattr(item, "size_bytes", 0) or 0)
+    if size > 0:
+        return size
+    source = getattr(item, "source", None)
+    try:
+        return Path(source).stat().st_size if source is not None else 0
+    except OSError:
+        return 0
+
+
+def _estimate_seconds_for_items(
+    items: list[object],
+    *,
+    preset: str,
+    crf: int,
+    ffmpeg: Path,
+    use_calibration: bool,
+) -> float | None:
+    try:
+        return estimate_analysis_encode_seconds(
+            items,
+            preset=preset,
+            crf=crf,
+            ffmpeg=ffmpeg,
+            known_speed=None,
+            use_calibration=use_calibration,
+            calibration_store=None,
+        )
+    except AttributeError:
+        return None
+
+
+def _estimate_size_confidence_for_items(
+    items: list[object],
+    *,
+    preset: str,
+    use_calibration: bool,
+) -> str | None:
+    try:
+        return estimate_size_confidence(
+            items,
+            preset=preset,
+            use_calibration=use_calibration,
+        )
+    except AttributeError:
+        return None
+
+
+def _estimate_time_confidence_for_items(
+    items: list[object],
+    *,
+    preset: str,
+    use_calibration: bool,
+) -> str | None:
+    try:
+        return estimate_time_confidence(
+            items,
+            benchmarked_files=0,
+            preset=preset,
+            use_calibration=use_calibration,
+        )
+    except AttributeError:
+        return None
+
+
+def _apply_profile(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+    profile: object,
+    *,
+    selection_method: str,
+    message: str | None = None,
+) -> EncodePreparation:
+    selected_items = _selected_analysis_items(preparation)
     if not selected_items:
         return preparation
-
-    preset = "ultrafast"
-    crf = 22
-    profile = SimpleNamespace(
-        name="Laptop Speed",
-        encoder_key=preset,
-        crf=crf,
-        compatible_count=len(selected_items),
-        incompatible_count=0,
-        grouped_incompatibilities={},
-        why_choose=(
-            "Speed-first software profile for CPU-limited laptops. It keeps CRF 22 but uses x265 ultrafast "
-            "to reduce wall-clock time, usually at the cost of larger output files."
-        ),
-    )
+    crf = int(getattr(profile, "crf", 22) or 22)
+    preset = str(getattr(profile, "encoder_key", "faster") or "faster")
     jobs = build_jobs(
         files=[item.source for item in selected_items],
         output_dir=None,
@@ -405,31 +521,21 @@ def _apply_laptop_speed_profile(
         no_skip=config.shrink.no_skip,
     )
     selected_sources = {_job_source(job) for job in jobs}
-    selected_input_bytes = sum(
-        int(getattr(item, "size_bytes", 0) or 0)
-        for item in selected_items
-        if item.source in selected_sources
-    )
-    selected_estimated_output_bytes = sum(
-        int(getattr(item, "estimated_output_bytes", 0) or 0)
-        for item in selected_items
-        if item.source in selected_sources and int(getattr(item, "estimated_output_bytes", 0) or 0) > 0
-    )
-    estimated_total_seconds = estimate_analysis_encode_seconds(
-        [item for item in selected_items if item.source in selected_sources],
+    effective_items = [item for item in selected_items if item.source in selected_sources]
+    selected_input_bytes = sum(_item_size_bytes(item) for item in effective_items)
+    selected_estimated_output_bytes = _estimated_output_for_profile(profile, effective_items)
+    estimated_total_seconds = _estimate_seconds_for_items(
+        effective_items,
         preset=preset,
         crf=crf,
         ffmpeg=preparation.ffmpeg,
-        known_speed=None,
         use_calibration=preparation.use_calibration,
-        calibration_store=None,
     )
     messages = list(preparation.stage_messages or [])
-    messages.append(
-        "Laptop Speed rebuild selected x265 ultrafast at CRF 22. Expect faster encodes, but larger outputs "
-        "and less reliable size estimates than the default Fast profile."
-    )
-    return replace(
+    if message:
+        messages.append(message)
+    profile_id = profile_id_for(profile)
+    return _replace_preparation(
         preparation,
         profile=profile,
         jobs=jobs,
@@ -437,22 +543,169 @@ def _apply_laptop_speed_profile(
         selected_input_bytes=selected_input_bytes,
         selected_estimated_output_bytes=selected_estimated_output_bytes,
         estimated_total_seconds=estimated_total_seconds,
-        size_confidence=estimate_size_confidence(
-            [item for item in selected_items if item.source in selected_sources],
+        size_confidence=_estimate_size_confidence_for_items(
+            effective_items,
             preset=preset,
             use_calibration=preparation.use_calibration,
         ),
-        time_confidence=estimate_time_confidence(
-            [item for item in selected_items if item.source in selected_sources],
-            benchmarked_files=0,
+        time_confidence=_estimate_time_confidence_for_items(
+            effective_items,
             preset=preset,
             use_calibration=preparation.use_calibration,
         ),
-        compatible_count=len(jobs),
+        compatible_count=int(getattr(profile, "compatible_count", len(jobs)) or 0),
+        incompatible_count=int(getattr(profile, "incompatible_count", 0) or 0),
+        grouped_incompatibilities=getattr(profile, "grouped_incompatibilities", {}) or {},
+        recommendation_reason=getattr(profile, "why_choose", None) or preparation.recommendation_reason,
+        stage_messages=messages,
+        selected_profile_id=profile_id,
+        profile_selection_method=selection_method,
+    )
+
+
+def _apply_profile_id(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+    selected_profile_id: str,
+    *,
+    selection_method: str,
+) -> EncodePreparation:
+    current_profile_id = profile_id_for(getattr(preparation, "profile", None))
+    if current_profile_id == selected_profile_id:
+        return _apply_profile(
+            preparation,
+            config,
+            getattr(preparation, "profile", None),
+            selection_method=selection_method,
+        )
+    for profile in _profile_options(preparation):
+        if profile_id_for(profile) == selected_profile_id:
+            return _apply_profile(
+                preparation,
+                config,
+                profile,
+                selection_method=selection_method,
+                message=f"Compression plan rebuilt with profile {getattr(profile, 'name', selected_profile_id)}.",
+            )
+    return preparation
+
+
+def _laptop_speed_profile(preparation: EncodePreparation, config: PipelineConfig) -> object | None:
+    selected_items = _selected_analysis_items(preparation)
+    if not selected_items:
+        return None
+    selected_input_bytes = sum(_item_size_bytes(item) for item in selected_items)
+    selected_estimated_output_bytes = sum(
+        int(getattr(item, "estimated_output_bytes", 0) or 0)
+        for item in selected_items
+        if int(getattr(item, "estimated_output_bytes", 0) or 0) > 0
+    )
+    estimated_seconds = _estimate_seconds_for_items(
+        selected_items,
+        preset="ultrafast",
+        crf=22,
+        ffmpeg=preparation.ffmpeg,
+        use_calibration=preparation.use_calibration,
+    )
+    profile = SimpleNamespace(
+        name="Laptop Speed",
+        intent_label="Speed first",
+        encoder_key="ultrafast",
+        sw_preset="ultrafast",
+        crf=22,
+        estimated_output_bytes=selected_estimated_output_bytes,
+        estimated_encode_seconds=estimated_seconds,
+        quality_label="Good",
+        compatible_count=len(selected_items),
         incompatible_count=0,
         grouped_incompatibilities={},
-        recommendation_reason=profile.why_choose,
-        stage_messages=messages,
+        why_choose=(
+            "Fastest CPU-friendly option for constrained laptops. It trades compression efficiency and some "
+            "detail retention for much shorter wall-clock time."
+        ),
+        profile_id="Laptop Speed::ultrafast::ultrafast::22",
+        effective_input_bytes=selected_input_bytes,
+    )
+    return profile
+
+
+def _with_laptop_speed_option(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+) -> EncodePreparation:
+    profile = _laptop_speed_profile(preparation, config)
+    if profile is None:
+        return preparation
+    options = _profile_options(preparation)
+    if any(profile_id_for(option) == profile.profile_id for option in options):
+        return preparation
+    return _replace_preparation(preparation, profile_options=[*options, profile])
+
+
+def _movie_heavy_overwrite_batch(preparation: EncodePreparation, config: PipelineConfig) -> bool:
+    if not config.shrink.overwrite:
+        return False
+    selected_items = _selected_analysis_items(preparation)
+    if not selected_items:
+        return False
+    movie_like = 0
+    for item in selected_items:
+        path_text = str(getattr(item, "source", "")).lower()
+        if "/movies/" in path_text or "\\movies\\" in path_text:
+            movie_like += 1
+        elif not any(token in path_text for token in ("tv shows", "s01e", "s02e", "s03e", "season ")):
+            movie_like += 1
+    return movie_like / len(selected_items) >= 0.6
+
+
+def _apply_quality_default_if_needed(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+) -> EncodePreparation:
+    if config.shrink.policy != "fastest-wall-clock":
+        return preparation
+    if not _movie_heavy_overwrite_batch(preparation, config):
+        return preparation
+    current = getattr(preparation, "profile", None)
+    current_name = str(getattr(current, "name", "") or "").lower()
+    if current_name not in {"fast", "fast batch"}:
+        return preparation
+    options = _profile_options(preparation)
+    balanced = next((profile for profile in options if str(getattr(profile, "name", "")).lower() == "balanced"), None)
+    if balanced is None:
+        return preparation
+    compatible = int(getattr(balanced, "compatible_count", 0) or 0)
+    selected_count = len(_selected_analysis_items(preparation))
+    if compatible and compatible < selected_count:
+        return preparation
+    return _apply_profile(
+        preparation,
+        config,
+        balanced,
+        selection_method="quality-aware-default",
+        message=(
+            "Quality-aware default selected Balanced for this movie-heavy overwrite batch. "
+            "Review the profile table before starting compression."
+        ),
+    )
+
+
+def _apply_laptop_speed_profile(
+    preparation: EncodePreparation,
+    config: PipelineConfig,
+) -> EncodePreparation:
+    profile = _laptop_speed_profile(preparation, config)
+    if profile is None:
+        return preparation
+    return _apply_profile(
+        _with_laptop_speed_option(preparation, config),
+        config,
+        profile,
+        selection_method="speed-shortcut",
+        message=(
+            "Laptop Speed rebuild selected x265 ultrafast at CRF 22. Expect faster encodes, but larger outputs "
+            "and less reliable size estimates than the default Fast profile."
+        ),
     )
 
 
@@ -463,6 +716,17 @@ def _supports_prepare_source_paths() -> bool:
         return False
     return any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "source_paths"
+        for name, parameter in signature.parameters.items()
+    )
+
+
+def _supports_prepare_selected_profile() -> bool:
+    try:
+        signature = inspect.signature(prepare_encode_run)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "selected_profile_id"
         for name, parameter in signature.parameters.items()
     )
 
@@ -645,6 +909,7 @@ __all__ = [
     "prepare_safer_compression",
     "prepare_retry_compression",
     "prepare_tools",
+    "profile_id_for",
     "resumable_session_status",
     "run_compression",
     "supports_encode_run_results",

@@ -79,6 +79,7 @@ from .mediashrink_adapter import (
     prepare_safer_compression,
     prepare_speed_compression,
     prepare_retry_compression,
+    profile_id_for,
     resumable_session_status,
     run_compression,
     session_path_for_preparation,
@@ -147,6 +148,12 @@ class MainWindow(QMainWindow):
         self._organised_not_encoded: list[dict[str, object]] = []
         self._compression_plan_rows: list = []
         self._summary_rows: list = []
+        self._profile_review_required: bool = False
+        self._profile_review_acknowledged: bool = True
+        self._selected_profile_id: str | None = None
+        self._pending_profile_id: str | None = None
+        self._profile_rebuild_profile_id: str | None = None
+        self._profile_selection_method: str = "recommended"
         self._plan_classification = classify_compression_plan(())
         self._diagnostics = DiagnosticsRecorder()
         self._encode_progress_model = EncodeProgressModel()
@@ -499,6 +506,36 @@ class MainWindow(QMainWindow):
         self.compression_filter_status_label.setObjectName("muted-label")
         self.compression_order_combo = QComboBox()
         self.compression_order_combo.addItems(["Current order", "Fastest first", "Largest savings first"])
+        self.profile_review_group = QGroupBox("Choose Encoding Profile")
+        self.profile_review_group.setVisible(False)
+        self.profile_review_label = QLabel()
+        self.profile_review_label.setWordWrap(True)
+        self.profile_review_status_label = QLabel("")
+        self.profile_review_status_label.setWordWrap(True)
+        self.profile_review_status_label.setObjectName("muted-label")
+        self.accept_profile_button = QPushButton("Use Selected Profile")
+        self.profile_table = QTableWidget(0, 8)
+        self.profile_table.setHorizontalHeaderLabels(
+            [
+                "Profile",
+                "Quality",
+                "Est. Output",
+                "Est. Saving",
+                "Est. Time",
+                "Compatibility",
+                "Preset / CRF",
+                "Tradeoff",
+            ]
+        )
+        self.profile_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.profile_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.profile_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.profile_table.setSortingEnabled(False)
+        self._configure_table(
+            self.profile_table,
+            "profile_options",
+            default_widths=[170, 110, 110, 110, 110, 130, 120, 360],
+        )
         self.compression_table = QTableWidget(0, 8)
         self.compression_table.setHorizontalHeaderLabels(
             ["File", "Codec", "Recommendation", "Reason", "Issue", "Est. Output", "Est. Saving", "Selected"]
@@ -1122,12 +1159,22 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.encode_projection_bar)
         self.encode_card.setVisible(False)
 
+        profile_layout = QVBoxLayout(self.profile_review_group)
+        profile_layout.addWidget(self.profile_review_label)
+        self.profile_table.setMinimumHeight(150)
+        profile_layout.addWidget(self.profile_table)
+        profile_action_row = QHBoxLayout()
+        profile_action_row.addWidget(self.profile_review_status_label, stretch=1)
+        profile_action_row.addWidget(self.accept_profile_button)
+        profile_layout.addLayout(profile_action_row)
+
         compress_splitter = QSplitter(Qt.Horizontal)
         compress_splitter.addWidget(left_pane)
         compress_splitter.addWidget(right_pane)
         compress_splitter.setStretchFactor(0, 1)
         compress_splitter.setStretchFactor(1, 2)
 
+        ready_layout.addWidget(self.profile_review_group)
         ready_layout.addWidget(self.encode_card)
         toggle_row = QHBoxLayout()
         toggle_row.addStretch(1)
@@ -1226,6 +1273,9 @@ class MainWindow(QMainWindow):
         self.toggle_details_button.toggled.connect(self._toggle_details)
         self.review_filter_combo.currentTextChanged.connect(lambda *_: self._apply_review_filter())
         self.compression_filter_combo.currentTextChanged.connect(lambda *_: self._apply_compression_filter())
+        self.profile_table.itemSelectionChanged.connect(self._profile_selection_changed)
+        self.profile_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_profile())
+        self.accept_profile_button.clicked.connect(self._accept_selected_profile)
 
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
@@ -2077,6 +2127,221 @@ class MainWindow(QMainWindow):
             return f"{hours}h"
         return f"{s // 60}m {s % 60}s"
 
+    def _profile_options(self, preparation: EncodePreparation | None = None) -> list[object]:
+        prep = preparation or self.encode_preparation
+        if prep is None:
+            return []
+        return list(getattr(prep, "profile_options", None) or [])
+
+    def _profile_label(self, profile: object | None) -> str:
+        if profile is None:
+            return "No profile selected"
+        return f"{getattr(profile, 'name', 'Profile')} ({getattr(profile, 'encoder_key', 'encoder')}, CRF {getattr(profile, 'crf', '?')})"
+
+    def _profile_tooltip(self, profile: object) -> str:
+        parts = [
+            self._profile_label(profile),
+            f"Quality: {getattr(profile, 'quality_label', None) or 'Not specified'}",
+            f"Intent: {getattr(profile, 'intent_label', None) or 'Not specified'}",
+            f"Preset: {getattr(profile, 'sw_preset', None) or getattr(profile, 'encoder_key', '')}",
+            f"CRF: {getattr(profile, 'crf', '')}",
+        ]
+        why = getattr(profile, "why_choose", None)
+        if why:
+            parts.append(str(why))
+        return "\n".join(str(part) for part in parts if part)
+
+    def _profile_payload(self, profile: object | None) -> dict[str, object] | None:
+        if profile is None:
+            return None
+        return {
+            "id": profile_id_for(profile),
+            "name": getattr(profile, "name", None),
+            "quality": getattr(profile, "quality_label", None),
+            "intent": getattr(profile, "intent_label", None),
+            "encoder_key": getattr(profile, "encoder_key", None),
+            "preset": getattr(profile, "sw_preset", None),
+            "crf": getattr(profile, "crf", None),
+            "estimated_output_bytes": getattr(profile, "estimated_output_bytes", None),
+            "estimated_encode_seconds": getattr(profile, "estimated_encode_seconds", None),
+            "compatible_count": getattr(profile, "compatible_count", None),
+            "incompatible_count": getattr(profile, "incompatible_count", None),
+            "reason": getattr(profile, "why_choose", None),
+        }
+
+    def _selected_profile_option(self) -> object | None:
+        selected_id = self._selected_profile_id or profile_id_for(
+            getattr(self.encode_preparation, "profile", None)
+        )
+        for option in self._profile_options():
+            if profile_id_for(option) == selected_id:
+                return option
+        return getattr(self.encode_preparation, "profile", None) if self.encode_preparation is not None else None
+
+    def _profile_review_is_satisfied(self) -> bool:
+        return not self._profile_review_required or self._profile_review_acknowledged
+
+    def _prepare_profile_review(self, preparation: EncodePreparation) -> None:
+        options = self._profile_options(preparation)
+        self._selected_profile_id = getattr(preparation, "selected_profile_id", None) or profile_id_for(preparation.profile)
+        self._pending_profile_id = self._selected_profile_id
+        self._profile_selection_method = str(getattr(preparation, "profile_selection_method", None) or "recommended")
+        self._profile_review_required = bool(self.overwrite.isChecked() and len(options) > 1 and preparation.profile is not None)
+        self._profile_review_acknowledged = not self._profile_review_required
+        if (
+            self._profile_review_required
+            and self._profile_rebuild_profile_id is not None
+            and self._profile_rebuild_profile_id == self._selected_profile_id
+        ):
+            self._profile_review_acknowledged = True
+            self._profile_selection_method = "manual"
+        self._profile_rebuild_profile_id = None
+        self._populate_profile_table(preparation)
+
+    def _populate_profile_table(self, preparation: EncodePreparation) -> None:
+        options = self._profile_options(preparation)
+        self.profile_review_group.setVisible(bool(options and len(options) > 1))
+        self.profile_table.blockSignals(True)
+        self.profile_table.setRowCount(0)
+        recommended_id = getattr(preparation, "recommended_profile_id", None)
+        selected_id = self._selected_profile_id
+        input_bytes = int(getattr(preparation, "selected_input_bytes", 0) or 0)
+        for row, profile in enumerate(options):
+            profile_id = profile_id_for(profile)
+            estimated_output = int(getattr(profile, "estimated_output_bytes", 0) or 0)
+            if profile_id == selected_id and preparation.selected_estimated_output_bytes:
+                estimated_output = int(preparation.selected_estimated_output_bytes)
+            estimated_saving = max(input_bytes - estimated_output, 0) if estimated_output else 0
+            compatible = int(getattr(profile, "compatible_count", 0) or 0)
+            incompatible = int(getattr(profile, "incompatible_count", 0) or 0)
+            name = str(getattr(profile, "name", "Profile"))
+            if profile_id == selected_id:
+                name = f"* {name}"
+            elif profile_id == recommended_id:
+                name = f"{name} (native recommendation)"
+            values = [
+                name,
+                str(getattr(profile, "quality_label", "") or ""),
+                self._format_bytes(estimated_output) if estimated_output else "",
+                self._format_bytes(estimated_saving) if estimated_saving else "",
+                self._format_elapsed(float(getattr(profile, "estimated_encode_seconds", 0.0) or 0.0)),
+                f"{compatible} compatible / {incompatible} incompatible",
+                f"{getattr(profile, 'sw_preset', None) or getattr(profile, 'encoder_key', '')}, CRF {getattr(profile, 'crf', '')}",
+                str(getattr(profile, "why_choose", None) or getattr(profile, "intent_label", "") or ""),
+            ]
+            self.profile_table.insertRow(row)
+            tooltip = self._profile_tooltip(profile)
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setToolTip(tooltip if column in {0, 7} else f"{value}\n\n{tooltip}".strip())
+                if column == 0:
+                    cell.setData(Qt.UserRole, profile_id)
+                self.profile_table.setItem(row, column, cell)
+            if profile_id == selected_id:
+                self.profile_table.selectRow(row)
+        self.profile_table.blockSignals(False)
+        self._refresh_profile_review_text()
+
+    def _refresh_profile_review_text(self) -> None:
+        if self.encode_preparation is None:
+            return
+        selected = self._selected_profile_option()
+        self.profile_review_label.setText(
+            "Choose the encoding profile before overwriting originals. "
+            "Higher-quality profiles usually keep more detail and larger files; speed-first profiles finish sooner."
+        )
+        if not self._profile_review_required:
+            self.profile_review_status_label.setText("")
+            self.accept_profile_button.setText("Use Selected Profile")
+        elif self._profile_review_acknowledged:
+            self.profile_review_status_label.setText(
+                f"Profile accepted: {self._profile_label(selected)}. Start Compression is now available."
+            )
+            self.accept_profile_button.setText("Use Selected Profile")
+        elif self._pending_profile_id and self._pending_profile_id != self._selected_profile_id:
+            self.profile_review_status_label.setText(
+                "Profile changed. Rebuild the compression plan before starting so estimates, sessions, and jobs match."
+            )
+            self.accept_profile_button.setText("Rebuild With Selected Profile")
+        else:
+            self.profile_review_status_label.setText(
+                f"Review required before overwrite compression starts. Current default: {self._profile_label(selected)}."
+            )
+            self.accept_profile_button.setText("Accept Selected Profile")
+
+    def _profile_selection_changed(self) -> None:
+        row = self.profile_table.currentRow()
+        item = self.profile_table.item(row, 0) if row >= 0 else None
+        self._pending_profile_id = str(item.data(Qt.UserRole)) if item is not None else self._selected_profile_id
+        if self._pending_profile_id != self._selected_profile_id:
+            self._profile_review_acknowledged = False
+        self._refresh_profile_review_text()
+        self._update_ui()
+
+    def _accept_selected_profile(self) -> None:
+        if self.encode_preparation is None:
+            return
+        profile_id = self._pending_profile_id or self._selected_profile_id
+        if not profile_id:
+            return
+        if profile_id != self._selected_profile_id:
+            self._start_profile_rebuild(profile_id)
+            return
+        self._profile_review_acknowledged = True
+        self._diagnostics.record_event(
+            "profile_review_accepted",
+            selected_profile_id=self._selected_profile_id,
+            selected_profile=self._profile_payload(self._selected_profile_option()),
+            selection_method=self._profile_selection_method,
+        )
+        self._refresh_profile_review_text()
+        self._update_compress_summary()
+        self._update_ui()
+
+    def _start_profile_rebuild(self, selected_profile_id: str) -> None:
+        if self.encode_preparation is None:
+            return
+        self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
+        try:
+            config = self._current_config()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._persist_ui_state()
+        source_paths = set(self._compression_source_paths) if self._compression_source_paths is not None else None
+        previous_profile = self._profile_payload(getattr(self.encode_preparation, "profile", None))
+        self._profile_review_acknowledged = False
+        self._profile_rebuild_profile_id = selected_profile_id
+        self._diagnostics.record_event(
+            "profile_rebuild_started",
+            compression_root=str(config.compression_root),
+            source_paths=[str(path) for path in sorted(source_paths or set())],
+            previous_profile=previous_profile,
+            selected_profile_id=selected_profile_id,
+        )
+        self.prepare_progress.setRange(0, 0)
+        self.prepare_log.clear()
+        self.prepare_log.appendPlainText("Rebuilding compression plan with the selected encoding profile...")
+        self.compress_preparing_label.setText("Rebuilding compression plan with selected profile...")
+        self.prepare_stage_label.setText("Discovering files...")
+        self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
+        self.prepare_timeline_label.setText(self._preparation_timeline_text("discovering"))
+        self._preparation_model = PreparationProgressModel()
+        self._set_current_action("Rebuilding compression plan with selected profile")
+        self._set_state(WorkflowState.PREPARING_COMPRESSION)
+        self._switch_tab("compress")
+        self._preparation_start = time.monotonic()
+        self._preparation_last_update_at = self._preparation_start
+        self._preparation_timer.start()
+        self._flush_runtime_diagnostics()
+        worker = FunctionWorker(
+            prepare_compression,
+            config,
+            source_paths=source_paths,
+            selected_profile_id=selected_profile_id,
+        )
+        self._start_worker(worker, self._compression_prepared, self._preparation_progress)
+
     @staticmethod
     def _summarize_path(path_text: str | None) -> str:
         if not path_text:
@@ -2699,6 +2964,16 @@ class MainWindow(QMainWindow):
         self._last_compression_stall_state = ""
         self._last_progress_payload = None
         self._overwrite_audit_manifest_path = None
+        self._profile_review_required = False
+        self._profile_review_acknowledged = True
+        self._selected_profile_id = None
+        self._pending_profile_id = None
+        self._profile_rebuild_profile_id = None
+        self._profile_selection_method = "recommended"
+        self.profile_review_group.setVisible(False)
+        self.profile_table.setRowCount(0)
+        self.profile_review_label.setText("")
+        self.profile_review_status_label.setText("")
         self.prepare_elapsed_label.setText("")
         self.prepare_stage_label.setText("Analysing files...")
         self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
@@ -2902,6 +3177,7 @@ class MainWindow(QMainWindow):
             has_compression_plan
             and self._runnable_jobs(self.encode_preparation)
             and not self._compression_plan_is_blocked()
+            and self._profile_review_is_satisfied()
             and self.workflow_state == WorkflowState.READY_TO_COMPRESS
             and not busy
             and not self._config_dirty
@@ -2970,6 +3246,13 @@ class MainWindow(QMainWindow):
 
         self.start_compress_button.setEnabled(can_start_compression)
         self.start_compress_button.setToolTip(self._compression_start_tooltip())
+        self.accept_profile_button.setEnabled(
+            self.profile_review_group.isVisible()
+            and has_compression_plan
+            and self.workflow_state == WorkflowState.READY_TO_COMPRESS
+            and not busy
+            and not self._config_dirty
+        )
         self.include_risky_jobs.setVisible(bool(self._plan_classification.risky_follow_up))
         self.include_risky_jobs.setEnabled(has_compression_plan and not busy and not self._config_dirty)
         can_rebuild_safer = bool(
@@ -3368,6 +3651,18 @@ class MainWindow(QMainWindow):
             lines.append(
                 f"Profile: {prep.profile.name} ({prep.profile.encoder_key}, CRF {prep.profile.crf})"
             )
+            quality = getattr(prep.profile, "quality_label", None)
+            intent = getattr(prep.profile, "intent_label", None)
+            if quality or intent:
+                parts = [part for part in [f"quality: {quality}" if quality else None, intent] if part]
+                lines.append(f"Profile tradeoff: {', '.join(parts)}")
+            if self._profile_review_required:
+                if self._profile_review_acknowledged:
+                    lines.append(
+                        f"Profile reviewed: {self._profile_selection_method.replace('-', ' ')} selection accepted."
+                    )
+                else:
+                    lines.append("Profile review required: accept or change the encoding profile before starting.")
         if prep.recommendation_reason:
             lines.append(f"Reason: {prep.recommendation_reason}")
         if prep.followup_manifest_path:
@@ -5952,6 +6247,7 @@ class MainWindow(QMainWindow):
         self.prepare_progress.setRange(0, 100)
         self.prepare_progress.setValue(100)
         self.include_risky_jobs.setChecked(False)
+        self._prepare_profile_review(preparation)
         self._populate_compression_table(preparation)
         self._config_dirty = False
         self.compress_hint_label.setText(self._compression_scope_banner_text())
@@ -5970,6 +6266,8 @@ class MainWindow(QMainWindow):
                 skip_count=0,
                 scope=self._compression_scope,
                 source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
+                profile_options=[],
+                selected_profile=None,
             )
             self._flush_runtime_diagnostics()
             return
@@ -5986,6 +6284,13 @@ class MainWindow(QMainWindow):
                 skip_count=preparation.skip_count,
                 scope=self._compression_scope,
                 source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
+                profile_options=[self._profile_payload(profile) for profile in self._profile_options(preparation)],
+                selected_profile=self._profile_payload(preparation.profile),
+                selected_profile_id=self._selected_profile_id,
+                recommended_profile_id=getattr(preparation, "recommended_profile_id", None),
+                profile_selection_method=self._profile_selection_method,
+                profile_review_required=self._profile_review_required,
+                profile_review_accepted=self._profile_review_acknowledged,
             )
             self._flush_runtime_diagnostics()
             return
@@ -6039,6 +6344,13 @@ class MainWindow(QMainWindow):
             scope=self._compression_scope,
             source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
             speed_warning=speed_warning,
+            profile_options=[self._profile_payload(profile) for profile in self._profile_options(preparation)],
+            selected_profile=self._profile_payload(preparation.profile),
+            selected_profile_id=self._selected_profile_id,
+            recommended_profile_id=getattr(preparation, "recommended_profile_id", None),
+            profile_selection_method=self._profile_selection_method,
+            profile_review_required=self._profile_review_required,
+            profile_review_accepted=self._profile_review_acknowledged,
         )
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
@@ -6492,6 +6804,8 @@ class MainWindow(QMainWindow):
             return "Settings changed after planning. Rebuild the compression plan first."
         if self.workflow_state != WorkflowState.READY_TO_COMPRESS:
             return "Finish preparing the compression plan before starting encoding."
+        if not self._profile_review_is_satisfied():
+            return "Review and accept an encoding profile before overwrite compression starts."
         if prep.profile is None:
             return "No encoder profile is selected for this plan. Rebuild with safer settings first."
         if self._compatibility_counts_block(prep):
@@ -6781,6 +7095,9 @@ class MainWindow(QMainWindow):
         if self._config_dirty:
             self._show_error("Settings changed after the compression plan was prepared. Prepare the plan again.")
             return
+        if not self._profile_review_is_satisfied():
+            self._show_error(self._compression_start_tooltip())
+            return
         if self._compression_plan_is_blocked():
             self._show_error(self._compression_start_tooltip())
             return
@@ -6821,6 +7138,15 @@ class MainWindow(QMainWindow):
             f"Estimated output: {self._format_bytes(runnable_preparation.selected_estimated_output_bytes)}",
             f"Ordering: {self.compression_order_combo.currentText()}",
         ]
+        if runnable_preparation.profile is not None:
+            summary_lines.append(f"Profile: {self._profile_label(runnable_preparation.profile)}")
+            profile_parts = [
+                getattr(runnable_preparation.profile, "quality_label", None),
+                getattr(runnable_preparation.profile, "intent_label", None),
+            ]
+            tradeoff = " • ".join(str(part) for part in profile_parts if part)
+            if tradeoff:
+                summary_lines.append(f"Tradeoff: {tradeoff}")
         warning_lines: list[str] = []
         if self.overwrite.isChecked():
             warning_lines.append(
@@ -6896,6 +7222,12 @@ class MainWindow(QMainWindow):
             source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
             resume_session=resume_status,
             deferred_risky=[str(path) for path in sorted({row.source for row in self._plan_classification.risky_follow_up} - self._runnable_sources())],
+            selected_profile=self._profile_payload(runnable_preparation.profile),
+            selected_profile_id=getattr(runnable_preparation, "selected_profile_id", None) or self._selected_profile_id,
+            recommended_profile_id=getattr(runnable_preparation, "recommended_profile_id", None),
+            profile_selection_method=self._profile_selection_method,
+            profile_review_required=self._profile_review_required,
+            profile_review_accepted=self._profile_review_acknowledged,
         )
         self._flush_runtime_diagnostics()
         self._compression_timer.start()
@@ -7056,6 +7388,14 @@ class MainWindow(QMainWindow):
                 str(self._overwrite_audit_manifest_path) if self._overwrite_audit_manifest_path else None
             ),
             not_encoded_organised_files=list(self._organised_not_encoded),
+            selected_profile=self._profile_payload(getattr(self.encode_preparation, "profile", None)),
+            selected_profile_id=getattr(self.encode_preparation, "selected_profile_id", None) if self.encode_preparation else None,
+            recommended_profile_id=getattr(self.encode_preparation, "recommended_profile_id", None)
+            if self.encode_preparation
+            else None,
+            profile_selection_method=self._profile_selection_method,
+            profile_review_required=self._profile_review_required,
+            profile_review_accepted=self._profile_review_acknowledged,
         )
         if self._compression_interrupted:
             self._append_status("Compression interrupted. Resume remaining jobs from the session record.")

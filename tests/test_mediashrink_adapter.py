@@ -16,6 +16,7 @@ from mediaflow.mediashrink_adapter import (
     prepare_retry_compression,
     prepare_safer_compression,
     prepare_speed_compression,
+    profile_id_for,
     run_compression,
     supports_encode_run_results,
     supports_prepare_source_paths,
@@ -300,6 +301,159 @@ def test_prepare_compression_passes_source_allowlist_to_mediashrink(tmp_path: Pa
 def test_mediashrink_capability_helpers_reflect_adapter_dependencies() -> None:
     assert supports_prepare_source_paths() in {True, False}
     assert supports_encode_run_results() in {True, False}
+
+
+def test_prepare_compression_forwards_selected_profile_id(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+    selected = "Balanced::slow::slow::20"
+    profile = SimpleNamespace(
+        name="Balanced",
+        encoder_key="slow",
+        sw_preset="slow",
+        crf=20,
+        estimated_output_bytes=40,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Quality-focused option.",
+    )
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x" * 100)
+    item = SimpleNamespace(
+        source=source,
+        codec="mpeg2video",
+        size_bytes=100,
+        estimated_output_bytes=50,
+        estimated_savings_bytes=50,
+        recommendation="recommended",
+        reason_text="Strong savings",
+    )
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[item],
+        duplicate_warnings=[],
+        profile=profile,
+        jobs=[_job(tmp_path, "movie.mkv")],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=40,
+        estimated_total_seconds=20.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        profile_options=[profile],
+        selected_profile_id=selected,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_prepare_encode_run(**kwargs):
+        captured.update(kwargs)
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", side_effect=fake_prepare_encode_run), patch(
+        "mediaflow.mediashrink_adapter.build_jobs", return_value=prep.jobs
+    ), patch("mediaflow.mediashrink_adapter.estimate_analysis_encode_seconds", return_value=20.0):
+        result = prepare_compression(config, selected_profile_id=selected)
+
+    assert captured["selected_profile_id"] == selected
+    assert result.selected_profile_id == selected
+    assert result.profile_selection_method == "manual"
+
+
+def test_prepare_compression_uses_quality_aware_default_for_movie_overwrite(tmp_path: Path) -> None:
+    movie_dir = tmp_path / "Movies" / "Movie (2000)"
+    movie_dir.mkdir(parents=True)
+    source = movie_dir / "Movie (2000).mkv"
+    source.write_bytes(b"x" * 100)
+    item = SimpleNamespace(
+        source=source,
+        codec="mpeg2video",
+        size_bytes=100,
+        estimated_output_bytes=50,
+        estimated_savings_bytes=50,
+        recommendation="recommended",
+        reason_text="Strong savings",
+    )
+    fast = SimpleNamespace(
+        name="Fast",
+        encoder_key="faster",
+        sw_preset="faster",
+        crf=22,
+        estimated_output_bytes=40,
+        estimated_encode_seconds=10.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Fast default.",
+    )
+    balanced = SimpleNamespace(
+        name="Balanced",
+        encoder_key="slow",
+        sw_preset="slow",
+        crf=20,
+        estimated_output_bytes=60,
+        estimated_encode_seconds=20.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Better quality for movies.",
+    )
+    job = EncodeJob(
+        source=source,
+        output=source.with_suffix(".out.mkv"),
+        tmp_output=source.with_suffix(".tmp.mkv"),
+        crf=20,
+        preset="slow",
+        dry_run=False,
+    )
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[item],
+        duplicate_warnings=[],
+        profile=fast,
+        jobs=[job],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=40,
+        estimated_total_seconds=10.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        profile_options=[fast, balanced],
+        recommended_profile_id=profile_id_for(fast),
+        selected_profile_id=profile_id_for(fast),
+    )
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(policy="fastest-wall-clock", overwrite=True),
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", return_value=prep), patch(
+        "mediaflow.mediashrink_adapter.build_jobs", return_value=[job]
+    ), patch("mediaflow.mediashrink_adapter.estimate_analysis_encode_seconds", return_value=20.0):
+        result = prepare_compression(config)
+
+    assert result.profile.name == "Balanced"
+    assert result.selected_profile_id == profile_id_for(balanced)
+    assert result.profile_selection_method == "quality-aware-default"
+    assert result.selected_estimated_output_bytes == 60
 
 
 def test_prepare_compression_filters_sources_when_mediashrink_lacks_allowlist(tmp_path: Path) -> None:
