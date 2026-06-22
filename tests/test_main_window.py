@@ -1144,6 +1144,74 @@ def test_preparing_compression_uses_preparing_view() -> None:
     assert "compression plan" in window.compress_hint_label.text().lower()
 
 
+def test_prepare_compression_worker_receives_cancel_callback(tmp_path: Path, monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    window.source_input.setText(str(tmp_path))
+    window.library_input.setText(str(tmp_path))
+    window.compression_root_input.setText(str(tmp_path))
+    window.compress_enabled.setChecked(True)
+    window._compatibility_checked = True
+    captured: dict[str, object] = {}
+
+    def fake_start_worker(worker, *_args):
+        captured["kwargs"] = worker.kwargs
+
+    monkeypatch.setattr(window, "_start_worker", fake_start_worker)
+
+    window._start_compression_preparation("Preparing test plan.")
+
+    assert "cancel_callback" in captured["kwargs"]
+    assert captured["kwargs"]["cancel_callback"]() is False
+    assert window.cancel_prepare_button.isEnabled() is True
+
+
+def test_cancel_prepare_button_sets_graceful_cancel_flag() -> None:
+    _app()
+    window = MainWindow()
+    window._set_state(WorkflowState.PREPARING_COMPRESSION)
+    window.cancel_prepare_button.setEnabled(True)
+
+    window._request_preparation_cancel()
+
+    assert window._compression_preparation_cancel_requested() is True
+    assert window.cancel_prepare_button.isEnabled() is False
+    assert "Cancel requested" in window.prepare_log.toPlainText()
+
+
+def test_cancelled_compression_preparation_reports_cancelled_state(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=0,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=0,
+        total_input_bytes=0,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        stage_messages=["Compression preparation was cancelled before a runnable plan was built."],
+        cancelled=True,
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
+    assert window.start_compress_button.isEnabled() is False
+    assert "cancelled" in window.current_action_label.text().lower()
+    assert any(event["kind"] == "compression_preparation_cancelled" for event in window._diagnostics.events)
+
+
 def test_preparation_progress_updates_stage_dashboard(tmp_path: Path) -> None:
     _app()
     window = MainWindow()

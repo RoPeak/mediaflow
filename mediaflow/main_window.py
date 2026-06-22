@@ -83,6 +83,7 @@ from .mediashrink_adapter import (
     run_compression,
     session_path_for_preparation,
     supports_encode_run_results,
+    supports_prepare_cancel_callback,
     supports_prepare_source_paths,
 )
 from .pipeline import build_pipeline_summary
@@ -176,6 +177,7 @@ class MainWindow(QMainWindow):
         self._scan_started_at: float | None = None
         self._scan_last_update_at: float | None = None
         self._preparation_last_update_at: float | None = None
+        self._preparation_cancel_requested: bool = False
         self._apply_started_at: float | None = None
         self._apply_last_update_at: float | None = None
         self._apply_progress: ApplyProgress | None = None
@@ -449,6 +451,7 @@ class MainWindow(QMainWindow):
         self.prepare_timeline_label.setWordWrap(True)
         self.prepare_timeline_label.setObjectName("muted-label")
         self.prepare_progress = QProgressBar()
+        self.cancel_prepare_button = QPushButton("Cancel Preparation")
         self.file_progress = QProgressBar()
         self.overall_progress = QProgressBar()
         self.start_compress_button = QPushButton("Start Compression")
@@ -1052,6 +1055,7 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.prepare_counts_label)
         card_layout.addWidget(self.prepare_elapsed_label)
         card_layout.addWidget(self.prepare_progress)
+        card_layout.addWidget(self.cancel_prepare_button)
         card_layout.addWidget(self.prepare_timeline_label)
         preparing_layout.addWidget(preparation_card)
         preparing_layout.addWidget(self.prepare_log, stretch=1)
@@ -1248,6 +1252,7 @@ class MainWindow(QMainWindow):
         self.preview_button.clicked.connect(self._preview_plan)
         self.apply_button.clicked.connect(self._apply_plan)
         self.start_compress_button.clicked.connect(self._start_compression)
+        self.cancel_prepare_button.clicked.connect(self._request_preparation_cancel)
         self.rebuild_safer_button.clicked.connect(self._prepare_safer_plan)
         self.prepare_followup_button.clicked.connect(self._prepare_followup_plan)
         self.retry_failed_button.clicked.connect(self._prepare_retry_plan)
@@ -3683,6 +3688,7 @@ class MainWindow(QMainWindow):
     def _dependency_capabilities_snapshot(self) -> dict[str, object]:
         return {
             "supports_mediashrink_source_paths": supports_prepare_source_paths(),
+            "supports_mediashrink_prepare_cancel": supports_prepare_cancel_callback(),
             "supports_mediashrink_encode_run_results": supports_encode_run_results(),
             "integrations": {
                 "plexify": self._module_origin_details("plexify"),
@@ -6046,6 +6052,7 @@ class MainWindow(QMainWindow):
             organised_batch_count=len(self._guided_batch_paths),
             fallback_warning=self._compression_scope_warning,
             supports_source_paths=supports_prepare_source_paths(),
+            supports_cancel_callback=supports_prepare_cancel_callback(),
             supports_encode_run_results=supports_encode_run_results(),
         )
         if self._compression_source_paths is not None and not supports_prepare_source_paths():
@@ -6060,6 +6067,8 @@ class MainWindow(QMainWindow):
             self.encode_preparation = None
             self.compression_table.setRowCount(0)
         self.prepare_progress.setRange(0, 0)
+        self._preparation_cancel_requested = False
+        self.cancel_prepare_button.setEnabled(True)
         self.file_progress.setValue(0)
         self.overall_progress.setValue(0)
         self.compress_status_log.clear()
@@ -6083,8 +6092,27 @@ class MainWindow(QMainWindow):
         self._preparation_last_update_at = self._preparation_start
         self._preparation_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(prepare_compression, config, source_paths=self._compression_source_paths)
+        worker = FunctionWorker(
+            prepare_compression,
+            config,
+            source_paths=self._compression_source_paths,
+            cancel_callback=self._compression_preparation_cancel_requested,
+        )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
+
+    def _request_preparation_cancel(self) -> None:
+        if self.workflow_state != WorkflowState.PREPARING_COMPRESSION:
+            return
+        self._preparation_cancel_requested = True
+        self.cancel_prepare_button.setEnabled(False)
+        self.prepare_log.appendPlainText("Cancel requested. Compression preparation will stop at the next safe checkpoint.")
+        self._append_status("Cancel requested. Compression preparation will stop at the next safe checkpoint.")
+        self._set_current_action("Stopping compression preparation at the next safe checkpoint")
+        self._diagnostics.record_event("compression_preparation_cancel_requested", scope=self._compression_scope)
+        self._flush_runtime_diagnostics()
+
+    def _compression_preparation_cancel_requested(self) -> bool:
+        return self._preparation_cancel_requested
 
     def _preparation_progress(self, payload: object) -> None:
         if isinstance(payload, PreparationStageUpdate):
@@ -6145,6 +6173,7 @@ class MainWindow(QMainWindow):
 
     def _compression_prepared(self, preparation: EncodePreparation) -> None:
         self._preparation_timer.stop()
+        self.cancel_prepare_button.setEnabled(False)
         self._preparation_last_update_at = None
         self._preparation_duration = time.monotonic() - self._preparation_start
         self.prepare_elapsed_label.setText("")
@@ -6160,6 +6189,23 @@ class MainWindow(QMainWindow):
         self.compress_hint_label.setText(self._compression_scope_banner_text())
         self._refresh_pipeline_summary()
         self._switch_tab("compress")
+        if bool(getattr(preparation, "cancelled", False)):
+            detail = "Compression preparation was cancelled before a runnable plan was built."
+            self._set_current_action(detail)
+            self._append_status(detail)
+            for line in preparation.stage_messages or []:
+                clean = self._strip_rich(line)
+                if clean not in self.prepare_log.toPlainText():
+                    self.prepare_log.appendPlainText(clean)
+            self._set_state(WorkflowState.READY_TO_COMPRESS)
+            self._diagnostics.record_event(
+                "compression_preparation_cancelled",
+                analysed_count=len(preparation.items),
+                scope=self._compression_scope,
+                source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
+            )
+            self._flush_runtime_diagnostics()
+            return
         self._complete_action("Compression plan prepared")
         if not preparation.items:
             self._set_current_action("Compression root scan finished with no supported video files")
@@ -6482,6 +6528,8 @@ class MainWindow(QMainWindow):
             retry_sources=[str(path) for path in sorted(self._retry_sources)],
         )
         self.prepare_progress.setRange(0, 0)
+        self._preparation_cancel_requested = False
+        self.cancel_prepare_button.setEnabled(True)
         self.prepare_log.clear()
         self.prepare_log.appendPlainText("Preparing compatibility-first retry plan...")
         self.compress_preparing_label.setText("Preparing compatibility-first retry plan...")
@@ -6495,7 +6543,12 @@ class MainWindow(QMainWindow):
         self._preparation_start = time.monotonic()
         self._preparation_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(prepare_retry_compression, config, set(self._retry_sources))
+        worker = FunctionWorker(
+            prepare_retry_compression,
+            config,
+            set(self._retry_sources),
+            cancel_callback=self._compression_preparation_cancel_requested,
+        )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
     def _prepare_safer_plan(self) -> None:
@@ -6519,6 +6572,8 @@ class MainWindow(QMainWindow):
             source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
         )
         self.prepare_progress.setRange(0, 0)
+        self._preparation_cancel_requested = False
+        self.cancel_prepare_button.setEnabled(True)
         self.prepare_log.clear()
         self.prepare_log.appendPlainText("Rebuilding compression plan with safer compatibility-first defaults...")
         self.compress_preparing_label.setText("Rebuilding compression plan with safer defaults...")
@@ -6537,6 +6592,7 @@ class MainWindow(QMainWindow):
             prepare_safer_compression,
             config,
             source_paths=self._compression_source_paths,
+            cancel_callback=self._compression_preparation_cancel_requested,
         )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
@@ -6571,6 +6627,8 @@ class MainWindow(QMainWindow):
             selection_groups=self._followup_selection_groups(sources),
         )
         self.prepare_progress.setRange(0, 0)
+        self._preparation_cancel_requested = False
+        self.cancel_prepare_button.setEnabled(True)
         self.prepare_log.clear()
         if maybe_count == len(sources):
             intro = "Preparing maybe follow-up plan for opt-in files..."
@@ -6591,7 +6649,12 @@ class MainWindow(QMainWindow):
         self._preparation_last_update_at = self._preparation_start
         self._preparation_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(prepare_retry_compression, config, sources)
+        worker = FunctionWorker(
+            prepare_retry_compression,
+            config,
+            sources,
+            cancel_callback=self._compression_preparation_cancel_requested,
+        )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
     def _select_followup_sources(self, sources: set[Path]) -> set[Path] | None:

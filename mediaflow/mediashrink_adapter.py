@@ -53,6 +53,7 @@ def prepare_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
     source_paths: Collection[Path] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     kwargs = {
         "directory": config.compression_root,
@@ -71,12 +72,20 @@ def prepare_compression(
     }
     if source_paths is not None and _supports_prepare_source_paths():
         kwargs["source_paths"] = source_paths
+    if cancel_callback is not None and _supports_prepare_cancel_callback():
+        kwargs["cancel_callback"] = cancel_callback
     try:
         preparation = prepare_encode_run(**kwargs)
     except TypeError as exc:
-        if "source_paths" not in kwargs or "source_paths" not in str(exc):
+        unsupported = {
+            name
+            for name in ("source_paths", "cancel_callback")
+            if name in kwargs and name in str(exc)
+        }
+        if not unsupported:
             raise
-        kwargs.pop("source_paths", None)
+        for name in unsupported:
+            kwargs.pop(name, None)
         preparation = prepare_encode_run(**kwargs)
     if source_paths is not None and "source_paths" not in kwargs:
         preparation = _filter_preparation_to_sources(preparation, set(source_paths))
@@ -87,6 +96,7 @@ def prepare_safer_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
     source_paths: Collection[Path] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     safer_config = replace(
         config,
@@ -101,6 +111,7 @@ def prepare_safer_compression(
         safer_config,
         progress_callback=progress_callback,
         source_paths=source_paths,
+        cancel_callback=cancel_callback,
     )
     extra_messages = list(preparation.stage_messages or [])
     extra_messages.append(
@@ -235,6 +246,7 @@ def prepare_retry_compression(
     config: PipelineConfig,
     retry_sources: set[Path],
     progress_callback: Callable[[object], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     retry_config = replace(
         config,
@@ -250,6 +262,7 @@ def prepare_retry_compression(
         retry_config,
         progress_callback=progress_callback,
         source_paths=retry_sources,
+        cancel_callback=cancel_callback,
     )
     filtered = _filter_preparation_to_sources(preparation, retry_sources)
     extra_messages = list(filtered.stage_messages or [])
@@ -369,8 +382,23 @@ def _supports_prepare_source_paths() -> bool:
     )
 
 
+def _supports_prepare_cancel_callback() -> bool:
+    try:
+        signature = inspect.signature(prepare_encode_run)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "cancel_callback"
+        for name, parameter in signature.parameters.items()
+    )
+
+
 def supports_prepare_source_paths() -> bool:
     return _supports_prepare_source_paths()
+
+
+def supports_prepare_cancel_callback() -> bool:
+    return _supports_prepare_cancel_callback()
 
 
 def supports_encode_run_results() -> bool:
@@ -550,5 +578,6 @@ __all__ = [
     "resumable_session_status",
     "run_compression",
     "supports_encode_run_results",
+    "supports_prepare_cancel_callback",
     "supports_prepare_source_paths",
 ]
