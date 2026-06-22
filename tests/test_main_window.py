@@ -1428,6 +1428,7 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     assert ".mediashrink-session.json" in names
     assert "mediaflow-last-organised-batch.json" in names
     assert "mediaflow-dependency-capabilities.json" in names
+    assert "mediaflow-run-timeline.txt" in names
     assert window._diagnostics.events[-1]["redacted"] is False
 
 
@@ -1622,6 +1623,9 @@ def test_zero_job_compression_plan_explains_disabled_start(tmp_path: Path) -> No
     assert "no encode jobs were auto-selected" in window.compress_summary_label.text().lower()
     assert "no runnable jobs were selected" in window.start_compress_button.toolTip().lower()
     assert window.compression_table.item(0, 7).text() == "recommended only"
+    assert window.compression_why_group.isHidden() is False
+    assert "why nothing can run" in window.compression_why_label.text().lower()
+    assert "attempted profile: fast" in window.compression_why_label.text().lower()
 
 
 def test_guided_zero_job_plan_prompts_for_safer_rebuild(monkeypatch, tmp_path: Path) -> None:
@@ -1667,6 +1671,8 @@ def test_guided_zero_job_plan_prompts_for_safer_rebuild(monkeypatch, tmp_path: P
 
     assert prompted == ["safer"]
     assert window.compression_table.item(0, 7).text() == "blocked by profile"
+    assert window.compression_scope_details_button.isHidden() is False
+    assert str(item_source) in window.compression_scope_details.toPlainText()
     assert any(event["kind"] == "zero_runnable_safer_rebuild_prompted" for event in window._diagnostics.events)
 
 
@@ -1700,6 +1706,60 @@ def test_prepare_safer_plan_preserves_guided_source_scope(monkeypatch, tmp_path:
     assert captured["kwargs"]["source_paths"] == {item_source}
     assert window._diagnostics.events[-1]["kind"] == "safer_preparation_started"
     assert window._diagnostics.events[-1]["scope"] == "guided-organised-batch"
+
+
+def test_preflight_check_records_free_space_recheck(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    preparation = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[SimpleNamespace(source=source, size_bytes=100, estimated_output_bytes=50)],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=50,
+        estimated_total_seconds=1.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    error = window._preflight_check(preparation)
+
+    assert error is None
+    assert "Free-space recheck" in window._last_compression_space_check
+    assert any(
+        event["kind"] == "compression_space_recheck" and event["status"] == "ok"
+        for event in window._diagnostics.events
+    )
+
+
+def test_summary_run_timeline_log_uses_diagnostics_events() -> None:
+    _app()
+    window = MainWindow()
+    window._diagnostics.record_event("scan_started", message="Scanning")
+    window._diagnostics.record_event(
+        "compression_space_recheck",
+        status="ok",
+        free_bytes=1000,
+        required_bytes=500,
+    )
+
+    window._refresh_pipeline_summary()
+
+    text = window.summary_timeline_log.toPlainText()
+    assert "scan_started" in text
+    assert "compression_space_recheck" in text
+    assert "status=ok" in text
 
 
 def test_guided_batch_paths_write_previous_batch_manifest(tmp_path: Path) -> None:

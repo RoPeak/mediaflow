@@ -204,6 +204,7 @@ class MainWindow(QMainWindow):
         self._last_compression_stall_state: str = ""
         self._last_progress_payload: EncodeProgress | None = None
         self._overwrite_audit_manifest_path: Path | None = None
+        self._last_compression_space_check: str = ""
         self._review_action_timeline: list[dict[str, object]] = []
         self._last_bulk_undo: dict[str, object] | None = None
         self._review_item_started_at: dict[int, float] = {}
@@ -501,6 +502,19 @@ class MainWindow(QMainWindow):
         self.compression_filter_status_label = QLabel("")
         self.compression_filter_status_label.setWordWrap(True)
         self.compression_filter_status_label.setObjectName("muted-label")
+        self.compression_why_group = QGroupBox("Why Nothing Can Run")
+        self.compression_why_group.setVisible(False)
+        why_layout = QVBoxLayout(self.compression_why_group)
+        self.compression_why_label = QLabel("")
+        self.compression_why_label.setWordWrap(True)
+        why_layout.addWidget(self.compression_why_label)
+        self.compression_scope_details_button = QPushButton("Show Scoped Files")
+        self.compression_scope_details_button.setCheckable(True)
+        self.compression_scope_details_button.setVisible(False)
+        self.compression_scope_details = QPlainTextEdit()
+        self.compression_scope_details.setReadOnly(True)
+        self.compression_scope_details.setMaximumHeight(150)
+        self.compression_scope_details.setVisible(False)
         self.compression_order_combo = QComboBox()
         self.compression_order_combo.addItems(["Current order", "Fastest first", "Largest savings first"])
         self.compression_table = QTableWidget(0, 8)
@@ -597,6 +611,9 @@ class MainWindow(QMainWindow):
         self.summary_timeline_label = QLabel()
         self.summary_timeline_label.setWordWrap(True)
         self.summary_timeline_label.setObjectName("muted-label")
+        self.summary_timeline_log = QPlainTextEdit()
+        self.summary_timeline_log.setReadOnly(True)
+        self.summary_timeline_log.setMaximumHeight(180)
         self.summary_filter_combo = QComboBox()
         self.summary_filter_combo.addItems(["All results", "Encoded only", "Failed only", "Skipped only", "Retry-ready"])
         self.summary_filter_status_label = QLabel("")
@@ -1104,6 +1121,9 @@ class MainWindow(QMainWindow):
         plan_control_row.addWidget(self.compression_order_combo, stretch=1)
         right_layout.addLayout(plan_control_row)
         right_layout.addWidget(self.compression_filter_status_label)
+        right_layout.addWidget(self.compression_why_group)
+        right_layout.addWidget(self.compression_scope_details_button)
+        right_layout.addWidget(self.compression_scope_details)
         self.compression_table.setMinimumHeight(280)
         right_layout.addWidget(self.compression_table, stretch=1)
         right_layout.addWidget(self.toggle_details_button)
@@ -1164,6 +1184,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.diagnostics_path_label)
         layout.addWidget(self.summary_failure_label)
         layout.addWidget(self.summary_timeline_label)
+        layout.addWidget(self.summary_timeline_log)
         tile_row = QHBoxLayout()
         tile_row.addWidget(self.stat_files_label)
         tile_row.addWidget(self.stat_saved_label)
@@ -1230,6 +1251,7 @@ class MainWindow(QMainWindow):
         self.prepare_previous_batch_button.clicked.connect(self._prepare_previous_batch_compression)
         self.reset_button.clicked.connect(lambda: self._reset_runtime_state("Cleared runtime state."))
         self.toggle_details_button.toggled.connect(self._toggle_details)
+        self.compression_scope_details_button.toggled.connect(self._toggle_compression_scope_details)
         self.review_filter_combo.currentTextChanged.connect(lambda *_: self._apply_review_filter())
         self.compression_filter_combo.currentTextChanged.connect(lambda *_: self._apply_compression_filter())
 
@@ -2395,6 +2417,10 @@ class MainWindow(QMainWindow):
     def _toggle_details(self, checked: bool) -> None:
         self.compress_status_log.setVisible(checked)
         self.toggle_details_button.setText("Hide Details" if checked else "Show Details")
+
+    def _toggle_compression_scope_details(self, checked: bool) -> None:
+        self.compression_scope_details.setVisible(checked)
+        self.compression_scope_details_button.setText("Hide Scoped Files" if checked else "Show Scoped Files")
 
     def _on_config_edited(self, *_args) -> None:
         if self._loading_state:
@@ -3618,6 +3644,7 @@ class MainWindow(QMainWindow):
         }
         snapshot_text = json.dumps(snapshot_payload, indent=2, sort_keys=True)
         digest_text = self._diagnostics_digest_text()
+        timeline_text = self._run_timeline_details_text()
         snapshot_path.write_text(self._redact_export_text(snapshot_text) if redact else snapshot_text, encoding="utf-8")
         digest_path.write_text(self._redact_export_text(digest_text) if redact else digest_text, encoding="utf-8")
         with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -3642,6 +3669,10 @@ class MainWindow(QMainWindow):
                 "mediaflow-dependency-capabilities.json",
                 json.dumps(self._dependency_capabilities_snapshot(), indent=2, sort_keys=True),
             )
+            archive.writestr(
+                "mediaflow-run-timeline.txt",
+                self._redact_export_text(timeline_text) if redact else timeline_text,
+            )
             archive.write(snapshot_path, arcname=snapshot_path.name)
             archive.write(digest_path, arcname=digest_path.name)
         snapshot_path.unlink(missing_ok=True)
@@ -3664,7 +3695,7 @@ class MainWindow(QMainWindow):
             "Yes: redact home-folder paths before bundling.\n"
             "No: keep full local paths for easier debugging.\n\n"
             "Bundle contents include diagnostics JSON/log, digest, review snapshot, dependency capabilities, "
-            "session/audit records when available, and the latest pre-apply or batch manifest when available.",
+            "run timeline, session/audit records when available, and the latest pre-apply or batch manifest when available.",
         ) == QMessageBox.Yes
 
     def _write_bundle_file(self, archive: zipfile.ZipFile, path: Path, *, redact: bool) -> None:
@@ -3951,17 +3982,47 @@ class MainWindow(QMainWindow):
             required_bytes = recommended_headroom_bytes(preparation)
             if usage.free < required_bytes:
                 required_gb = required_bytes / (1024 ** 3)
+                self._last_compression_space_check = (
+                    f"Free-space recheck failed: {free_gb:.1f} GB available; "
+                    f"{required_gb:.1f} GB recommended."
+                )
+                self._diagnostics.record_event(
+                    "compression_space_recheck",
+                    status="failed",
+                    root=str(root),
+                    free_bytes=usage.free,
+                    required_bytes=required_bytes,
+                )
                 return (
                     "The compression root may not have enough temporary working space for a safe in-place run. "
                     f"Available: {free_gb:.1f} GB. Recommended headroom: {required_gb:.1f} GB."
                 )
+            self._last_compression_space_check = (
+                f"Free-space recheck: {free_gb:.1f} GB available; "
+                f"{required_bytes / (1024 ** 3):.1f} GB recommended."
+            )
+            self._diagnostics.record_event(
+                "compression_space_recheck",
+                status="ok",
+                root=str(root),
+                free_bytes=usage.free,
+                required_bytes=required_bytes,
+            )
             probe = root / ".mediaflow_write_probe"
             try:
                 probe.write_bytes(b"")
                 probe.unlink()
             except OSError:
+                self._diagnostics.record_event(
+                    "compression_space_recheck",
+                    status="not_writable",
+                    root=str(root),
+                    free_bytes=usage.free,
+                    required_bytes=required_bytes,
+                )
                 return f"Compression root is not writable: {root}"
         except Exception as exc:  # noqa: BLE001
+            self._diagnostics.record_event("compression_space_recheck", status="error", error=str(exc))
             return f"Preflight check failed: {exc}"
         return None
 
@@ -4056,6 +4117,62 @@ class MainWindow(QMainWindow):
             seen_kinds.add(kind)
             labels.append(label)
         return f"Run timeline: {'  •  '.join(labels)}" if labels else ""
+
+    def _run_timeline_details_text(self) -> str:
+        rows: list[str] = []
+        started_at = self._diagnostics.started_at
+        interesting = {
+            "guided_pipeline_started",
+            "scan_started",
+            "scan_finished",
+            "manual_match",
+            "bulk_apply",
+            "organisation_preview_ready",
+            "organisation_apply_started",
+            "organisation_applied",
+            "compression_preparation_started",
+            "preparation_stage",
+            "compression_prepared",
+            "zero_runnable_safer_rebuild_prompted",
+            "safer_preparation_started",
+            "compression_space_recheck",
+            "compression_started",
+            "compression_complete",
+            "compression_interrupted",
+            "compression_preparation_cancelled",
+            "warning",
+        }
+        for event in self._diagnostics.events:
+            kind = str(event.get("kind", ""))
+            if kind not in interesting:
+                continue
+            timestamp = str(event.get("timestamp", ""))
+            prefix = kind
+            if timestamp:
+                try:
+                    seconds = max(0.0, (datetime.fromisoformat(timestamp) - started_at).total_seconds())
+                    prefix = f"{self._format_elapsed(seconds)}  {kind}"
+                except ValueError:
+                    pass
+            detail_parts = []
+            for key in (
+                "message",
+                "scope",
+                "selected_count",
+                "recommended_count",
+                "maybe_count",
+                "runnable_now",
+                "jobs",
+                "status",
+                "free_bytes",
+                "required_bytes",
+                "text",
+            ):
+                value = event.get(key)
+                if value not in (None, "", []):
+                    detail_parts.append(f"{key}={value}")
+            rows.append(prefix + (f" | {', '.join(detail_parts)}" if detail_parts else ""))
+        return "\n".join(rows)
 
     def _event_time(self, kind: str) -> datetime | None:
         for event in self._diagnostics.events:
@@ -6301,6 +6418,63 @@ class MainWindow(QMainWindow):
             )
         return "Compression plan contains no selected jobs."
 
+    def _compression_no_run_details(self, preparation: EncodePreparation | None) -> str:
+        if preparation is None:
+            return ""
+        if preparation.jobs and self._runnable_jobs(preparation):
+            return ""
+        profile_text = (
+            f"{preparation.profile.name} ({preparation.profile.encoder_key}, CRF {preparation.profile.crf})"
+            if preparation.profile is not None
+            else "none selected"
+        )
+        blockers: list[str] = []
+        if preparation.profile is None:
+            blockers.append("No encoder profile was selected automatically.")
+        if self._compatibility_counts_block(preparation):
+            blockers.append("The selected profile is predicted to be incompatible with this batch.")
+        if preparation.jobs and not self._runnable_jobs(preparation):
+            blockers.append("Jobs exist, but none are runnable under the current safe/default selection.")
+        if not preparation.jobs and (preparation.recommended_count or preparation.maybe_count):
+            blockers.append("Analysis found recommended files, but the current profile/job selection produced no runnable work.")
+        if not blockers:
+            blockers.append("No selected jobs are available.")
+        if self._compression_source_paths is not None:
+            scope = f"Scoped batch: {len(self._compression_source_paths)} eligible file(s)."
+        else:
+            scope = "Scope: whole compression root."
+        action = (
+            "Next action: Rebuild Safer Plan."
+            if preparation.recommended_count or preparation.maybe_count
+            else "Next action: adjust compression settings or choose a folder with supported media."
+        )
+        return "\n".join(
+            [
+                "Why nothing can run:",
+                f"Attempted profile: {profile_text}",
+                scope,
+                f"Analysis rows: {preparation.recommended_count} recommended, {preparation.maybe_count} maybe, {preparation.skip_count} skipped.",
+                "Blockers: " + " ".join(blockers),
+                action,
+            ]
+        )
+
+    def _update_compression_explanation_surfaces(self, preparation: EncodePreparation | None) -> None:
+        details = self._compression_no_run_details(preparation)
+        self.compression_why_label.setText(details)
+        self.compression_why_group.setVisible(bool(details))
+        if self._compression_source_paths:
+            paths = [str(path) for path in sorted(self._compression_source_paths)]
+            self.compression_scope_details.setPlainText("\n".join(paths))
+            self.compression_scope_details_button.setText(
+                "Hide Scoped Files" if self.compression_scope_details_button.isChecked() else "Show Scoped Files"
+            )
+            self.compression_scope_details_button.setVisible(True)
+        else:
+            self.compression_scope_details_button.setVisible(False)
+            self.compression_scope_details.setVisible(False)
+            self.compression_scope_details.setPlainText("")
+
     def _maybe_offer_safer_rebuild(self, preparation: EncodePreparation) -> None:
         if self._zero_runnable_prompt_shown:
             return
@@ -6349,6 +6523,7 @@ class MainWindow(QMainWindow):
         self.compression_table.setRowCount(0)
         self._compression_plan_rows = build_compression_plan_rows(preparation)
         self._plan_classification = classify_compression_plan(self._compression_plan_rows)
+        self._update_compression_explanation_surfaces(preparation)
         if preparation is None:
             return
         self.compression_table.setSortingEnabled(False)
@@ -7069,6 +7244,7 @@ class MainWindow(QMainWindow):
             f"About to process {job_count} file(s).",
             f"Input size: {self._format_bytes(runnable_preparation.selected_input_bytes)}",
             f"Estimated output: {self._format_bytes(runnable_preparation.selected_estimated_output_bytes)}",
+            self._last_compression_space_check,
             f"Ordering: {self.compression_order_combo.currentText()}",
         ]
         warning_lines: list[str] = []
@@ -7570,6 +7746,7 @@ class MainWindow(QMainWindow):
         else:
             self.summary_failure_label.setText("")
         self.summary_timeline_label.setText(self._summary_timeline_text())
+        self.summary_timeline_log.setPlainText(self._run_timeline_details_text())
 
         details: list[str] = []
         if self.preview_state is not None:
