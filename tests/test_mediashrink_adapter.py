@@ -497,9 +497,16 @@ def test_prepare_safer_compression_adds_compatibility_first_note(tmp_path: Path)
         compression_root=tmp_path,
         shrink=ShrinkSettings(),
     )
+    selected = {tmp_path / "movie.mkv"}
+    captured: dict[str, object] = {}
 
-    with patch("mediaflow.mediashrink_adapter.prepare_compression", return_value=prep):
-        safer = prepare_safer_compression(config)
+    def fake_prepare_compression(*args, **kwargs):
+        captured.update(kwargs)
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_compression", side_effect=fake_prepare_compression):
+        safer = prepare_safer_compression(config, source_paths=selected)
 
     assert safer.stage_messages is not None
     assert any("compatibility-first defaults" in line for line in safer.stage_messages)
+    assert captured["source_paths"] == selected

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -161,6 +162,7 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
     assert window.start_compress_button.isEnabled() is True
     assert window.compression_table.rowCount() == 1
+    assert window.compression_table.item(0, 7).text() == "runnable"
     assert "1 file(s)" in window.compress_summary_label.text()
     assert "Fast" in window.compress_summary_label.text()
     assert "Fast profile covers the selected file." in window.compress_summary_label.text()
@@ -1341,9 +1343,12 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     window = MainWindow()
     monkeypatch.setattr(window, "_diagnostics_directory_path", lambda: tmp_path)
     monkeypatch.setattr(window, "_flush_runtime_diagnostics", lambda: None)
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.No)
     session_path = tmp_path / ".mediashrink-session.json"
     session_path.write_text('{"entries": []}', encoding="utf-8")
     window._compression_session_path = session_path
+    batch_manifest = window._last_batch_manifest_path()
+    batch_manifest.write_text('{"paths": []}', encoding="utf-8")
 
     window._create_diagnostics_bundle()
 
@@ -1353,6 +1358,9 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
         names = archive.namelist()
     assert any(name.startswith("mediaflow-review-snapshot-") for name in names)
     assert ".mediashrink-session.json" in names
+    assert "mediaflow-last-organised-batch.json" in names
+    assert "mediaflow-dependency-capabilities.json" in names
+    assert window._diagnostics.events[-1]["redacted"] is False
 
 
 def test_bypass_blocked_organisation_prepares_compression_from_source_when_linked(monkeypatch, tmp_path: Path) -> None:
@@ -1545,6 +1553,138 @@ def test_zero_job_compression_plan_explains_disabled_start(tmp_path: Path) -> No
     assert "cannot start yet" in window.current_action_label.text().lower()
     assert "no encode jobs were auto-selected" in window.compress_summary_label.text().lower()
     assert "no runnable jobs were selected" in window.start_compress_button.toolTip().lower()
+    assert window.compression_table.item(0, 7).text() == "recommended only"
+
+
+def test_guided_zero_job_plan_prompts_for_safer_rebuild(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    window._compression_scope = "guided-organised-batch"
+    window._compression_source_paths = {item_source}
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    prompted: list[str] = []
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(window, "_prepare_safer_plan", lambda: prompted.append("safer"))
+
+    window._compression_prepared(prep)
+
+    assert prompted == ["safer"]
+    assert window.compression_table.item(0, 7).text() == "blocked by profile"
+    assert any(event["kind"] == "zero_runnable_safer_rebuild_prompted" for event in window._diagnostics.events)
+
+
+def test_prepare_safer_plan_preserves_guided_source_scope(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "source"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    item_source = library / "movie.mkv"
+    item_source.write_bytes(b"x")
+    window.source_input.setText(str(source))
+    window.library_input.setText(str(library))
+    window.compression_root_input.setText(str(library))
+    window.compress_enabled.setChecked(True)
+    window.encode_preparation = SimpleNamespace(profile=None)
+    window._compression_scope = "guided-organised-batch"
+    window._compression_source_paths = {item_source}
+    captured: dict[str, object] = {}
+
+    def fake_start_worker(worker, *_args):
+        captured["fn"] = worker.fn
+        captured["kwargs"] = worker.kwargs
+
+    monkeypatch.setattr(window, "_start_worker", fake_start_worker)
+
+    window._prepare_safer_plan()
+
+    assert captured["fn"].__name__ == "prepare_safer_compression"
+    assert captured["kwargs"]["source_paths"] == {item_source}
+    assert window._diagnostics.events[-1]["kind"] == "safer_preparation_started"
+    assert window._diagnostics.events[-1]["scope"] == "guided-organised-batch"
+
+
+def test_guided_batch_paths_write_previous_batch_manifest(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    first = tmp_path / "movie-one.mkv"
+    second = tmp_path / "movie-two.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    window.compression_root_input.setText(str(tmp_path))
+    window.library_input.setText(str(tmp_path))
+
+    window._set_guided_batch_paths([first, second])
+
+    manifest = window._last_batch_manifest_path()
+    assert manifest.exists()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["compression_root"] == str(tmp_path)
+    assert payload["paths"] == [str(first), str(second)]
+
+
+def test_prepare_previous_batch_uses_saved_manifest(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    first = tmp_path / "movie-one.mkv"
+    missing = tmp_path / "missing.mkv"
+    first.write_bytes(b"x")
+    window.compression_root_input.setText(str(tmp_path / "old-root"))
+    manifest = window._last_batch_manifest_path()
+    manifest.write_text(
+        json.dumps(
+            {
+                "compression_root": str(tmp_path),
+                "library": str(tmp_path),
+                "paths": [str(first), str(missing)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_start(message, *, source_paths=None, scope="whole-root"):
+        captured["message"] = message
+        captured["source_paths"] = source_paths
+        captured["scope"] = scope
+
+    monkeypatch.setattr(window, "_start_compression_preparation", fake_start)
+
+    window._prepare_previous_batch_compression()
+
+    assert captured["source_paths"] == [first]
+    assert captured["scope"] == "guided-organised-batch"
+    assert window.compression_root_input.text() == str(tmp_path)
 
 
 def test_zero_compatible_plan_enters_attention_state_and_offers_safer_rebuild(tmp_path: Path) -> None:

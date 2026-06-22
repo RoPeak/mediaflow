@@ -86,6 +86,7 @@ def prepare_compression(
 def prepare_safer_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
+    source_paths: Collection[Path] | None = None,
 ) -> EncodePreparation:
     safer_config = replace(
         config,
@@ -96,7 +97,11 @@ def prepare_safer_compression(
             no_skip=True,
         ),
     )
-    preparation = prepare_compression(safer_config, progress_callback=progress_callback)
+    preparation = prepare_compression(
+        safer_config,
+        progress_callback=progress_callback,
+        source_paths=source_paths,
+    )
     extra_messages = list(preparation.stage_messages or [])
     extra_messages.append(
         "Safer rebuild uses compatibility-first defaults to prefer the most reliable runnable profile."

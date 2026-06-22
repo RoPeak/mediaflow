@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 import importlib
+import importlib.metadata
 import json
 import re
 import sys
@@ -143,7 +144,9 @@ class MainWindow(QMainWindow):
         self._compression_source_paths: set[Path] | None = None
         self._compression_scope: str = "whole-root"
         self._compression_scope_warning: str | None = None
+        self._zero_runnable_prompt_shown = False
         self._organised_not_encoded: list[dict[str, object]] = []
+        self._apply_file_metrics: list[dict[str, object]] = []
         self._compression_plan_rows: list = []
         self._summary_rows: list = []
         self._plan_classification = classify_compression_plan(())
@@ -330,6 +333,7 @@ class MainWindow(QMainWindow):
         self.guided_button = QPushButton("Start Guided Pipeline")
         self.scan_button = QPushButton("Review Organise Matches")
         self.prepare_compress_button = QPushButton("Prepare Compression Plan")
+        self.prepare_previous_batch_button = QPushButton("Prepare Previous Batch")
         self.reset_button = QPushButton("Reset Runtime State")
 
         self.review_summary_label = QLabel()
@@ -862,6 +866,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.guided_button)
         row.addWidget(self.scan_button)
         row.addWidget(self.prepare_compress_button)
+        row.addWidget(self.prepare_previous_batch_button)
         row.addWidget(self.reset_button)
         action_layout.addLayout(row)
         action_layout.addWidget(self.setup_summary_label)
@@ -1218,6 +1223,7 @@ class MainWindow(QMainWindow):
         self.guided_button.clicked.connect(self._start_guided_pipeline)
         self.scan_button.clicked.connect(self._start_scan)
         self.prepare_compress_button.clicked.connect(self._prepare_compression_from_setup)
+        self.prepare_previous_batch_button.clicked.connect(self._prepare_previous_batch_compression)
         self.reset_button.clicked.connect(lambda: self._reset_runtime_state("Cleared runtime state."))
         self.toggle_details_button.toggled.connect(self._toggle_details)
         self.review_filter_combo.currentTextChanged.connect(lambda *_: self._apply_review_filter())
@@ -1707,6 +1713,46 @@ class MainWindow(QMainWindow):
 
     def _set_guided_batch_paths(self, paths: list[Path]) -> None:
         self._guided_batch_paths = {Path(path).resolve(strict=False) for path in paths}
+        if paths:
+            self._write_batch_manifest(paths)
+
+    def _last_batch_manifest_path(self) -> Path:
+        return self._diagnostics_directory_path() / "mediaflow-last-organised-batch.json"
+
+    def _write_batch_manifest(self, paths: list[Path]) -> None:
+        manifest_path = self._last_batch_manifest_path()
+        payload = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "compression_root": self.compression_root_input.text().strip(),
+            "library": self.library_input.text().strip(),
+            "paths": [str(Path(path)) for path in paths],
+        }
+        try:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            self._diagnostics.record_event(
+                "batch_manifest_written",
+                path=str(manifest_path),
+                count=len(paths),
+            )
+        except OSError as exc:
+            self._record_warning(f"Unable to write organised batch manifest: {exc}")
+
+    def _load_batch_manifest(self) -> tuple[Path | None, list[Path]]:
+        manifest_path = self._last_batch_manifest_path()
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, []
+        except (OSError, json.JSONDecodeError) as exc:
+            self._record_warning(f"Unable to read previous batch manifest: {exc}")
+            return None, []
+        if not isinstance(payload, dict):
+            return None, []
+        compression_root_text = str(payload.get("compression_root") or "").strip()
+        compression_root = Path(compression_root_text) if compression_root_text else None
+        paths = [Path(str(path)) for path in payload.get("paths", []) if str(path).strip()]
+        return compression_root, paths
 
     def _record_review_action(self, action: str, *, index: int | None = None, **payload: object) -> None:
         item_payload: dict[str, object] = {}
@@ -2157,9 +2203,16 @@ class MainWindow(QMainWindow):
             return {"imported": False, "error": str(exc)}
         module_path = getattr(module, "__file__", None)
         resolved = Path(module_path).resolve(strict=False) if module_path else None
+        version = getattr(module, "__version__", None)
+        if version is None:
+            try:
+                version = importlib.metadata.version(module_name)
+            except importlib.metadata.PackageNotFoundError:
+                version = None
         return {
             "imported": True,
             "path": str(resolved) if resolved else None,
+            "version": version,
             "editable_local": bool(resolved and ("github" in str(resolved) or ".egg-link" in str(resolved))),
         }
 
@@ -2561,6 +2614,76 @@ class MainWindow(QMainWindow):
         if model.event_log:
             self.apply_log.setPlainText("\n".join(model.event_log))
 
+    def _record_apply_file_metric(self, payload: ApplyProgress) -> None:
+        if payload.phase.replace("_", "-").strip().lower() != "completed-item":
+            return
+        source = payload.current_source or payload.last_applied_source
+        if not source:
+            return
+        if any(metric.get("source") == source for metric in self._apply_file_metrics):
+            return
+        seconds = self._apply_metric_seconds(payload.started_at, payload.completed_at)
+        size_bytes = int(payload.source_size_bytes or payload.current_file_bytes_copied or 0)
+        speed_mbps = (size_bytes / seconds / 1_048_576) if seconds and size_bytes else None
+        self._apply_file_metrics.append(
+            {
+                "source": source,
+                "destination": payload.current_destination,
+                "size_bytes": size_bytes,
+                "seconds": seconds,
+                "speed_mbps": speed_mbps,
+                "workers": payload.parallel_workers or self._apply_progress_model.parallel_workers,
+                "operation": payload.operation,
+            }
+        )
+
+    @staticmethod
+    def _apply_metric_seconds(started_at: str | None, completed_at: str | None) -> float | None:
+        if not started_at or not completed_at:
+            return None
+        try:
+            start = datetime.fromisoformat(started_at)
+            end = datetime.fromisoformat(completed_at)
+        except ValueError:
+            return None
+        return max(0.0, (end - start).total_seconds())
+
+    def _apply_metrics_lines(self) -> list[str]:
+        metrics = list(self._apply_file_metrics)
+        if not metrics:
+            return []
+        total_bytes = sum(int(metric.get("size_bytes") or 0) for metric in metrics)
+        durations = [float(metric["seconds"]) for metric in metrics if metric.get("seconds")]
+        total_seconds = sum(durations)
+        speeds = [float(metric["speed_mbps"]) for metric in metrics if metric.get("speed_mbps")]
+        largest = max(metrics, key=lambda metric: int(metric.get("size_bytes") or 0))
+        slowest = min(
+            (metric for metric in metrics if metric.get("speed_mbps")),
+            key=lambda metric: float(metric.get("speed_mbps") or 0),
+            default=None,
+        )
+        lines = ["Organisation apply metrics"]
+        lines.append(f"Files measured: {len(metrics)}")
+        lines.append(f"Measured bytes: {self._format_bytes(total_bytes)}")
+        if total_seconds > 0 and total_bytes > 0:
+            lines.append(f"Average throughput: {total_bytes / total_seconds / 1_048_576:.1f} MB/s")
+        if slowest is not None:
+            lines.append(
+                f"Slowest file: {Path(str(slowest.get('source'))).name} "
+                f"({float(slowest.get('speed_mbps') or 0):.1f} MB/s)"
+            )
+        lines.append(
+            f"Largest file: {Path(str(largest.get('source'))).name} "
+            f"({self._format_bytes(int(largest.get('size_bytes') or 0))})"
+        )
+        workers = {int(metric.get("workers") or 1) for metric in metrics}
+        lines.append(f"Workers used: {', '.join(str(worker) for worker in sorted(workers))}")
+        if self.copy_mode.isChecked() and self.copy_workers.value() == 1:
+            lines.append(
+                "Worker guidance: 1 worker is safest for same-drive copies; try 2 only when source and output are on separate physical disks."
+            )
+        return lines
+
     def _poll_apply_destination_progress(self) -> None:
         model = self._apply_progress_model
         if not model.current_destination or not model.current_file_bytes:
@@ -2604,6 +2727,7 @@ class MainWindow(QMainWindow):
         self.encode_results = []
         self._compression_plan_rows = []
         self._summary_rows = []
+        self._apply_file_metrics = []
         self._plan_classification = classify_compression_plan(())
         self._retry_sources = set()
         self._last_diagnostics_path = None
@@ -2920,6 +3044,11 @@ class MainWindow(QMainWindow):
         self.guided_button.setEnabled(not busy)
         self.scan_button.setEnabled(self.organise_enabled.isChecked() and not busy)
         self.prepare_compress_button.setEnabled(self.compress_enabled.isChecked() and not busy)
+        self.prepare_previous_batch_button.setEnabled(
+            self.compress_enabled.isChecked()
+            and not busy
+            and self._last_batch_manifest_path().exists()
+        )
         self.reset_button.setEnabled(not busy)
 
         review_actions_enabled = has_review_selection and not busy and not review_search_busy and not self._config_dirty
@@ -3476,32 +3605,90 @@ class MainWindow(QMainWindow):
         bundle_path = diagnostics_dir / f"mediaflow-diagnostics-bundle-{timestamp}.zip"
         snapshot_path = diagnostics_dir / f"mediaflow-review-snapshot-{timestamp}.json"
         digest_path = diagnostics_dir / f"mediaflow-diagnostics-digest-{timestamp}.txt"
+        redact = self._diagnostics_bundle_redaction_choice()
         snapshot_payload = {
             "effective_config": self._snapshot_config_for_diagnostics(),
             "review_snapshot": self._review_diagnostics_snapshot(),
+            "dependency_capabilities": self._dependency_capabilities_snapshot(),
         }
-        snapshot_path.write_text(json.dumps(snapshot_payload, indent=2, sort_keys=True), encoding="utf-8")
-        digest_path.write_text(self._diagnostics_digest_text(), encoding="utf-8")
+        snapshot_text = json.dumps(snapshot_payload, indent=2, sort_keys=True)
+        digest_text = self._diagnostics_digest_text()
+        snapshot_path.write_text(self._redact_export_text(snapshot_text) if redact else snapshot_text, encoding="utf-8")
+        digest_path.write_text(self._redact_export_text(digest_text) if redact else digest_text, encoding="utf-8")
         with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             if self._last_diagnostics_path is not None and self._last_diagnostics_path.exists():
-                archive.write(self._last_diagnostics_path, arcname=self._last_diagnostics_path.name)
+                self._write_bundle_file(archive, self._last_diagnostics_path, redact=redact)
                 log_path = self._last_diagnostics_path.with_suffix(".log")
                 if log_path.exists():
-                    archive.write(log_path, arcname=log_path.name)
+                    self._write_bundle_file(archive, log_path, redact=redact)
             if self._compression_session_path is not None:
                 session_path = Path(self._compression_session_path)
                 if session_path.exists():
-                    archive.write(session_path, arcname=session_path.name)
+                    self._write_bundle_file(archive, session_path, redact=redact)
             if self._overwrite_audit_manifest_path is not None and self._overwrite_audit_manifest_path.exists():
-                archive.write(self._overwrite_audit_manifest_path, arcname=self._overwrite_audit_manifest_path.name)
+                self._write_bundle_file(archive, self._overwrite_audit_manifest_path, redact=redact)
+            batch_manifest = self._last_batch_manifest_path()
+            if batch_manifest.exists():
+                self._write_bundle_file(archive, batch_manifest, redact=redact)
+            pre_apply = self._latest_diagnostics_artifact("mediaflow-pre-apply-*.txt")
+            if pre_apply is not None:
+                self._write_bundle_file(archive, pre_apply, redact=redact)
+            archive.writestr(
+                "mediaflow-dependency-capabilities.json",
+                json.dumps(self._dependency_capabilities_snapshot(), indent=2, sort_keys=True),
+            )
             archive.write(snapshot_path, arcname=snapshot_path.name)
             archive.write(digest_path, arcname=digest_path.name)
         snapshot_path.unlink(missing_ok=True)
         self._last_diagnostics_digest_path = digest_path
         QApplication.clipboard().setText(str(bundle_path))
-        self._diagnostics.record_event("diagnostics_bundle_created", path=str(bundle_path), digest_path=digest_path.name)
+        self._diagnostics.record_event(
+            "diagnostics_bundle_created",
+            path=str(bundle_path),
+            digest_path=digest_path.name,
+            redacted=redact,
+        )
         self._append_status(f"Created diagnostics bundle and copied path: {bundle_path}")
         self._update_ui()
+
+    def _diagnostics_bundle_redaction_choice(self) -> bool:
+        return QMessageBox.question(
+            self,
+            "mediaflow",
+            "Create a redacted diagnostics bundle?\n\n"
+            "Yes: redact home-folder paths before bundling.\n"
+            "No: keep full local paths for easier debugging.\n\n"
+            "Bundle contents include diagnostics JSON/log, digest, review snapshot, dependency capabilities, "
+            "session/audit records when available, and the latest pre-apply or batch manifest when available.",
+        ) == QMessageBox.Yes
+
+    def _write_bundle_file(self, archive: zipfile.ZipFile, path: Path, *, redact: bool) -> None:
+        if not redact:
+            archive.write(path, arcname=path.name)
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            archive.write(path, arcname=path.name)
+            return
+        archive.writestr(path.name, self._redact_export_text(text))
+
+    def _latest_diagnostics_artifact(self, pattern: str) -> Path | None:
+        try:
+            matches = [path for path in self._diagnostics_directory_path().glob(pattern) if path.is_file()]
+        except OSError:
+            return None
+        return max(matches, key=lambda path: path.stat().st_mtime, default=None)
+
+    def _dependency_capabilities_snapshot(self) -> dict[str, object]:
+        return {
+            "supports_mediashrink_source_paths": supports_prepare_source_paths(),
+            "supports_mediashrink_encode_run_results": supports_encode_run_results(),
+            "integrations": {
+                "plexify": self._module_origin_details("plexify"),
+                "mediashrink": self._module_origin_details("mediashrink"),
+            },
+        }
 
     def _load_overwrite_audit_entries(self) -> list[dict[str, object]]:
         path = self._overwrite_audit_manifest_path
@@ -3699,6 +3886,9 @@ class MainWindow(QMainWindow):
             lines.extend(["Organisation preview", *self.preview_state.summary_lines, ""])
         if self.apply_result is not None:
             lines.extend(["Organisation apply", *self.apply_result.summary_lines, ""])
+            apply_metric_lines = self._apply_metrics_lines()
+            if apply_metric_lines:
+                lines.extend([*apply_metric_lines, ""])
         if self.encode_preparation is not None:
             lines.extend(["Compression plan", self.compress_summary_label.text(), ""])
         if self.encode_results:
@@ -5585,6 +5775,7 @@ class MainWindow(QMainWindow):
             return
         self._last_bulk_undo = None
         self._export_pre_apply_plan(preflight_lines)
+        self._apply_file_metrics = []
         self._set_current_action("Applying organisation to disk")
         self._set_state(WorkflowState.APPLYING)
         self._diagnostics.record_event(
@@ -5650,6 +5841,7 @@ class MainWindow(QMainWindow):
             skipped_count=len(tuple(getattr(getattr(result, "result", None), "skipped", []) or [])),
             error_count=len(tuple(getattr(getattr(result, "result", None), "errors", []) or [])),
             organised_destinations=[str(path) for path in organised_destinations],
+            file_metrics=list(self._apply_file_metrics),
         )
         for warning in getattr(result, "warnings", []) or []:
             self._record_warning(str(warning))
@@ -5689,6 +5881,7 @@ class MainWindow(QMainWindow):
             else 0.0
         )
         self._apply_progress_model.update_from_progress(payload, now=elapsed)
+        self._record_apply_file_metric(payload)
         status_line = self._format_apply_status_text(payload)
         self._set_current_action(status_line)
         self._refresh_apply_dashboard()
@@ -5737,6 +5930,30 @@ class MainWindow(QMainWindow):
         self._guided_mode = False
         self._continue_to_compress = False
         self._start_compression_preparation("Preparing compression plan from Setup.")
+
+    def _prepare_previous_batch_compression(self) -> None:
+        compression_root, paths = self._load_batch_manifest()
+        existing_paths = [path for path in paths if path.exists()]
+        if not existing_paths:
+            self._show_error("No files from the previous organised batch are available.")
+            return
+        if compression_root is not None:
+            self.link_compression_root.setChecked(False)
+            self.compression_root_input.setText(str(compression_root))
+        self._guided_mode = False
+        self._continue_to_compress = False
+        self._set_guided_batch_paths(existing_paths)
+        self._diagnostics.record_event(
+            "previous_batch_compression_started",
+            count=len(existing_paths),
+            missing=max(len(paths) - len(existing_paths), 0),
+            source_paths=[str(path) for path in existing_paths],
+        )
+        self._start_compression_preparation(
+            f"Preparing compression plan for previous organised batch ({len(existing_paths)} file(s)).",
+            source_paths=existing_paths,
+            scope="guided-organised-batch",
+        )
 
     def _bypass_blocked_organisation(self) -> None:
         if self.workflow_state != WorkflowState.REVIEW_BLOCKED or not self.compress_enabled.isChecked():
@@ -5810,6 +6027,7 @@ class MainWindow(QMainWindow):
         self._persist_ui_state()
         self._diagnostics.set_config(self._snapshot_config_for_diagnostics())
         self._compression_scope = scope
+        self._zero_runnable_prompt_shown = False
         self._compression_source_paths = (
             {Path(path).resolve(strict=False) for path in source_paths}
             if source_paths is not None
@@ -5973,6 +6191,7 @@ class MainWindow(QMainWindow):
                 source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
             )
             self._flush_runtime_diagnostics()
+            self._maybe_offer_safer_rebuild(preparation)
             return
         if preparation.stage_messages:
             for line in preparation.stage_messages:
@@ -6016,6 +6235,7 @@ class MainWindow(QMainWindow):
         self._update_encode_dashboard(None)
         self._set_state(WorkflowState.READY_TO_COMPRESS)
         self._flush_runtime_diagnostics()
+        self._maybe_offer_safer_rebuild(preparation)
 
     def _compression_zero_jobs_message(self, preparation: EncodePreparation) -> str:
         if preparation.profile is None:
@@ -6034,6 +6254,39 @@ class MainWindow(QMainWindow):
                 "Recommended rows are available for review, but the current plan cannot start yet."
             )
         return "Compression plan contains no selected jobs."
+
+    def _maybe_offer_safer_rebuild(self, preparation: EncodePreparation) -> None:
+        if self._zero_runnable_prompt_shown:
+            return
+        if self._config_dirty:
+            return
+        if self._compression_source_paths is None:
+            return
+        if self._compression_scope not in {"guided-organised-batch", "guided-root-fallback"}:
+            return
+        if preparation.jobs:
+            return
+        if not (preparation.recommended_count or preparation.maybe_count):
+            return
+        self._zero_runnable_prompt_shown = True
+        self._diagnostics.record_event(
+            "zero_runnable_safer_rebuild_prompted",
+            scope=self._compression_scope,
+            recommended_count=preparation.recommended_count,
+            maybe_count=preparation.maybe_count,
+            source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
+        )
+        answer = QMessageBox.question(
+            self,
+            "mediaflow",
+            "Compression analysis found files worth compressing, but no runnable encoder profile was selected.\n\n"
+            "Rebuild this same scoped batch with safer compatibility-first settings now?",
+        )
+        if answer == QMessageBox.Yes:
+            self._diagnostics.record_event("zero_runnable_safer_rebuild_accepted", scope=self._compression_scope)
+            self._prepare_safer_plan()
+        else:
+            self._diagnostics.record_event("zero_runnable_safer_rebuild_declined", scope=self._compression_scope)
 
     def _compression_scope_banner_text(self) -> str:
         if self._compression_source_paths is not None:
@@ -6055,7 +6308,7 @@ class MainWindow(QMainWindow):
         self.compression_table.setSortingEnabled(False)
         for row, item in enumerate(self._ordered_compression_rows(self._compression_plan_rows)):
             self.compression_table.insertRow(row)
-            selected_text = "yes" if item.selected else "no"
+            selected_text = self._compression_selection_label(item)
             if item.selected and not item.exists:
                 selected_text = "missing"
             elif item.classification == "risky-follow-up" and not self.include_risky_jobs.isChecked():
@@ -6086,6 +6339,19 @@ class MainWindow(QMainWindow):
             self.compression_table.item(row, 0).setToolTip(str(item.source))
         self.compression_table.setSortingEnabled(True)
         self._apply_compression_filter()
+
+    def _compression_selection_label(self, item) -> str:
+        if item.selected and item.exists:
+            return "runnable"
+        if item.selected and not item.exists:
+            return "missing"
+        if item.recommendation in {"recommended", "maybe"}:
+            if self.encode_preparation is not None and self.encode_preparation.profile is None:
+                return "blocked by profile"
+            return "recommended only"
+        if item.recommendation == "skip":
+            return "skip"
+        return "not selected"
 
     def _ordered_compression_rows(self, rows: list) -> list:
         mode = self.compression_order_combo.currentText() if hasattr(self, "compression_order_combo") else "Current order"
@@ -6133,13 +6399,13 @@ class MainWindow(QMainWindow):
             reason = (self.compression_table.item(row_index, 3).text() if self.compression_table.item(row_index, 3) else "")
             hide = False
             if mode == "Runnable now":
-                hide = selected_text != "yes" or "Deferred by default" in issue
+                hide = selected_text != "runnable" or "Deferred by default" in issue
             elif mode == "Follow-up / incompatible":
                 hide = "Deferred by default" not in issue and not issue
             elif mode == "Informational skips":
                 hide = "Already efficient codec" not in reason
             elif mode == "Selected only":
-                hide = selected_text not in {"yes", "missing"}
+                hide = selected_text not in {"runnable", "missing", "deferred"}
             elif mode == "Recommended only":
                 hide = recommendation != "recommended"
             elif mode == "Problem items":
@@ -6249,6 +6515,8 @@ class MainWindow(QMainWindow):
             previous_profile=(
                 self.encode_preparation.profile.name if self.encode_preparation.profile is not None else None
             ),
+            scope=self._compression_scope,
+            source_paths=[str(path) for path in sorted(self._compression_source_paths or set())],
         )
         self.prepare_progress.setRange(0, 0)
         self.prepare_log.clear()
@@ -6265,7 +6533,11 @@ class MainWindow(QMainWindow):
         self._preparation_last_update_at = self._preparation_start
         self._preparation_timer.start()
         self._flush_runtime_diagnostics()
-        worker = FunctionWorker(prepare_safer_compression, config)
+        worker = FunctionWorker(
+            prepare_safer_compression,
+            config,
+            source_paths=self._compression_source_paths,
+        )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
 
     def _prepare_followup_plan(self) -> None:
@@ -7241,6 +7513,9 @@ class MainWindow(QMainWindow):
             details.extend(["Organisation preview", *self.preview_state.summary_lines, ""])
         if self.apply_result is not None:
             details.extend(["Organisation apply", *self.apply_result.summary_lines, ""])
+            apply_metric_lines = self._apply_metrics_lines()
+            if apply_metric_lines:
+                details.extend([*apply_metric_lines, ""])
             if apply_stats.warnings:
                 details.extend(["Apply warnings", *(f"- {warning}" for warning in apply_stats.warnings), ""])
         if self.encode_preparation is not None:
