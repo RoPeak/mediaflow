@@ -676,7 +676,18 @@ def test_bulk_undo_restores_affected_review_rows() -> None:
         auto_selectable=True,
         skipped=False,
     )
-    window.controller = SimpleNamespace(items=[item])
+    preview_state = SimpleNamespace(
+        summary_lines=[],
+        unresolved_items=[],
+        warnings=[],
+        can_apply=True,
+        unresolved_count=0,
+    )
+
+    def build_preview():
+        return preview_state
+
+    window.controller = SimpleNamespace(items=[item], build_preview=build_preview)
     window._populate_review_table()
     window._store_bulk_undo([0], "filename show group")
     window.controller.items[0].decision_status = "manual"
@@ -1097,7 +1108,7 @@ def test_interrupted_compression_uses_attention_summary(tmp_path: Path) -> None:
         duration_seconds=2.0,
         error_message="Stopped by user",
     )
-    from mediashrink.gui_api import EncodeRunResults
+    from mediaflow.mediashrink_adapter import EncodeRunResults
 
     results = EncodeRunResults(
         [result],
@@ -1147,9 +1158,15 @@ def test_preparing_compression_uses_preparing_view() -> None:
 def test_prepare_compression_worker_receives_cancel_callback(tmp_path: Path, monkeypatch) -> None:
     _app()
     window = MainWindow()
-    window.source_input.setText(str(tmp_path))
-    window.library_input.setText(str(tmp_path))
-    window.compression_root_input.setText(str(tmp_path))
+    source_dir = tmp_path / "source"
+    library_dir = tmp_path / "library"
+    compression_dir = tmp_path / "compression"
+    source_dir.mkdir()
+    library_dir.mkdir()
+    compression_dir.mkdir()
+    window.source_input.setText(str(source_dir))
+    window.library_input.setText(str(library_dir))
+    window.compression_root_input.setText(str(compression_dir))
     window.compress_enabled.setChecked(True)
     window._compatibility_checked = True
     captured: dict[str, object] = {}
@@ -1429,7 +1446,10 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     assert "mediaflow-last-organised-batch.json" in names
     assert "mediaflow-dependency-capabilities.json" in names
     assert "mediaflow-run-timeline.txt" in names
-    assert window._diagnostics.events[-1]["redacted"] is False
+    bundle_events = [
+        event for event in window._diagnostics.events if event["kind"] == "diagnostics_bundle_created"
+    ]
+    assert bundle_events[-1]["redacted"] is False
 
 
 def test_bypass_blocked_organisation_prepares_compression_from_source_when_linked(monkeypatch, tmp_path: Path) -> None:
@@ -1689,7 +1709,25 @@ def test_prepare_safer_plan_preserves_guided_source_scope(monkeypatch, tmp_path:
     window.library_input.setText(str(library))
     window.compression_root_input.setText(str(library))
     window.compress_enabled.setChecked(True)
-    window.encode_preparation = SimpleNamespace(profile=None)
+    window.encode_preparation = EncodePreparation(
+        directory=library,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=0,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=0,
+        total_input_bytes=0,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
     window._compression_scope = "guided-organised-batch"
     window._compression_source_paths = {item_source}
     captured: dict[str, object] = {}
