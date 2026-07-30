@@ -12,7 +12,25 @@ Practical desktop GUI for running `plexify` and `mediashrink` as one video workf
 
 This project is intentionally utility-first. The goal is a clear operator-facing desktop app, not a decorative interface.
 
-## Install
+## Install for users
+
+Download the latest release artifact for your operating system from GitHub
+Releases, extract it, and run the `mediaflow` executable inside the extracted
+folder.
+
+Release builds are portable PyInstaller bundles. They include `mediaflow`,
+`plexify`, `mediashrink`, and the Python GUI runtime, so you do not need to
+clone the project, create a virtual environment, or install Python packages
+manually.
+
+FFmpeg and ffprobe are still runtime prerequisites. Install FFmpeg separately
+and make sure both commands are available on `PATH` before running compression.
+
+macOS release bundles are currently unsigned. Until signing and notarization are
+added, macOS may require you to approve the app in Privacy & Security settings
+the first time you launch it.
+
+## Install for development
 
 `mediaflow` expects local editable installs of `plexify` and `mediashrink`, plus a GUI runtime:
 
@@ -42,14 +60,20 @@ mediaflow doctor --source /path/to/incoming --library /path/to/library --compres
 
 ## Packaging
 
-For Windows test builds, the project already includes `PyInstaller` in the `dev` extra:
+Release builds use `PyInstaller` through `mediaflow.spec`. PyInstaller builds
+must run on the target OS; a WSL build produces the Linux bundle, while Windows
+and macOS release artifacts should come from native runners or GitHub Actions:
 
 ```bash
 pip install -e .[dev]
-pyinstaller --noconfirm --windowed --name mediaflow mediaflow/cli.py
+pyinstaller --noconfirm --clean mediaflow.spec
 ```
 
-The current GUI also records startup, plan-preparation, and first-progress timings so packaged builds can be compared against editable runs.
+See `docs/releasing.md` for the full release process, including pinned
+`plexify` and `mediashrink` refs, CI artifacts, and smoke-test steps.
+
+The current GUI also records startup, plan-preparation, and first-progress
+timings so packaged builds can be compared against editable runs.
 
 ## Notes
 

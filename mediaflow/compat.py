@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import inspect
+from dataclasses import dataclass
 from importlib import import_module
 
 
@@ -84,6 +84,19 @@ def check_runtime_compatibility() -> list[CompatibilityIssue]:
                         message=f"Installed mediashrink build is missing `{name}`.",
                     )
                 )
+
+    try:
+        guessit_api = import_module("guessit.api")
+        guessit = guessit_api.guessit
+        guessit("Blinded_by_the_Light_-__m00150xc_original.mp4")
+    except Exception as exc:
+        issues.append(
+            CompatibilityIssue(
+                area="guessit",
+                message="Could not parse a sample filename with guessit.",
+                technical_detail=str(exc),
+            )
+        )
 
     return issues
 
