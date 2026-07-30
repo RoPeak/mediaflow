@@ -18,35 +18,40 @@ from mediashrink.gui_api import (
     prepare_tools,
     run_encode_plan,
 )
-try:
-    from mediashrink.gui_api import EncodeRunResults
-    _HAS_NATIVE_ENCODE_RUN_RESULTS = True
-except ImportError:
-    _HAS_NATIVE_ENCODE_RUN_RESULTS = False
-    class EncodeRunResults(list):
-        def __init__(
-            self,
-            results,
-            *,
-            session_path=None,
-            resumed_from_session=False,
-            session_status=None,
-            stopped_early=False,
-            interrupted=False,
-        ):
-            super().__init__(results)
-            self.session_path = session_path
-            self.resumed_from_session = resumed_from_session
-            self.session_status = session_status or {}
-            self.stopped_early = stopped_early
-            self.interrupted = interrupted
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 from mediashrink.scanner import build_jobs
 from mediashrink.session import find_resumable_session, get_session_path, load_session
 from mediashrink.wizard import prepare_profile_planning
 
-from .config import PipelineConfig
 from .callback_types import PreparationProgress, PreparationStageUpdate
+from .config import PipelineConfig
+
+try:
+    from mediashrink.gui_api import EncodeRunResults as _NativeEncodeRunResults
+
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = True
+except ImportError:
+    _NativeEncodeRunResults = None
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = False
+
+
+class EncodeRunResults(list):
+    def __init__(
+        self,
+        results,
+        *,
+        session_path=None,
+        resumed_from_session=False,
+        session_status=None,
+        stopped_early=False,
+        interrupted=False,
+    ):
+        super().__init__(results)
+        self.session_path = session_path
+        self.resumed_from_session = resumed_from_session
+        self.session_status = session_status or {}
+        self.stopped_early = stopped_early
+        self.interrupted = interrupted
 
 
 def prepare_compression(

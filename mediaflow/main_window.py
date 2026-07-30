@@ -2686,7 +2686,6 @@ class MainWindow(QMainWindow):
         total_bytes = sum(int(metric.get("size_bytes") or 0) for metric in metrics)
         durations = [float(metric["seconds"]) for metric in metrics if metric.get("seconds")]
         total_seconds = sum(durations)
-        speeds = [float(metric["speed_mbps"]) for metric in metrics if metric.get("speed_mbps")]
         largest = max(metrics, key=lambda metric: int(metric.get("size_bytes") or 0))
         slowest = min(
             (metric for metric in metrics if metric.get("speed_mbps")),
