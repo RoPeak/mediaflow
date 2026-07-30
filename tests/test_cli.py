@@ -15,8 +15,7 @@ def test_help_renders_without_typer_path_union_error() -> None:
 
     assert result.exit_code == 0
     assert "Usage:" in result.stdout
-    assert "--source" in result.stdout
-    assert "--library" in result.stdout
+    assert "doctor" in result.stdout
 
 
 def test_cli_forwards_optional_paths_to_launch(tmp_path: Path) -> None:
