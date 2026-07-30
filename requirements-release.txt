@@ -1,0 +1,7 @@
+# Release builds install the integration dependencies from Git so the packaged
+# app does not depend on sibling checkouts.
+#
+# Before cutting a release, replace each ref with the exact tag or commit that
+# was smoke-tested with mediaflow.
+plexify @ git+https://github.com/RoPeak/plexify.git@f6ad48f6eda2afe39077a5ba78f2762fd14469e1
+mediashrink @ git+https://github.com/RoPeak/mediashrink.git@30045be96aa1db89cfe3996667ff8fcb82925451
