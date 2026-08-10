@@ -23,35 +23,40 @@ try:
     from mediashrink.gui_api import profile_id_for as _native_profile_id_for
 except ImportError:
     _native_profile_id_for = None
-try:
-    from mediashrink.gui_api import EncodeRunResults
-    _HAS_NATIVE_ENCODE_RUN_RESULTS = True
-except ImportError:
-    _HAS_NATIVE_ENCODE_RUN_RESULTS = False
-    class EncodeRunResults(list):
-        def __init__(
-            self,
-            results,
-            *,
-            session_path=None,
-            resumed_from_session=False,
-            session_status=None,
-            stopped_early=False,
-            interrupted=False,
-        ):
-            super().__init__(results)
-            self.session_path = session_path
-            self.resumed_from_session = resumed_from_session
-            self.session_status = session_status or {}
-            self.stopped_early = stopped_early
-            self.interrupted = interrupted
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 from mediashrink.scanner import build_jobs
 from mediashrink.session import find_resumable_session, get_session_path, load_session
 from mediashrink.wizard import prepare_profile_planning
 
-from .config import PipelineConfig
 from .callback_types import PreparationProgress, PreparationStageUpdate
+from .config import PipelineConfig
+
+try:
+    from mediashrink.gui_api import EncodeRunResults as _NativeEncodeRunResults
+
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = True
+except ImportError:
+    _NativeEncodeRunResults = None
+    _HAS_NATIVE_ENCODE_RUN_RESULTS = False
+
+
+class EncodeRunResults(list):
+    def __init__(
+        self,
+        results,
+        *,
+        session_path=None,
+        resumed_from_session=False,
+        session_status=None,
+        stopped_early=False,
+        interrupted=False,
+    ):
+        super().__init__(results)
+        self.session_path = session_path
+        self.resumed_from_session = resumed_from_session
+        self.session_status = session_status or {}
+        self.stopped_early = stopped_early
+        self.interrupted = interrupted
 
 
 def prepare_compression(
@@ -59,6 +64,7 @@ def prepare_compression(
     progress_callback: Callable[[object], None] | None = None,
     source_paths: Collection[Path] | None = None,
     selected_profile_id: str | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     kwargs = {
         "directory": config.compression_root,
@@ -79,16 +85,23 @@ def prepare_compression(
         kwargs["source_paths"] = source_paths
     if selected_profile_id is not None and _supports_prepare_selected_profile():
         kwargs["selected_profile_id"] = selected_profile_id
+    if cancel_callback is not None and _supports_prepare_cancel_callback():
+        kwargs["cancel_callback"] = cancel_callback
     while True:
         try:
             preparation = prepare_encode_run(**kwargs)
             break
         except TypeError as exc:
-            if "selected_profile_id" in kwargs and "selected_profile_id" in str(exc):
-                kwargs.pop("selected_profile_id", None)
-                continue
-            if "source_paths" in kwargs and "source_paths" in str(exc):
-                kwargs.pop("source_paths", None)
+            unsupported = next(
+                (
+                    name
+                    for name in ("selected_profile_id", "source_paths", "cancel_callback")
+                    if name in kwargs and name in str(exc)
+                ),
+                None,
+            )
+            if unsupported is not None:
+                kwargs.pop(unsupported, None)
                 continue
             raise
     if source_paths is not None and "source_paths" not in kwargs:
@@ -104,6 +117,8 @@ def prepare_compression(
 def prepare_safer_compression(
     config: PipelineConfig,
     progress_callback: Callable[[object], None] | None = None,
+    source_paths: Collection[Path] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     safer_config = replace(
         config,
@@ -114,7 +129,12 @@ def prepare_safer_compression(
             no_skip=True,
         ),
     )
-    preparation = prepare_compression(safer_config, progress_callback=progress_callback)
+    preparation = prepare_compression(
+        safer_config,
+        progress_callback=progress_callback,
+        source_paths=source_paths,
+        cancel_callback=cancel_callback,
+    )
     extra_messages = list(preparation.stage_messages or [])
     extra_messages.append(
         "Safer rebuild uses compatibility-first defaults to prefer the most reliable runnable profile."
@@ -261,6 +281,7 @@ def prepare_retry_compression(
     config: PipelineConfig,
     retry_sources: set[Path],
     progress_callback: Callable[[object], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     retry_config = replace(
         config,
@@ -276,6 +297,7 @@ def prepare_retry_compression(
         retry_config,
         progress_callback=progress_callback,
         source_paths=retry_sources,
+        cancel_callback=cancel_callback,
     )
     filtered = _filter_preparation_to_sources(preparation, retry_sources)
     extra_messages = list(filtered.stage_messages or [])
@@ -731,8 +753,23 @@ def _supports_prepare_selected_profile() -> bool:
     )
 
 
+def _supports_prepare_cancel_callback() -> bool:
+    try:
+        signature = inspect.signature(prepare_encode_run)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "cancel_callback"
+        for name, parameter in signature.parameters.items()
+    )
+
+
 def supports_prepare_source_paths() -> bool:
     return _supports_prepare_source_paths()
+
+
+def supports_prepare_cancel_callback() -> bool:
+    return _supports_prepare_cancel_callback()
 
 
 def supports_encode_run_results() -> bool:
@@ -913,5 +950,6 @@ __all__ = [
     "resumable_session_status",
     "run_compression",
     "supports_encode_run_results",
+    "supports_prepare_cancel_callback",
     "supports_prepare_source_paths",
 ]

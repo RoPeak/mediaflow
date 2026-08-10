@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,6 +163,7 @@ def test_compression_prepared_enables_encode_step_and_populates_plan(tmp_path: P
     assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
     assert window.start_compress_button.isEnabled() is True
     assert window.compression_table.rowCount() == 1
+    assert window.compression_table.item(0, 7).text() == "runnable"
     assert "1 file(s)" in window.compress_summary_label.text()
     assert "Fast" in window.compress_summary_label.text()
     assert "Fast profile covers the selected file." in window.compress_summary_label.text()
@@ -875,7 +877,18 @@ def test_bulk_undo_restores_affected_review_rows() -> None:
         auto_selectable=True,
         skipped=False,
     )
-    window.controller = SimpleNamespace(items=[item])
+    preview_state = SimpleNamespace(
+        summary_lines=[],
+        unresolved_items=[],
+        warnings=[],
+        can_apply=True,
+        unresolved_count=0,
+    )
+
+    def build_preview():
+        return preview_state
+
+    window.controller = SimpleNamespace(items=[item], build_preview=build_preview)
     window._populate_review_table()
     window._store_bulk_undo([0], "filename show group")
     window.controller.items[0].decision_status = "manual"
@@ -1296,7 +1309,7 @@ def test_interrupted_compression_uses_attention_summary(tmp_path: Path) -> None:
         duration_seconds=2.0,
         error_message="Stopped by user",
     )
-    from mediashrink.gui_api import EncodeRunResults
+    from mediaflow.mediashrink_adapter import EncodeRunResults
 
     results = EncodeRunResults(
         [result],
@@ -1341,6 +1354,87 @@ def test_preparing_compression_uses_preparing_view() -> None:
 
     assert window.compress_stack.currentIndex() == 1
     assert "compression plan" in window.compress_hint_label.text().lower()
+
+
+def test_prepare_compression_worker_receives_cancel_callback(tmp_path: Path, monkeypatch) -> None:
+    _app()
+    window = MainWindow()
+    source_dir = tmp_path / "source"
+    library_dir = tmp_path / "library"
+    compression_dir = tmp_path / "compression"
+    source_dir.mkdir()
+    library_dir.mkdir()
+    compression_dir.mkdir()
+    window.source_input.setText(str(source_dir))
+    window.library_input.setText(str(library_dir))
+    window.compression_root_input.setText(str(compression_dir))
+    window.compress_enabled.setChecked(True)
+    window._compatibility_checked = True
+    captured: dict[str, object] = {}
+
+    def fake_start_worker(worker, *_args):
+        captured["kwargs"] = worker.kwargs
+
+    monkeypatch.setattr(window, "_start_worker", fake_start_worker)
+
+    window._start_compression_preparation("Preparing test plan.")
+
+    assert "cancel_callback" in captured["kwargs"]
+    assert captured["kwargs"]["cancel_callback"]() is False
+    assert window.cancel_prepare_button.isEnabled() is True
+
+
+def test_cancel_prepare_button_sets_graceful_cancel_flag() -> None:
+    _app()
+    window = MainWindow()
+    window._set_state(WorkflowState.PREPARING_COMPRESSION)
+    window.cancel_prepare_button.setEnabled(True)
+
+    window._request_preparation_cancel()
+
+    assert window._compression_preparation_cancel_requested() is True
+    assert window.cancel_prepare_button.isEnabled() is False
+    assert "Cancel requested" in window.prepare_log.toPlainText()
+
+
+def test_cancelled_compression_preparation_reports_cancelled_state(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    prep = SimpleNamespace(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=0,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=0,
+        total_input_bytes=0,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        stage_messages=["Compression preparation was cancelled before a runnable plan was built."],
+        compatible_count=0,
+        incompatible_count=0,
+        size_confidence=None,
+        time_confidence=None,
+        grouped_incompatibilities={},
+        recommendation_reason=None,
+        followup_manifest_path=None,
+        cancelled=True,
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
+    assert window.start_compress_button.isEnabled() is False
+    assert "cancelled" in window.current_action_label.text().lower()
+    assert any(event["kind"] == "compression_preparation_cancelled" for event in window._diagnostics.events)
 
 
 def test_preparation_progress_updates_stage_dashboard(tmp_path: Path) -> None:
@@ -1542,9 +1636,12 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
     window = MainWindow()
     monkeypatch.setattr(window, "_diagnostics_directory_path", lambda: tmp_path)
     monkeypatch.setattr(window, "_flush_runtime_diagnostics", lambda: None)
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.No)
     session_path = tmp_path / ".mediashrink-session.json"
     session_path.write_text('{"entries": []}', encoding="utf-8")
     window._compression_session_path = session_path
+    batch_manifest = window._last_batch_manifest_path()
+    batch_manifest.write_text('{"paths": []}', encoding="utf-8")
 
     window._create_diagnostics_bundle()
 
@@ -1554,6 +1651,13 @@ def test_create_diagnostics_bundle_writes_light_archive(monkeypatch, tmp_path: P
         names = archive.namelist()
     assert any(name.startswith("mediaflow-review-snapshot-") for name in names)
     assert ".mediashrink-session.json" in names
+    assert "mediaflow-last-organised-batch.json" in names
+    assert "mediaflow-dependency-capabilities.json" in names
+    assert "mediaflow-run-timeline.txt" in names
+    bundle_events = [
+        event for event in window._diagnostics.events if event["kind"] == "diagnostics_bundle_created"
+    ]
+    assert bundle_events[-1]["redacted"] is False
 
 
 def test_bypass_blocked_organisation_prepares_compression_from_source_when_linked(monkeypatch, tmp_path: Path) -> None:
@@ -1746,6 +1850,215 @@ def test_zero_job_compression_plan_explains_disabled_start(tmp_path: Path) -> No
     assert "cannot start yet" in window.current_action_label.text().lower()
     assert "no encode jobs were auto-selected" in window.compress_summary_label.text().lower()
     assert "no runnable jobs were selected" in window.start_compress_button.toolTip().lower()
+    assert window.compression_table.item(0, 7).text() == "recommended only"
+    assert window.compression_why_group.isHidden() is False
+    assert "why nothing can run" in window.compression_why_label.text().lower()
+    assert "attempted profile: fast" in window.compression_why_label.text().lower()
+
+
+def test_guided_zero_job_plan_prompts_for_safer_rebuild(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    item_source = tmp_path / "movie.mkv"
+    item_source.write_bytes(b"x")
+    window._compression_scope = "guided-organised-batch"
+    window._compression_source_paths = {item_source}
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=item_source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    prompted: list[str] = []
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(window, "_prepare_safer_plan", lambda: prompted.append("safer"))
+
+    window._compression_prepared(prep)
+
+    assert prompted == ["safer"]
+    assert window.compression_table.item(0, 7).text() == "blocked by profile"
+    assert window.compression_scope_details_button.isHidden() is False
+    assert str(item_source) in window.compression_scope_details.toPlainText()
+    assert any(event["kind"] == "zero_runnable_safer_rebuild_prompted" for event in window._diagnostics.events)
+
+
+def test_prepare_safer_plan_preserves_guided_source_scope(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "source"
+    library = tmp_path / "library"
+    source.mkdir()
+    library.mkdir()
+    item_source = library / "movie.mkv"
+    item_source.write_bytes(b"x")
+    window.source_input.setText(str(source))
+    window.library_input.setText(str(library))
+    window.compression_root_input.setText(str(library))
+    window.compress_enabled.setChecked(True)
+    window.encode_preparation = EncodePreparation(
+        directory=library,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[],
+        recommended_count=0,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=0,
+        total_input_bytes=0,
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    window._compression_scope = "guided-organised-batch"
+    window._compression_source_paths = {item_source}
+    captured: dict[str, object] = {}
+
+    def fake_start_worker(worker, *_args):
+        captured["fn"] = worker.fn
+        captured["kwargs"] = worker.kwargs
+
+    monkeypatch.setattr(window, "_start_worker", fake_start_worker)
+
+    window._prepare_safer_plan()
+
+    assert captured["fn"].__name__ == "prepare_safer_compression"
+    assert captured["kwargs"]["source_paths"] == {item_source}
+    assert window._diagnostics.events[-1]["kind"] == "safer_preparation_started"
+    assert window._diagnostics.events[-1]["scope"] == "guided-organised-batch"
+
+
+def test_preflight_check_records_free_space_recheck(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    preparation = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[SimpleNamespace(source=source, size_bytes=100, estimated_output_bytes=50)],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=50,
+        estimated_total_seconds=1.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+
+    error = window._preflight_check(preparation)
+
+    assert error is None
+    assert "Free-space recheck" in window._last_compression_space_check
+    assert any(
+        event["kind"] == "compression_space_recheck" and event["status"] == "ok"
+        for event in window._diagnostics.events
+    )
+
+
+def test_summary_run_timeline_log_uses_diagnostics_events() -> None:
+    _app()
+    window = MainWindow()
+    window._diagnostics.record_event("scan_started", message="Scanning")
+    window._diagnostics.record_event(
+        "compression_space_recheck",
+        status="ok",
+        free_bytes=1000,
+        required_bytes=500,
+    )
+
+    window._refresh_pipeline_summary()
+
+    text = window.summary_timeline_log.toPlainText()
+    assert "scan_started" in text
+    assert "compression_space_recheck" in text
+    assert "status=ok" in text
+
+
+def test_guided_batch_paths_write_previous_batch_manifest(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    first = tmp_path / "movie-one.mkv"
+    second = tmp_path / "movie-two.mkv"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    window.compression_root_input.setText(str(tmp_path))
+    window.library_input.setText(str(tmp_path))
+
+    window._set_guided_batch_paths([first, second])
+
+    manifest = window._last_batch_manifest_path()
+    assert manifest.exists()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["compression_root"] == str(tmp_path)
+    assert payload["paths"] == [str(first), str(second)]
+
+
+def test_prepare_previous_batch_uses_saved_manifest(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    first = tmp_path / "movie-one.mkv"
+    missing = tmp_path / "missing.mkv"
+    first.write_bytes(b"x")
+    window.compression_root_input.setText(str(tmp_path / "old-root"))
+    manifest = window._last_batch_manifest_path()
+    manifest.write_text(
+        json.dumps(
+            {
+                "compression_root": str(tmp_path),
+                "library": str(tmp_path),
+                "paths": [str(first), str(missing)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_start(message, *, source_paths=None, scope="whole-root"):
+        captured["message"] = message
+        captured["source_paths"] = source_paths
+        captured["scope"] = scope
+
+    monkeypatch.setattr(window, "_start_compression_preparation", fake_start)
+
+    window._prepare_previous_batch_compression()
+
+    assert captured["source_paths"] == [first]
+    assert captured["scope"] == "guided-organised-batch"
+    assert window.compression_root_input.text() == str(tmp_path)
 
 
 def test_zero_compatible_plan_enters_attention_state_and_offers_safer_rebuild(tmp_path: Path) -> None:

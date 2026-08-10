@@ -19,6 +19,7 @@ from mediaflow.mediashrink_adapter import (
     profile_id_for,
     run_compression,
     supports_encode_run_results,
+    supports_prepare_cancel_callback,
     supports_prepare_source_paths,
 )
 from mediaflow.config import PipelineConfig, ShrinkSettings
@@ -298,8 +299,33 @@ def test_prepare_compression_passes_source_allowlist_to_mediashrink(tmp_path: Pa
     assert captured["source_paths"] == selected
 
 
+def test_prepare_compression_passes_cancel_callback_when_supported(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(),
+    )
+    prep = _preparation(tmp_path, [])
+    captured: dict[str, object] = {}
+
+    def cancel_callback() -> bool:
+        return False
+
+    def fake_prepare_encode_run(**kwargs):
+        captured.update(kwargs)
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", side_effect=fake_prepare_encode_run):
+        result = prepare_compression(config, cancel_callback=cancel_callback)
+
+    assert result is prep
+    assert captured["cancel_callback"] is cancel_callback
+
+
 def test_mediashrink_capability_helpers_reflect_adapter_dependencies() -> None:
     assert supports_prepare_source_paths() in {True, False}
+    assert supports_prepare_cancel_callback() in {True, False}
     assert supports_encode_run_results() in {True, False}
 
 
@@ -652,12 +678,20 @@ def test_prepare_safer_compression_adds_compatibility_first_note(tmp_path: Path)
         compression_root=tmp_path,
         shrink=ShrinkSettings(),
     )
+    selected = {tmp_path / "movie.mkv"}
+    captured: dict[str, object] = {}
 
-    with patch("mediaflow.mediashrink_adapter.prepare_compression", return_value=prep):
-        safer = prepare_safer_compression(config)
+    def fake_prepare_compression(*args, **kwargs):
+        captured.update(kwargs)
+        return prep
+
+    with patch("mediaflow.mediashrink_adapter.prepare_compression", side_effect=fake_prepare_compression):
+        safer = prepare_safer_compression(config, source_paths=selected, cancel_callback=lambda: False)
 
     assert safer.stage_messages is not None
     assert any("compatibility-first defaults" in line for line in safer.stage_messages)
+    assert captured["source_paths"] == selected
+    assert captured["cancel_callback"] is not None
 
 
 def test_prepare_speed_compression_rebuilds_with_ultrafast_profile(tmp_path: Path) -> None:

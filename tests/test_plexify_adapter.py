@@ -93,7 +93,8 @@ def test_scan_controller_supports_legacy_plexify_scan_signature() -> None:
 def test_scan_controller_passes_progress_callback_when_supported() -> None:
     adapter = _load_adapter_with_stubbed_plexify()
     controller = _ProgressController()
-    callback = lambda _payload: None
+    def callback(_payload):
+        return None
 
     result = adapter.scan_controller(controller, progress_callback=callback)
 
@@ -149,7 +150,8 @@ def test_apply_preview_controller_converts_apply_progress_payload() -> None:
 def test_apply_preview_controller_passes_cancel_callback_when_supported() -> None:
     adapter = _load_adapter_with_stubbed_plexify()
     controller = _ProgressController()
-    cancel = lambda: False
+    def cancel():
+        return False
 
     adapter.apply_preview_controller(controller, object(), progress_callback=lambda _payload: None, cancel_callback=cancel)
 
