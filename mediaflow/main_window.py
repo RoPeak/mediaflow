@@ -4880,6 +4880,43 @@ class MainWindow(QMainWindow):
             dialog.setDetailedText(technical_detail)
         dialog.exec()
 
+    def _show_compression_start_blocked(self, message: str) -> None:
+        if self._shutting_down:
+            return
+        summary, technical_detail = self._summarise_error(message)
+        self._record_warning(summary)
+        self._diagnostics.record_event(
+            "compression_start_blocked",
+            summary=summary,
+            technical_detail=technical_detail or message,
+            workflow_state=self.workflow_state.value,
+        )
+        self._set_state(WorkflowState.READY_TO_COMPRESS)
+        self._complete_action("Compression start blocked")
+        self._set_current_action("Fix the issue, then start compression again.")
+        self._set_summary_text(
+            "\n".join(
+                [
+                    "Compression is still ready.",
+                    "",
+                    summary,
+                    "",
+                    "After fixing the issue, click Start Compression again. The prepared plan will be reused.",
+                    "Technical details are available in the error dialog." if technical_detail else "",
+                ]
+            ).strip()
+        )
+        self._switch_tab("compress")
+        self._flush_runtime_diagnostics()
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("mediaflow")
+        dialog.setText(summary)
+        dialog.setInformativeText("Fix the issue, then click Start Compression again. The existing plan will be reused.")
+        if technical_detail:
+            dialog.setDetailedText(technical_detail)
+        dialog.exec()
+
     def _start_worker(self, worker: FunctionWorker, on_result, on_progress=None) -> None:
         self._active_worker_count += 1
         self._worker_refs.add(worker)
@@ -7616,11 +7653,11 @@ class MainWindow(QMainWindow):
             return
         preflight_error = self._preflight_check(runnable_preparation)
         if preflight_error:
-            self._show_error(preflight_error)
+            self._show_compression_start_blocked(preflight_error)
             return
         missing_sources = missing_job_sources(runnable_preparation)
         if missing_sources and len(missing_sources) == len(runnable_preparation.jobs):
-            self._show_error(
+            self._show_compression_start_blocked(
                 f"All planned compression files are missing from the compression root. First missing file: {missing_sources[0]}"
             )
             return

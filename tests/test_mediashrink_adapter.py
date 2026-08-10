@@ -59,6 +59,12 @@ def _preparation(tmp_path: Path, jobs: list[EncodeJob]) -> EncodePreparation:
     )
 
 
+def _with_attrs(obj, **attrs):
+    for name, value in attrs.items():
+        object.__setattr__(obj, name, value)
+    return obj
+
+
 def test_missing_job_sources_reports_jobs_that_disappeared(tmp_path: Path) -> None:
     existing = _job(tmp_path, "existing.mkv")
     existing.source.write_bytes(b"x")
@@ -118,6 +124,8 @@ def test_run_compression_preserves_session_metadata(tmp_path: Path) -> None:
             interrupted=True,
         ),
     ) as run_encode_plan:
+        run_encode_plan.__signature__ = None
+
         def cancel_callback() -> bool:
             return False
 
@@ -129,6 +137,48 @@ def test_run_compression_preserves_session_metadata(tmp_path: Path) -> None:
     assert getattr(results, "stopped_early") is True
     assert getattr(results, "interrupted") is True
     assert run_encode_plan.call_args.kwargs["cancel_callback"] is cancel_callback
+
+
+def test_run_compression_omits_cancel_callback_for_older_mediashrink(tmp_path: Path) -> None:
+    existing = _job(tmp_path, "existing.mkv")
+    existing.source.write_bytes(b"x")
+    prep = _preparation(tmp_path, [existing])
+    fake_result = SimpleNamespace(
+        job=existing,
+        skipped=False,
+        success=True,
+        input_size_bytes=100,
+        output_size_bytes=50,
+        error_message=None,
+    )
+    captured: dict[str, object] = {}
+
+    def older_run_encode_plan(
+        preparation,
+        *,
+        on_progress=None,
+        on_file_failure=None,
+        use_calibration=True,
+        session_path=None,
+        resume=False,
+    ):
+        captured["preparation"] = preparation
+        captured["kwargs"] = {
+            "on_progress": on_progress,
+            "on_file_failure": on_file_failure,
+            "use_calibration": use_calibration,
+            "session_path": session_path,
+            "resume": resume,
+        }
+        return [fake_result]
+
+    with patch("mediaflow.mediashrink_adapter.run_encode_plan", older_run_encode_plan):
+        results = run_compression(prep, resume=True, cancel_callback=lambda: False)
+
+    assert list(results) == [fake_result]
+    assert "cancel_callback" not in captured["kwargs"]
+    assert "stop_mode" not in captured["kwargs"]
+    assert "quarantine_originals" not in captured["kwargs"]
 
 
 def test_incomplete_session_status_reports_retryable_counts(tmp_path: Path) -> None:
@@ -359,24 +409,26 @@ def test_prepare_compression_forwards_selected_profile_id(tmp_path: Path) -> Non
         recommendation="recommended",
         reason_text="Strong savings",
     )
-    prep = EncodePreparation(
-        directory=tmp_path,
-        ffmpeg=tmp_path / "ffmpeg",
-        ffprobe=tmp_path / "ffprobe",
-        items=[item],
-        duplicate_warnings=[],
-        profile=profile,
-        jobs=[_job(tmp_path, "movie.mkv")],
-        recommended_count=1,
-        maybe_count=0,
-        skip_count=0,
-        selected_count=1,
-        total_input_bytes=100,
-        selected_input_bytes=100,
-        selected_estimated_output_bytes=40,
-        estimated_total_seconds=20.0,
-        on_file_failure="retry",
-        use_calibration=True,
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[item],
+            duplicate_warnings=[],
+            profile=profile,
+            jobs=[_job(tmp_path, "movie.mkv")],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=100,
+            selected_input_bytes=100,
+            selected_estimated_output_bytes=40,
+            estimated_total_seconds=20.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
         profile_options=[profile],
         selected_profile_id=selected,
     )
@@ -442,24 +494,26 @@ def test_prepare_compression_uses_quality_aware_default_for_movie_overwrite(tmp_
         preset="slow",
         dry_run=False,
     )
-    prep = EncodePreparation(
-        directory=tmp_path,
-        ffmpeg=tmp_path / "ffmpeg",
-        ffprobe=tmp_path / "ffprobe",
-        items=[item],
-        duplicate_warnings=[],
-        profile=fast,
-        jobs=[job],
-        recommended_count=1,
-        maybe_count=0,
-        skip_count=0,
-        selected_count=1,
-        total_input_bytes=100,
-        selected_input_bytes=100,
-        selected_estimated_output_bytes=40,
-        estimated_total_seconds=10.0,
-        on_file_failure="retry",
-        use_calibration=True,
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[item],
+            duplicate_warnings=[],
+            profile=fast,
+            jobs=[job],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=100,
+            selected_input_bytes=100,
+            selected_estimated_output_bytes=40,
+            estimated_total_seconds=10.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
         profile_options=[fast, balanced],
         recommended_profile_id=profile_id_for(fast),
         selected_profile_id=profile_id_for(fast),

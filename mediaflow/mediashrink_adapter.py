@@ -254,19 +254,24 @@ def run_compression(
         return missing_results
 
     active_preparation = replace(preparation, jobs=runnable_jobs)
-    results = run_encode_plan(
-        active_preparation,
-        on_progress=progress_callback,
-        on_file_failure=preparation.on_file_failure,
-        use_calibration=preparation.use_calibration,
-        session_path=session_path,
-        resume=resume,
-        cancel_callback=cancel_callback,
-        stop_mode="graceful",
-        quarantine_originals=quarantine_originals,
-        quarantine_dir=quarantine_dir,
-        quarantine_retention_days=quarantine_retention_days,
-    )
+    kwargs = {
+        "on_progress": progress_callback,
+        "on_file_failure": preparation.on_file_failure,
+        "use_calibration": preparation.use_calibration,
+        "session_path": session_path,
+        "resume": resume,
+    }
+    if cancel_callback is not None and _supports_run_encode_kwarg("cancel_callback"):
+        kwargs["cancel_callback"] = cancel_callback
+    if _supports_run_encode_kwarg("stop_mode"):
+        kwargs["stop_mode"] = "graceful"
+    if _supports_run_encode_kwarg("quarantine_originals"):
+        kwargs["quarantine_originals"] = quarantine_originals
+    if _supports_run_encode_kwarg("quarantine_dir"):
+        kwargs["quarantine_dir"] = quarantine_dir
+    if _supports_run_encode_kwarg("quarantine_retention_days"):
+        kwargs["quarantine_retention_days"] = quarantine_retention_days
+    results = run_encode_plan(active_preparation, **kwargs)
     return EncodeRunResults(
         missing_results + list(results),
         session_path=getattr(results, "session_path", session_path),
@@ -435,11 +440,27 @@ def _profile_options(preparation: EncodePreparation) -> list[object]:
 
 
 def _replace_preparation(preparation: EncodePreparation, **changes) -> EncodePreparation:
-    try:
-        return replace(preparation, **changes)
-    except TypeError:
-        allowed = {key: value for key, value in changes.items() if hasattr(preparation, key)}
-        return replace(preparation, **allowed)
+    dataclass_fields = getattr(preparation, "__dataclass_fields__", {}) or {}
+    init_field_names = {
+        name
+        for name, field in dataclass_fields.items()
+        if getattr(field, "init", False)
+    }
+    constructor_changes = {
+        key: value for key, value in changes.items() if key in init_field_names
+    }
+    result = replace(preparation, **constructor_changes)
+    dynamic_attrs = {
+        key: value
+        for key, value in vars(preparation).items()
+        if key not in dataclass_fields
+    }
+    dynamic_attrs.update(
+        {key: value for key, value in changes.items() if key not in init_field_names}
+    )
+    for key, value in dynamic_attrs.items():
+        object.__setattr__(result, key, value)
+    return result
 
 
 def _estimated_output_for_profile(profile: object, selected_items: list[object]) -> int:
@@ -761,6 +782,17 @@ def _supports_prepare_cancel_callback() -> bool:
     return any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD or name == "cancel_callback"
         for name, parameter in signature.parameters.items()
+    )
+
+
+def _supports_run_encode_kwarg(name: str) -> bool:
+    try:
+        signature = inspect.signature(run_encode_plan)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter_name == name
+        for parameter_name, parameter in signature.parameters.items()
     )
 
 

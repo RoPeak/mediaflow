@@ -23,6 +23,12 @@ def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
 
 
+def _with_attrs(obj, **attrs):
+    for name, value in attrs.items():
+        object.__setattr__(obj, name, value)
+    return obj
+
+
 @pytest.fixture(autouse=True)
 def _isolate_persisted_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("mediaflow.main_window.load_ui_state", lambda: {})
@@ -203,33 +209,35 @@ def test_overwrite_compression_requires_profile_review_when_options_exist(tmp_pa
         grouped_incompatibilities={},
         why_choose="Keeps more movie detail.",
     )
-    prep = EncodePreparation(
-        directory=tmp_path,
-        ffmpeg=tmp_path / "ffmpeg",
-        ffprobe=tmp_path / "ffprobe",
-        items=[
-            SimpleNamespace(
-                source=item_source,
-                codec="mpeg2video",
-                recommendation="recommended",
-                reason_text="legacy codec with strong projected savings",
-                estimated_output_bytes=520,
-                estimated_savings_bytes=480,
-            )
-        ],
-        duplicate_warnings=[],
-        profile=balanced,
-        jobs=[SimpleNamespace(source=item_source)],
-        recommended_count=1,
-        maybe_count=0,
-        skip_count=0,
-        selected_count=1,
-        total_input_bytes=1000,
-        selected_input_bytes=1000,
-        selected_estimated_output_bytes=520,
-        estimated_total_seconds=240.0,
-        on_file_failure="retry",
-        use_calibration=True,
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[
+                SimpleNamespace(
+                    source=item_source,
+                    codec="mpeg2video",
+                    recommendation="recommended",
+                    reason_text="legacy codec with strong projected savings",
+                    estimated_output_bytes=520,
+                    estimated_savings_bytes=480,
+                )
+            ],
+            duplicate_warnings=[],
+            profile=balanced,
+            jobs=[SimpleNamespace(source=item_source)],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=1000,
+            selected_input_bytes=1000,
+            selected_estimated_output_bytes=520,
+            estimated_total_seconds=240.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
         profile_options=[fast, balanced],
         recommended_profile_id=profile_id_for(fast),
         selected_profile_id=profile_id_for(balanced),
@@ -284,33 +292,35 @@ def test_profile_selection_change_rebuilds_plan_before_start(monkeypatch, tmp_pa
         grouped_incompatibilities={},
         why_choose="Quality-first.",
     )
-    prep = EncodePreparation(
-        directory=tmp_path,
-        ffmpeg=tmp_path / "ffmpeg",
-        ffprobe=tmp_path / "ffprobe",
-        items=[
-            SimpleNamespace(
-                source=source,
-                codec="mpeg2video",
-                recommendation="recommended",
-                reason_text="legacy codec with strong projected savings",
-                estimated_output_bytes=400,
-                estimated_savings_bytes=600,
-            )
-        ],
-        duplicate_warnings=[],
-        profile=fast,
-        jobs=[SimpleNamespace(source=source)],
-        recommended_count=1,
-        maybe_count=0,
-        skip_count=0,
-        selected_count=1,
-        total_input_bytes=1000,
-        selected_input_bytes=1000,
-        selected_estimated_output_bytes=400,
-        estimated_total_seconds=120.0,
-        on_file_failure="retry",
-        use_calibration=True,
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[
+                SimpleNamespace(
+                    source=source,
+                    codec="mpeg2video",
+                    recommendation="recommended",
+                    reason_text="legacy codec with strong projected savings",
+                    estimated_output_bytes=400,
+                    estimated_savings_bytes=600,
+                )
+            ],
+            duplicate_warnings=[],
+            profile=fast,
+            jobs=[SimpleNamespace(source=source)],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=1000,
+            selected_input_bytes=1000,
+            selected_estimated_output_bytes=400,
+            estimated_total_seconds=120.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
         profile_options=[fast, balanced],
         recommended_profile_id=profile_id_for(fast),
         selected_profile_id=profile_id_for(fast),
@@ -1987,6 +1997,53 @@ def test_preflight_check_records_free_space_recheck(tmp_path: Path) -> None:
         event["kind"] == "compression_space_recheck" and event["status"] == "ok"
         for event in window._diagnostics.events
     )
+
+
+def test_compression_preflight_failure_keeps_prepared_plan_startable(monkeypatch, tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    preparation = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=tmp_path / "ffmpeg",
+        ffprobe=tmp_path / "ffprobe",
+        items=[
+            SimpleNamespace(
+                source=source,
+                codec="h264",
+                recommendation="recommended",
+                reason_text="Large AVC file",
+                estimated_output_bytes=50,
+                estimated_savings_bytes=50,
+            )
+        ],
+        duplicate_warnings=[],
+        profile=SimpleNamespace(name="Fast", encoder_key="faster", crf=22),
+        jobs=[SimpleNamespace(source=source)],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=100,
+        selected_input_bytes=100,
+        selected_estimated_output_bytes=50,
+        estimated_total_seconds=1.0,
+        on_file_failure="retry",
+        use_calibration=True,
+    )
+    monkeypatch.setattr(window, "_preflight_check", lambda _preparation: "Not enough disk space.")
+    monkeypatch.setattr(window, "_confirm_compression_start", lambda **_kwargs: pytest.fail("confirm should not open"))
+    monkeypatch.setattr("mediaflow.main_window.QMessageBox.exec", lambda _self: QMessageBox.Ok)
+
+    window._compression_prepared(preparation)
+    window._start_compression()
+
+    assert window.workflow_state == WorkflowState.READY_TO_COMPRESS
+    assert window.encode_preparation is preparation
+    assert window.start_compress_button.isEnabled() is True
+    assert window.tabs.currentIndex() == 2
+    assert window._diagnostics.events[-1]["kind"] == "compression_start_blocked"
 
 
 def test_summary_run_timeline_log_uses_diagnostics_events() -> None:
