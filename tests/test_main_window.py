@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QHeaderView
 
 from mediaflow.main_window import MainWindow
 from mediaflow.callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
+from mediaflow.compression_preview import CompressionPreviewRequest, CompressionPreviewResult
 from mediaflow.mediashrink_adapter import profile_id_for
 from mediaflow.workflow import WorkflowState
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
@@ -335,6 +336,166 @@ def test_profile_selection_change_rebuilds_plan_before_start(monkeypatch, tmp_pa
 
     assert started == [profile_id_for(balanced)]
     assert window.start_compress_button.isEnabled() is False
+
+
+def test_compression_preview_button_enabled_for_runnable_plan(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    profile = SimpleNamespace(
+        name="Balanced",
+        encoder_key="faster",
+        sw_preset="faster",
+        crf=22,
+        quality_label="Very good",
+        intent_label="Quality-aware",
+        estimated_output_bytes=600,
+        estimated_encode_seconds=180.0,
+        compatible_count=1,
+        incompatible_count=0,
+        why_choose="Keeps more detail.",
+    )
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[
+                SimpleNamespace(
+                    source=source,
+                    codec="mpeg2video",
+                    recommendation="recommended",
+                    reason_text="legacy codec with strong projected savings",
+                    estimated_output_bytes=600,
+                    estimated_savings_bytes=400,
+                )
+            ],
+            duplicate_warnings=[],
+            profile=profile,
+            jobs=[SimpleNamespace(source=source)],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=1000,
+            selected_input_bytes=1000,
+            selected_estimated_output_bytes=600,
+            estimated_total_seconds=180.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
+        profile_options=[profile],
+        selected_profile_id=profile_id_for(profile),
+    )
+
+    window._compression_prepared(prep)
+
+    assert window.profile_review_group.isHidden() is False
+    assert window.preview_compress_button.isEnabled() is True
+    assert window.skip_compression_preview_button.isEnabled() is True
+    assert "preview a middle clip" in window.compression_preview_status_label.text().lower()
+
+
+def test_approved_compression_preview_unlocks_profile_review(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x")
+    profile = SimpleNamespace(
+        name="Balanced",
+        encoder_key="slow",
+        sw_preset="slow",
+        crf=20,
+        quality_label="Excellent",
+        intent_label="Quality first",
+        estimated_output_bytes=700,
+        estimated_encode_seconds=300.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Higher quality.",
+    )
+    alternate = SimpleNamespace(
+        name="Laptop Speed",
+        encoder_key="ultrafast",
+        sw_preset="ultrafast",
+        crf=22,
+        quality_label="Good",
+        intent_label="Speed first",
+        estimated_output_bytes=500,
+        estimated_encode_seconds=120.0,
+        compatible_count=1,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="Faster.",
+    )
+    profile_id = profile_id_for(profile)
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=[
+                SimpleNamespace(
+                    source=source,
+                    codec="mpeg2video",
+                    recommendation="recommended",
+                    reason_text="legacy codec with strong projected savings",
+                    estimated_output_bytes=700,
+                    estimated_savings_bytes=300,
+                )
+            ],
+            duplicate_warnings=[],
+            profile=profile,
+            jobs=[SimpleNamespace(source=source)],
+            recommended_count=1,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=1,
+            total_input_bytes=1000,
+            selected_input_bytes=1000,
+            selected_estimated_output_bytes=700,
+            estimated_total_seconds=300.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
+        profile_options=[profile, alternate],
+        selected_profile_id=profile_id,
+        recommended_profile_id=profile_id_for(alternate),
+    )
+    result = CompressionPreviewResult(
+        request=CompressionPreviewRequest(
+            source=source,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            preset="slow",
+            crf=20,
+            duration_seconds=90,
+            start_seconds=450,
+            profile_id=profile_id,
+            profile_label="Balanced",
+        ),
+        success=True,
+        cancelled=False,
+        output_path=None,
+        temp_dir=None,
+        input_size_bytes=1000,
+        output_size_bytes=50,
+        source_duration_seconds=1000,
+        encoded_duration_seconds=90,
+        elapsed_seconds=1.0,
+        estimated_full_output_bytes=550,
+    )
+
+    window._compression_prepared(prep)
+    assert window.start_compress_button.isEnabled() is False
+
+    window._handle_compression_preview_decision(result, "approve")
+
+    assert window.start_compress_button.isEnabled() is True
+    assert window._compression_preview_decision == "approved"
+    assert "preview approved" in window.compression_preview_status_label.text().lower()
 
 
 def test_slow_compression_plan_offers_faster_rebuild(tmp_path: Path) -> None:

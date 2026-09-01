@@ -14,8 +14,8 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer
-from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtGui import QBrush, QColor, QCloseEvent, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QSystemTrayIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QHeaderView,
     QScrollArea,
+    QSlider,
     QSplitter,
     QSpinBox,
     QStackedWidget,
@@ -49,12 +50,30 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+try:
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+
+    _QT_MULTIMEDIA_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional platform feature
+    QAudioOutput = None
+    QMediaPlayer = None
+    QVideoWidget = None
+    _QT_MULTIMEDIA_AVAILABLE = False
 
 from mediashrink.gui_api import EncodePreparation, EncodeProgress
 from plexify.ui_controller import ApplyResultState, PreviewState, VideoUIController
 
 from . import __version__
 from .callback_types import ApplyProgress, PreparationProgress, PreparationStageUpdate
+from .compression_preview import (
+    CompressionPreviewProgress,
+    CompressionPreviewRequest,
+    CompressionPreviewResult,
+    build_preview_request,
+    cleanup_preview_result,
+    run_compression_preview,
+)
 from .compat import check_runtime_compatibility, compatibility_error_text
 from .config import PipelineConfig, PlexifySettings, ShrinkSettings, build_pipeline_config
 from .diagnostics import (
@@ -158,6 +177,10 @@ class MainWindow(QMainWindow):
         self._pending_profile_id: str | None = None
         self._profile_rebuild_profile_id: str | None = None
         self._profile_selection_method: str = "recommended"
+        self._compression_preview_result: CompressionPreviewResult | None = None
+        self._compression_preview_approved_profile_id: str | None = None
+        self._compression_preview_decision: str = "not-run"
+        self._compression_preview_cancel_requested: bool = False
         self._plan_classification = classify_compression_plan(())
         self._diagnostics = DiagnosticsRecorder()
         self._encode_progress_model = EncodeProgressModel()
@@ -535,6 +558,11 @@ class MainWindow(QMainWindow):
         self.profile_review_status_label.setWordWrap(True)
         self.profile_review_status_label.setObjectName("muted-label")
         self.accept_profile_button = QPushButton("Use Selected Profile")
+        self.preview_compress_button = QPushButton("Preview Compression")
+        self.skip_compression_preview_button = QPushButton("Skip Preview")
+        self.compression_preview_status_label = QLabel("")
+        self.compression_preview_status_label.setWordWrap(True)
+        self.compression_preview_status_label.setObjectName("muted-label")
         self.profile_table = QTableWidget(0, 8)
         self.profile_table.setHorizontalHeaderLabels(
             [
@@ -1190,10 +1218,13 @@ class MainWindow(QMainWindow):
 
         profile_layout = QVBoxLayout(self.profile_review_group)
         profile_layout.addWidget(self.profile_review_label)
+        profile_layout.addWidget(self.compression_preview_status_label)
         self.profile_table.setMinimumHeight(150)
         profile_layout.addWidget(self.profile_table)
         profile_action_row = QHBoxLayout()
         profile_action_row.addWidget(self.profile_review_status_label, stretch=1)
+        profile_action_row.addWidget(self.preview_compress_button)
+        profile_action_row.addWidget(self.skip_compression_preview_button)
         profile_action_row.addWidget(self.accept_profile_button)
         profile_layout.addLayout(profile_action_row)
 
@@ -1308,6 +1339,8 @@ class MainWindow(QMainWindow):
         self.profile_table.itemSelectionChanged.connect(self._profile_selection_changed)
         self.profile_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_profile())
         self.accept_profile_button.clicked.connect(self._accept_selected_profile)
+        self.preview_compress_button.clicked.connect(self._preview_compression)
+        self.skip_compression_preview_button.clicked.connect(self._skip_compression_preview)
 
         self.review_table.itemSelectionChanged.connect(self._review_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_: self._accept_selected_candidate())
@@ -1720,6 +1753,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 self._shutting_down = False
                 return
+        self._cleanup_active_compression_preview(reason="shutdown")
         super().closeEvent(event)
 
     def _browse_into(self, target: QLineEdit) -> None:
@@ -1975,6 +2009,8 @@ class MainWindow(QMainWindow):
             "largest_estimate_miss_bytes": largest_miss[0],
             "calibration_enabled": self.use_calibration.isChecked(),
             "calibration_updated": bool(successful and self.use_calibration.isChecked()),
+            "preview_decision": self._compression_preview_decision,
+            "preview_approved_profile_id": self._compression_preview_approved_profile_id,
         }
 
     def _run_quality_lines(self) -> list[str]:
@@ -2006,6 +2042,9 @@ class MainWindow(QMainWindow):
                 f"Largest estimate miss: {quality['largest_estimate_miss_file']} "
                 f"({self._format_bytes(miss)})"
             )
+        decision = str(quality.get("preview_decision", "") or "")
+        if decision and decision != "not-run":
+            lines.append(f"Compression preview: {decision.replace('-', ' ')}")
         lines.append("Calibration updated: yes" if quality.get("calibration_updated") else "Calibration updated: no")
         return lines
 
@@ -2224,6 +2263,47 @@ class MainWindow(QMainWindow):
             parts.append(str(why))
         return "\n".join(str(part) for part in parts if part)
 
+    @staticmethod
+    def _profile_cell_background(
+        profile: object,
+        column: int,
+        estimated_saving: int,
+        input_bytes: int,
+    ) -> QColor | None:
+        quality = str(getattr(profile, "quality_label", "") or "").lower()
+        if column == 1:
+            if "lossless" in quality or "excellent" in quality:
+                return QColor("#d9ead3")
+            if "very good" in quality or "better" in quality:
+                return QColor("#e7f2dc")
+            if "good" in quality:
+                return QColor("#fff2cc")
+        if column == 3 and input_bytes > 0:
+            saving_pct = estimated_saving / input_bytes
+            if saving_pct >= 0.70:
+                return QColor("#fce5cd")
+            if saving_pct >= 0.45:
+                return QColor("#fff2cc")
+        if column == 4:
+            seconds = float(getattr(profile, "estimated_encode_seconds", 0.0) or 0.0)
+            if seconds >= 8 * 3600:
+                return QColor("#f4cccc")
+            if seconds >= 4 * 3600:
+                return QColor("#fce5cd")
+        if column == 5 and int(getattr(profile, "incompatible_count", 0) or 0) > 0:
+            return QColor("#f4cccc")
+        return None
+
+    def _compression_preview_status_text(self, selected: object | None = None) -> str:
+        selected_id = profile_id_for(selected) if selected is not None else self._selected_profile_id
+        if self._compression_preview_decision == "approved" and selected_id == self._compression_preview_approved_profile_id:
+            return "Compression preview approved for the selected profile."
+        if self._compression_preview_decision == "skipped":
+            return "Compression preview skipped for this plan."
+        if not _QT_MULTIMEDIA_AVAILABLE:
+            return "Preview encode is available, but in-window playback is not available in this Qt build."
+        return "Optional: preview a middle clip before starting the full compression run."
+
     def _profile_payload(self, profile: object | None) -> dict[str, object] | None:
         if profile is None:
             return None
@@ -2255,6 +2335,10 @@ class MainWindow(QMainWindow):
         return not self._profile_review_required or self._profile_review_acknowledged
 
     def _prepare_profile_review(self, preparation: EncodePreparation) -> None:
+        self._cleanup_active_compression_preview(reason="new-plan")
+        self._compression_preview_approved_profile_id = None
+        self._compression_preview_decision = "not-run"
+        self._compression_preview_cancel_requested = False
         options = self._profile_options(preparation)
         self._selected_profile_id = getattr(preparation, "selected_profile_id", None) or profile_id_for(preparation.profile)
         self._pending_profile_id = self._selected_profile_id
@@ -2273,7 +2357,7 @@ class MainWindow(QMainWindow):
 
     def _populate_profile_table(self, preparation: EncodePreparation) -> None:
         options = self._profile_options(preparation)
-        self.profile_review_group.setVisible(bool(options and len(options) > 1))
+        self.profile_review_group.setVisible(bool(options or preparation.profile is not None))
         self.profile_table.blockSignals(True)
         self.profile_table.setRowCount(0)
         recommended_id = getattr(preparation, "recommended_profile_id", None)
@@ -2307,6 +2391,9 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 cell.setToolTip(tooltip if column in {0, 7} else f"{value}\n\n{tooltip}".strip())
+                color = self._profile_cell_background(profile, column, estimated_saving, input_bytes)
+                if color is not None:
+                    cell.setBackground(QBrush(color))
                 if column == 0:
                     cell.setData(Qt.UserRole, profile_id)
                 self.profile_table.setItem(row, column, cell)
@@ -2319,10 +2406,13 @@ class MainWindow(QMainWindow):
         if self.encode_preparation is None:
             return
         selected = self._selected_profile_option()
+        preview_text = self._compression_preview_status_text(selected)
         self.profile_review_label.setText(
             "Choose the encoding profile before overwriting originals. "
-            "Higher-quality profiles usually keep more detail and larger files; speed-first profiles finish sooner."
+            "Higher-quality profiles usually keep more detail and larger files; speed-first profiles finish sooner. "
+            "Use Preview Compression to inspect a middle clip before committing a long run."
         )
+        self.compression_preview_status_label.setText(preview_text)
         if not self._profile_review_required:
             self.profile_review_status_label.setText("")
             self.accept_profile_button.setText("Use Selected Profile")
@@ -2348,6 +2438,8 @@ class MainWindow(QMainWindow):
         self._pending_profile_id = str(item.data(Qt.UserRole)) if item is not None else self._selected_profile_id
         if self._pending_profile_id != self._selected_profile_id:
             self._profile_review_acknowledged = False
+            self._compression_preview_approved_profile_id = None
+            self._compression_preview_decision = "not-run"
         self._refresh_profile_review_text()
         self._update_ui()
 
@@ -2384,6 +2476,9 @@ class MainWindow(QMainWindow):
         source_paths = set(self._compression_source_paths) if self._compression_source_paths is not None else None
         previous_profile = self._profile_payload(getattr(self.encode_preparation, "profile", None))
         self._profile_review_acknowledged = False
+        self._cleanup_active_compression_preview(reason="profile-rebuild")
+        self._compression_preview_approved_profile_id = None
+        self._compression_preview_decision = "not-run"
         self._profile_rebuild_profile_id = selected_profile_id
         self._diagnostics.record_event(
             "profile_rebuild_started",
@@ -2414,6 +2509,377 @@ class MainWindow(QMainWindow):
             selected_profile_id=selected_profile_id,
         )
         self._start_worker(worker, self._compression_prepared, self._preparation_progress)
+
+    def _preview_candidate_jobs(self) -> list:
+        if self.encode_preparation is None:
+            return []
+        jobs_by_source = {Path(getattr(job, "source", "")): job for job in self.encode_preparation.jobs}
+        return [
+            jobs_by_source[row.source]
+            for row in self._ordered_compression_rows(self._compression_plan_rows)
+            if row.source in jobs_by_source and row.source in self._runnable_sources() and row.exists
+        ]
+
+    def _default_preview_source(self) -> Path | None:
+        jobs = self._preview_candidate_jobs()
+        if not jobs:
+            return None
+        return max(
+            (Path(getattr(job, "source", "")) for job in jobs),
+            key=self._path_size,
+            default=None,
+        )
+
+    def _profile_by_id(self, profile_id: str | None) -> object | None:
+        if not profile_id:
+            return None
+        for profile in self._profile_options():
+            if profile_id_for(profile) == profile_id:
+                return profile
+        if self.encode_preparation is not None and profile_id_for(self.encode_preparation.profile) == profile_id:
+            return self.encode_preparation.profile
+        return None
+
+    def _compression_preview_request_dialog(self) -> CompressionPreviewRequest | str | None:
+        if self.encode_preparation is None:
+            return None
+        jobs = self._preview_candidate_jobs()
+        if not jobs:
+            self._show_error("No runnable compression jobs are available to preview.")
+            return None
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview Compression")
+        dialog.resize(760, 260)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel("Preview a middle clip with the selected compression settings before starting the full run.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        file_combo = QComboBox()
+        default_source = self._default_preview_source()
+        for index, job in enumerate(jobs):
+            source = Path(getattr(job, "source", ""))
+            label = f"{display_name_for_ui(source.name)} ({self._format_bytes(self._path_size(source))})"
+            file_combo.addItem(label, str(source))
+            if default_source is not None and source == default_source:
+                file_combo.setCurrentIndex(index)
+        profile_combo = QComboBox()
+        selected_id = self._selected_profile_id or profile_id_for(self.encode_preparation.profile)
+        for index, profile in enumerate(self._profile_options() or [self.encode_preparation.profile]):
+            if profile is None:
+                continue
+            profile_id = profile_id_for(profile)
+            profile_combo.addItem(self._profile_label(profile), profile_id)
+            if profile_id == selected_id:
+                profile_combo.setCurrentIndex(index)
+        length_combo = QComboBox()
+        for label, seconds in [("30 seconds", 30), ("60 seconds", 60), ("90 seconds", 90), ("120 seconds", 120)]:
+            length_combo.addItem(label, seconds)
+        length_combo.setCurrentIndex(2)
+        form.addRow("File", file_combo)
+        form.addRow("Profile", profile_combo)
+        form.addRow("Clip length", length_combo)
+        layout.addLayout(form)
+        status = QLabel("The preview is temporary and will be removed after review.")
+        status.setWordWrap(True)
+        status.setObjectName("muted-label")
+        layout.addWidget(status)
+        buttons = QDialogButtonBox()
+        start_button = buttons.addButton("Start Preview", QDialogButtonBox.AcceptRole)
+        skip_button = buttons.addButton("Skip Preview", QDialogButtonBox.DestructiveRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        start_button.clicked.connect(dialog.accept)
+        skip_button.clicked.connect(lambda: dialog.done(2))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        result = dialog.exec()
+        if result == 2:
+            return "skip"
+        if result != QDialog.Accepted:
+            return None
+        profile_id = str(profile_combo.currentData() or "")
+        profile = self._profile_by_id(profile_id)
+        if profile is None:
+            self._show_error("No encoding profile is selected for preview.")
+            return None
+        return build_preview_request(
+            source=Path(str(file_combo.currentData())),
+            ffmpeg=self.encode_preparation.ffmpeg,
+            ffprobe=self.encode_preparation.ffprobe,
+            preset=str(getattr(profile, "encoder_key", None) or getattr(profile, "sw_preset", None) or "fast"),
+            crf=int(getattr(profile, "crf", 20) or 20),
+            duration_seconds=float(length_combo.currentData() or 90),
+            profile_id=profile_id,
+            profile_label=self._profile_label(profile),
+        )
+
+    def _preview_compression(self) -> None:
+        choice = self._compression_preview_request_dialog()
+        if choice is None:
+            return
+        if choice == "skip":
+            self._skip_compression_preview()
+            return
+        assert isinstance(choice, CompressionPreviewRequest)
+        self._diagnostics.record_event(
+            "compression_preview_requested",
+            source=str(choice.source),
+            profile_id=choice.profile_id,
+            profile_label=choice.profile_label,
+            preset=choice.preset,
+            crf=choice.crf,
+            start_seconds=round(choice.start_seconds, 2),
+            duration_seconds=round(choice.duration_seconds, 2),
+        )
+        self._flush_runtime_diagnostics()
+        result = self._run_compression_preview_dialog(choice)
+        if result is None:
+            return
+        self._compression_preview_result = result if result.success else None
+        self._diagnostics.record_event(
+            "compression_preview_finished",
+            source=str(result.request.source),
+            profile_id=result.request.profile_id,
+            success=result.success,
+            cancelled=result.cancelled,
+            output_bytes=result.output_size_bytes,
+            estimated_full_output_bytes=result.estimated_full_output_bytes,
+            elapsed_seconds=round(result.elapsed_seconds, 2),
+            error=result.error_message,
+        )
+        if not result.success:
+            self._compression_preview_decision = "cancelled" if result.cancelled else "failed"
+            self._refresh_profile_review_text()
+            self._flush_runtime_diagnostics()
+            if not result.cancelled:
+                QMessageBox.warning(self, "mediaflow", result.error_message or "Preview encode failed.")
+            return
+        decision = self._show_compression_preview_result(result)
+        self._handle_compression_preview_decision(result, decision)
+
+    def _run_compression_preview_dialog(
+        self,
+        request: CompressionPreviewRequest,
+    ) -> CompressionPreviewResult | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Encoding Preview")
+        dialog.resize(620, 180)
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"Encoding preview for {display_name_for_ui(request.source.name)}")
+        label.setWordWrap(True)
+        detail = QLabel("")
+        detail.setWordWrap(True)
+        detail.setObjectName("muted-label")
+        bar = QProgressBar()
+        cancel_button = QPushButton("Cancel Preview")
+        layout.addWidget(label)
+        layout.addWidget(detail)
+        layout.addWidget(bar)
+        layout.addWidget(cancel_button)
+        holder: dict[str, object] = {}
+
+        def on_progress(payload: object) -> None:
+            if not isinstance(payload, CompressionPreviewProgress):
+                return
+            bar.setValue(int(payload.progress * 100))
+            detail.setText(f"{payload.message} Elapsed: {self._format_elapsed(payload.elapsed_seconds)}")
+
+        def on_result(result: object) -> None:
+            holder["result"] = result
+            dialog.accept()
+
+        def on_error(error: str) -> None:
+            holder["error"] = error
+            dialog.reject()
+
+        self._compression_preview_cancel_requested = False
+        cancel_button.clicked.connect(lambda: self._request_compression_preview_cancel(cancel_button, detail))
+        worker = FunctionWorker(
+            run_compression_preview,
+            request,
+            cancel_callback=lambda: self._compression_preview_cancel_requested,
+        )
+        self._active_worker_count += 1
+        self._worker_refs.add(worker)
+        worker.signals.result.connect(on_result)
+        worker.signals.error.connect(on_error)
+        worker.signals.progress.connect(on_progress)
+        worker.signals.finished.connect(self._worker_finished)
+        worker.signals.finished.connect(lambda w=worker: self._release_worker_ref(w))
+        self.thread_pool.start(worker)
+        self._update_ui()
+        dialog.exec()
+        if "result" not in holder and "error" not in holder:
+            self._compression_preview_cancel_requested = True
+            self._diagnostics.record_event("compression_preview_dialog_closed_before_result")
+            self._flush_runtime_diagnostics()
+            return None
+        self._compression_preview_cancel_requested = False
+        if "error" in holder:
+            QMessageBox.warning(self, "mediaflow", str(holder["error"]))
+            return None
+        result = holder.get("result")
+        return result if isinstance(result, CompressionPreviewResult) else None
+
+    def _request_compression_preview_cancel(self, button: QPushButton, detail: QLabel) -> None:
+        self._compression_preview_cancel_requested = True
+        button.setEnabled(False)
+        detail.setText("Cancel requested. Temporary preview output will be cleaned up.")
+        self._diagnostics.record_event("compression_preview_cancel_requested")
+
+    def _show_compression_preview_result(self, result: CompressionPreviewResult) -> str:
+        if not _QT_MULTIMEDIA_AVAILABLE or QMediaPlayer is None or QAudioOutput is None or QVideoWidget is None:
+            message = (
+                "Preview encoded successfully, but in-window playback is not available in this Qt build.\n\n"
+                f"Preview size: {self._format_bytes(result.output_size_bytes)}"
+            )
+            return "approve" if QMessageBox.question(self, "mediaflow", message + "\n\nApprove this profile?") == QMessageBox.Yes else "cancel"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review Compression Preview")
+        dialog.resize(980, 720)
+        layout = QVBoxLayout(dialog)
+        metadata = QLabel(self._compression_preview_metadata_text(result))
+        metadata.setWordWrap(True)
+        layout.addWidget(metadata)
+        video_widget = QVideoWidget()
+        layout.addWidget(video_widget, stretch=1)
+        controls = QHBoxLayout()
+        play_button = QPushButton("Play")
+        seek = QSlider(Qt.Horizontal)
+        seek.setRange(0, 0)
+        volume = QSlider(Qt.Horizontal)
+        volume.setRange(0, 100)
+        volume.setValue(70)
+        controls.addWidget(play_button)
+        controls.addWidget(seek, stretch=1)
+        controls.addWidget(QLabel("Volume"))
+        controls.addWidget(volume)
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox()
+        approve_button = buttons.addButton("Approve And Continue", QDialogButtonBox.AcceptRole)
+        change_button = buttons.addButton("Change Profile", QDialogButtonBox.ActionRole)
+        choose_button = buttons.addButton("Choose Another File", QDialogButtonBox.ActionRole)
+        buttons.addButton("Skip Preview", QDialogButtonBox.DestructiveRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        player = QMediaPlayer(dialog)
+        audio = QAudioOutput(dialog)
+        audio.setVolume(0.70)
+        player.setAudioOutput(audio)
+        player.setVideoOutput(video_widget)
+        if result.output_path is not None:
+            player.setSource(QUrl.fromLocalFile(str(result.output_path)))
+        play_button.clicked.connect(lambda: player.pause() if player.playbackState() == QMediaPlayer.PlayingState else player.play())
+        player.playbackStateChanged.connect(lambda state: play_button.setText("Pause" if state == QMediaPlayer.PlayingState else "Play"))
+        player.durationChanged.connect(seek.setMaximum)
+        player.positionChanged.connect(lambda position: seek.setValue(position) if not seek.isSliderDown() else None)
+        seek.sliderMoved.connect(player.setPosition)
+        volume.valueChanged.connect(lambda value: audio.setVolume(value / 100))
+        approve_button.clicked.connect(lambda: dialog.done(1))
+        change_button.clicked.connect(lambda: dialog.done(2))
+        choose_button.clicked.connect(lambda: dialog.done(3))
+        buttons.rejected.connect(dialog.reject)
+        for button in buttons.buttons():
+            if button.text() == "Skip Preview":
+                button.clicked.connect(lambda: dialog.done(4))
+        player.play()
+        decision_code = dialog.exec()
+        player.stop()
+        return {1: "approve", 2: "change-profile", 3: "choose-file", 4: "skip"}.get(decision_code, "cancel")
+
+    def _compression_preview_metadata_text(self, result: CompressionPreviewResult) -> str:
+        estimated = (
+            f"Estimated full-file output from this sample: {self._format_bytes(result.estimated_full_output_bytes)}"
+            if result.estimated_full_output_bytes
+            else "Estimated full-file output from this sample: unavailable"
+        )
+        return "\n".join(
+            [
+                f"File: {result.request.source}",
+                f"Profile: {result.request.profile_label}",
+                f"Clip: starts at {self._format_elapsed(result.request.start_seconds)}, length {self._format_elapsed(result.encoded_duration_seconds)}",
+                f"Preview output: {self._format_bytes(result.output_size_bytes)}",
+                estimated,
+                "Use the clip to judge visible quality, not as an exact file-size promise.",
+            ]
+        )
+
+    def _handle_compression_preview_decision(self, result: CompressionPreviewResult, decision: str) -> None:
+        cleanup_ok = True
+        if decision == "approve":
+            current_id = self._selected_profile_id or profile_id_for(getattr(self.encode_preparation, "profile", None))
+            self._compression_preview_decision = "approved"
+            self._compression_preview_approved_profile_id = result.request.profile_id
+            self._profile_review_acknowledged = bool(result.request.profile_id == current_id)
+            cleanup_ok = self._cleanup_active_compression_preview(reason="approved")
+            self._diagnostics.record_event(
+                "compression_preview_decision",
+                decision="approved",
+                profile_id=result.request.profile_id,
+                cleanup_ok=cleanup_ok,
+            )
+            if result.request.profile_id and result.request.profile_id != current_id:
+                self._start_profile_rebuild(result.request.profile_id)
+            else:
+                self._refresh_profile_review_text()
+                self._update_compress_summary()
+                self._update_ui()
+                self._flush_runtime_diagnostics()
+            return
+        if decision == "choose-file":
+            cleanup_ok = self._cleanup_active_compression_preview(reason="choose-another")
+            self._diagnostics.record_event("compression_preview_decision", decision=decision, cleanup_ok=cleanup_ok)
+            self._flush_runtime_diagnostics()
+            self._preview_compression()
+            return
+        if decision == "change-profile":
+            cleanup_ok = self._cleanup_active_compression_preview(reason="change-profile")
+            self._compression_preview_decision = "change-profile"
+            self._diagnostics.record_event("compression_preview_decision", decision=decision, cleanup_ok=cleanup_ok)
+            self._refresh_profile_review_text()
+            self._update_ui()
+            self._flush_runtime_diagnostics()
+            return
+        if decision == "skip":
+            cleanup_ok = self._cleanup_active_compression_preview(reason="skipped")
+            self._record_compression_preview_skipped(cleanup_ok=cleanup_ok)
+            return
+        cleanup_ok = self._cleanup_active_compression_preview(reason="cancelled")
+        self._compression_preview_decision = "cancelled"
+        self._diagnostics.record_event("compression_preview_decision", decision="cancelled", cleanup_ok=cleanup_ok)
+        self._refresh_profile_review_text()
+        self._update_ui()
+        self._flush_runtime_diagnostics()
+
+    def _skip_compression_preview(self) -> None:
+        cleanup_ok = self._cleanup_active_compression_preview(reason="skipped")
+        self._record_compression_preview_skipped(cleanup_ok=cleanup_ok)
+
+    def _record_compression_preview_skipped(self, *, cleanup_ok: bool) -> None:
+        self._compression_preview_decision = "skipped"
+        self._compression_preview_approved_profile_id = None
+        self._diagnostics.record_event(
+            "compression_preview_decision",
+            decision="skipped",
+            selected_profile_id=self._selected_profile_id,
+            cleanup_ok=cleanup_ok,
+        )
+        self._refresh_profile_review_text()
+        self._update_ui()
+        self._flush_runtime_diagnostics()
+
+    def _cleanup_active_compression_preview(self, *, reason: str) -> bool:
+        result = self._compression_preview_result
+        self._compression_preview_result = None
+        cleanup_ok = cleanup_preview_result(result)
+        if result is not None:
+            self._diagnostics.record_event(
+                "compression_preview_cleanup",
+                reason=reason,
+                path=str(result.temp_dir) if result.temp_dir else None,
+                cleanup_ok=cleanup_ok,
+            )
+        return cleanup_ok
 
     @staticmethod
     def _summarize_path(path_text: str | None) -> str:
@@ -3124,10 +3590,15 @@ class MainWindow(QMainWindow):
         self._pending_profile_id = None
         self._profile_rebuild_profile_id = None
         self._profile_selection_method = "recommended"
+        self._cleanup_active_compression_preview(reason="reset")
+        self._compression_preview_approved_profile_id = None
+        self._compression_preview_decision = "not-run"
+        self._compression_preview_cancel_requested = False
         self.profile_review_group.setVisible(False)
         self.profile_table.setRowCount(0)
         self.profile_review_label.setText("")
         self.profile_review_status_label.setText("")
+        self.compression_preview_status_label.setText("")
         self.prepare_elapsed_label.setText("")
         self.prepare_stage_label.setText("Analysing files...")
         self.prepare_counts_label.setText("0 file(s) discovered • 0.0 B")
@@ -3411,6 +3882,19 @@ class MainWindow(QMainWindow):
             and self.workflow_state == WorkflowState.READY_TO_COMPRESS
             and not busy
             and not self._config_dirty
+        )
+        can_preview_compression = bool(
+            has_compression_plan
+            and self.workflow_state == WorkflowState.READY_TO_COMPRESS
+            and self.encode_preparation is not None
+            and self._runnable_jobs(self.encode_preparation)
+            and self._selected_profile_option() is not None
+            and not busy
+            and not self._config_dirty
+        )
+        self.preview_compress_button.setEnabled(can_preview_compression)
+        self.skip_compression_preview_button.setEnabled(
+            bool(has_compression_plan and self.workflow_state == WorkflowState.READY_TO_COMPRESS and not busy and not self._config_dirty)
         )
         self.include_risky_jobs.setVisible(bool(self._plan_classification.risky_follow_up))
         self.include_risky_jobs.setEnabled(has_compression_plan and not busy and not self._config_dirty)
@@ -4380,6 +4864,13 @@ class MainWindow(QMainWindow):
     def _snapshot_config_for_diagnostics(self) -> dict[str, object]:
         payload = self._ui_state_payload()
         payload["workflow_state"] = self.workflow_state.value
+        payload["compression_preview"] = {
+            "decision": self._compression_preview_decision,
+            "approved_profile_id": self._compression_preview_approved_profile_id,
+            "active_temp_dir": str(self._compression_preview_result.temp_dir)
+            if self._compression_preview_result is not None and self._compression_preview_result.temp_dir is not None
+            else None,
+        }
         return payload
 
     def _summary_timeline_text(self) -> str:
