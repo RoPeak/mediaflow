@@ -536,6 +536,95 @@ def test_prepare_compression_uses_quality_aware_default_for_movie_overwrite(tmp_
     assert result.selected_estimated_output_bytes == 60
 
 
+def test_prepare_compression_prefers_all_compatible_fallback_over_partial_profile(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        source=tmp_path,
+        library=tmp_path,
+        compression_root=tmp_path,
+        shrink=ShrinkSettings(policy="fastest-wall-clock", overwrite=True),
+    )
+    sources = [tmp_path / f"movie-{index}.mkv" for index in range(3)]
+    for source in sources:
+        source.write_bytes(b"x" * 100)
+    items = [
+        SimpleNamespace(
+            source=source,
+            codec="h264",
+            size_bytes=100,
+            estimated_output_bytes=50,
+            estimated_savings_bytes=50,
+            recommendation="recommended",
+            reason_text="Strong savings",
+        )
+        for source in sources
+    ]
+    partial = SimpleNamespace(
+        name="Fast",
+        encoder_key="faster",
+        sw_preset="faster",
+        crf=22,
+        estimated_output_bytes=150,
+        estimated_encode_seconds=10.0,
+        compatible_count=2,
+        incompatible_count=1,
+        grouped_incompatibilities={"container compatibility": 1},
+        why_choose="Partial-batch default only.",
+    )
+    safe = SimpleNamespace(
+        name="Laptop Speed",
+        encoder_key="ultrafast",
+        sw_preset="ultrafast",
+        crf=22,
+        estimated_output_bytes=180,
+        estimated_encode_seconds=12.0,
+        compatible_count=3,
+        incompatible_count=0,
+        grouped_incompatibilities={},
+        why_choose="All-compatible fallback.",
+    )
+    jobs = [_job(tmp_path, source.name) for source in sources]
+    prep = _with_attrs(
+        EncodePreparation(
+            directory=tmp_path,
+            ffmpeg=tmp_path / "ffmpeg",
+            ffprobe=tmp_path / "ffprobe",
+            items=items,
+            duplicate_warnings=[],
+            profile=partial,
+            jobs=jobs[:2],
+            recommended_count=3,
+            maybe_count=0,
+            skip_count=0,
+            selected_count=3,
+            total_input_bytes=300,
+            selected_input_bytes=300,
+            selected_estimated_output_bytes=150,
+            estimated_total_seconds=10.0,
+            on_file_failure="retry",
+            use_calibration=True,
+        ),
+        profile_options=[partial, safe],
+        selected_profile_id=profile_id_for(partial),
+    )
+
+    with patch("mediaflow.mediashrink_adapter.prepare_encode_run", return_value=prep), patch(
+        "mediaflow.mediashrink_adapter.prepare_profile_planning",
+        return_value=SimpleNamespace(profiles=[partial, safe], active_calibration=None, benchmark_speeds={}),
+    ), patch("mediaflow.mediashrink_adapter.build_jobs", return_value=jobs), patch(
+        "mediaflow.mediashrink_adapter.estimate_analysis_encode_seconds", return_value=12.0
+    ), patch("mediaflow.mediashrink_adapter.estimate_size_confidence", return_value="High"), patch(
+        "mediaflow.mediashrink_adapter.estimate_time_confidence", return_value="Medium"
+    ):
+        result = prepare_compression(config)
+
+    assert result.profile.name == "Laptop Speed"
+    assert result.selected_profile_id == profile_id_for(safe)
+    assert result.profile_selection_method == "fallback"
+    assert result.compatible_count == 3
+    assert result.incompatible_count == 0
+    assert all("no safe runnable profile" not in line.lower() for line in result.stage_messages)
+
+
 def test_prepare_compression_filters_sources_when_mediashrink_lacks_allowlist(tmp_path: Path) -> None:
     first = tmp_path / "first.mkv"
     second = tmp_path / "second.mkv"

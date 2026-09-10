@@ -998,6 +998,140 @@ def test_bulk_confirmation_table_includes_affected_row_details() -> None:
     assert table.item(0, 4).text() == "Half Man"
 
 
+def test_auto_accept_skips_suspicious_subset_movie_match() -> None:
+    _app()
+    window = MainWindow()
+    accepted: list[tuple[int, int]] = []
+    item = SimpleNamespace(
+        item=SimpleNamespace(
+            path=Path("/tmp/Interview_with_the_Vampire_The_Vampire_Lestat_-_03._Toronto_m002zld0_original.mp4"),
+            media_type="movie",
+            title="Interview with the Vampire The Vampire Lestat",
+            season=None,
+            episode=None,
+        ),
+        lookup_title="Interview with the Vampire The Vampire Lestat",
+        manual_candidate=None,
+        selected_candidate=None,
+        selected_candidate_index=None,
+        candidates=[SimpleNamespace(title="Interview with the Vampire", year=1994)],
+        decision_status="pending",
+        preview_block_reason=None,
+        unresolved_reason=None,
+        warning=None,
+        cache_context="auto-selectable",
+        auto_selectable=True,
+        status_label="pending",
+        has_more=False,
+        candidate_states=[],
+        skipped=False,
+    )
+    window.controller = SimpleNamespace(
+        items=[item],
+        accept_candidate=lambda index, candidate_index: accepted.append((index, candidate_index)),
+        build_preview=lambda: SimpleNamespace(
+            plans=[],
+            summary_lines=[],
+            can_apply=False,
+            unresolved_count=1,
+            unresolved_items=[],
+            warnings=[],
+        ),
+    )
+
+    assert window._auto_accept_safe_matches() == 0
+
+    assert accepted == []
+    assert item.auto_accept_block_reason == "source title has significant words missing from selected movie title"
+    assert any(event["kind"] == "auto_accept_blocked" for event in window._diagnostics.events)
+
+
+def test_bulk_mismatch_allows_numeric_tv_files_with_parent_show_folder() -> None:
+    _app()
+    window = MainWindow()
+    items = [
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path(f"/tmp/The Pitt/Season 1/{episode}.mkv"), media_type="tv", title="The Pitt", season=1, episode=episode),
+            selected_candidate=SimpleNamespace(title="The Pitt"),
+            decision_status="accepted",
+            status_label="accepted",
+            preview_block_reason=None,
+            unresolved_reason=None,
+            warning=None,
+        )
+        for episode in range(1, 4)
+    ]
+    window.controller = SimpleNamespace(items=items)
+
+    assert window._bulk_mismatch_rows([0, 1, 2], "The Pitt", "the pitt") == []
+
+
+def test_bulk_mismatch_still_blocks_mixed_parent_show_folders() -> None:
+    _app()
+    window = MainWindow()
+    items = [
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/The Pitt/Season 1/1.mkv"), media_type="tv", title="The Pitt", season=1, episode=1),
+            selected_candidate=SimpleNamespace(title="The Pitt"),
+            decision_status="accepted",
+            status_label="accepted",
+            preview_block_reason=None,
+            unresolved_reason=None,
+            warning=None,
+        ),
+        SimpleNamespace(
+            item=SimpleNamespace(path=Path("/tmp/Other Show/Season 1/1.mkv"), media_type="tv", title="Other Show", season=1, episode=1),
+            selected_candidate=None,
+            decision_status="pending",
+            status_label="pending",
+            preview_block_reason=None,
+            unresolved_reason=None,
+            warning=None,
+        ),
+    ]
+    window.controller = SimpleNamespace(items=items)
+
+    mismatches = window._bulk_mismatch_rows([0, 1], "The Pitt", "the pitt")
+
+    assert mismatches == [(1, "filename group 'other show' differs from 'the pitt'")]
+
+
+def test_pre_apply_plan_flags_episodic_movie_destination_cluster(tmp_path: Path) -> None:
+    _app()
+    window = MainWindow()
+    sources = []
+    for episode in range(3, 5):
+        source = tmp_path / f"Interview_with_the_Vampire_The_Vampire_Lestat_-_{episode:02d}._City.mp4"
+        source.write_bytes(b"x")
+        sources.append(source)
+    destinations = [
+        tmp_path / "Movies" / "Interview with the Vampire (1994)" / "Interview with the Vampire (1994).mp4",
+        tmp_path / "Movies" / "Interview with the Vampire (1994)" / "Interview with the Vampire (1994) (2).mp4",
+    ]
+    items = [
+        SimpleNamespace(
+            item=SimpleNamespace(path=source, media_type="movie", title="Interview with the Vampire The Vampire Lestat"),
+            selected_candidate=SimpleNamespace(title="Interview with the Vampire", year=1994),
+            decision_status="accepted",
+            status_label="accepted",
+            preview_block_reason=None,
+            unresolved_reason=None,
+            warning=None,
+        )
+        for source in sources
+    ]
+    window.controller = SimpleNamespace(items=items)
+    window.preview_state = SimpleNamespace(
+        plans=[SimpleNamespace(source=source, destination=destination) for source, destination in zip(sources, destinations)]
+    )
+
+    lines = window._organisation_preflight_lines()
+
+    text = "\n".join(lines)
+    assert "Suspicious destination groups: 1" in text
+    assert "multiple episodic-looking sources resolve to the same movie destination" in text
+
+
 def test_suspicious_bulk_apply_is_blocked_without_changing_review_state(monkeypatch) -> None:
     _app()
     window = MainWindow()

@@ -118,6 +118,7 @@ class ApplyProgressModel:
     completed_bytes: int = 0
     active_files: int = 0
     parallel_workers: int = 1
+    operation: str = ""
     progress_capability: str = ""
     speed_mbps: float | None = None
     eta_seconds: float | None = None
@@ -141,6 +142,7 @@ class ApplyProgressModel:
         self.completed_bytes = 0
         self.active_files = 0
         self.parallel_workers = 1
+        self.operation = ""
         self.progress_capability = ""
         self.speed_mbps = None
         self.eta_seconds = None
@@ -176,6 +178,7 @@ class ApplyProgressModel:
         self.total_bytes = max(self.total_bytes, total_bytes)
         self.active_files = max(0, int(getattr(payload, "active_files", 0) or 0))
         self.parallel_workers = max(1, int(getattr(payload, "parallel_workers", 1) or 1))
+        self.operation = str(getattr(payload, "operation", "") or self.operation)
         self.progress_capability = str(getattr(payload, "progress_capability", "") or self.progress_capability)
         self.report_path = report_path or self.report_path
         self.cancel_requested = self.cancel_requested or bool(getattr(payload, "cancel_requested", False))

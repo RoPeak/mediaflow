@@ -822,9 +822,11 @@ def _stabilize_preparation(
         return preparation
 
     current_profile = preparation.profile
+    selected_total = len(selected_items)
     current_usable = bool(
         current_profile is not None
-        and getattr(current_profile, "compatible_count", 0) > 0
+        and getattr(current_profile, "compatible_count", 0) >= selected_total
+        and getattr(current_profile, "incompatible_count", 0) <= 0
         and preparation.jobs
         and not _profile_has_blocking_risk(current_profile)
     )
@@ -847,7 +849,7 @@ def _stabilize_preparation(
             "Compression analysis completed, but no safe runnable profile could be selected automatically. "
             "Review the plan details or rebuild the plan with safer settings."
         )
-        return replace(preparation, stage_messages=messages)
+        return _replace_preparation(preparation, stage_messages=messages)
 
     jobs = build_jobs(
         files=[item.source for item in selected_items],
@@ -863,7 +865,7 @@ def _stabilize_preparation(
         messages.append(
             f"Profile {profile.name} was selected as the safest available fallback, but no runnable jobs were produced."
         )
-        return replace(
+        return _replace_preparation(
             preparation,
             profile=profile,
             compatible_count=profile.compatible_count,
@@ -882,6 +884,12 @@ def _stabilize_preparation(
             f"Selected profile {current_profile.name} was predicted to work for 0 file(s), so mediaflow switched "
             f"to the safer runnable fallback {profile.name}."
         )
+    else:
+        messages.append(
+            f"Selected profile {current_profile.name} was only compatible with "
+            f"{getattr(current_profile, 'compatible_count', 0)} of {selected_total} selected file(s), so mediaflow switched "
+            f"to the all-compatible fallback {profile.name}."
+        )
     selected_input_bytes = sum(int(getattr(item, "size_bytes", 0) or 0) for item in selected_items)
     selected_estimated_output_bytes = sum(
         int(getattr(item, "estimated_output_bytes", 0) or 0)
@@ -897,10 +905,12 @@ def _stabilize_preparation(
         use_calibration=preparation.use_calibration,
         calibration_store=planning.active_calibration if planning is not None else None,
     )
-    return replace(
+    return _replace_preparation(
         preparation,
         profile=profile,
         jobs=jobs,
+        selected_profile_id=profile_id_for(profile),
+        profile_selection_method="fallback",
         selected_count=len(jobs),
         selected_input_bytes=selected_input_bytes,
         selected_estimated_output_bytes=selected_estimated_output_bytes,

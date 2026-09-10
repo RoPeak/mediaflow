@@ -3273,6 +3273,8 @@ class MainWindow(QMainWindow):
             lines.append(f"Destination: {payload.current_destination}")
         if payload.source_size_bytes:
             lines.append(f"Current file size: {self._format_bytes(payload.source_size_bytes)}")
+        if self._apply_progress_is_metadata_move(payload):
+            lines.append("Move progress: same-filesystem rename; tracking completed items.")
         if payload.report_path:
             lines.append(f"Report: {payload.report_path}")
         if payload.conflict_action:
@@ -3286,6 +3288,12 @@ class MainWindow(QMainWindow):
         if payload.cancel_requested or self._apply_cancel_requested:
             lines.append("Cancel requested. Mediaflow will stop before the next file operation.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _apply_progress_is_metadata_move(payload: ApplyProgress) -> bool:
+        operation = str(payload.operation or "").strip().lower()
+        capability = str(payload.progress_capability or "").strip().lower()
+        return operation == "moving" and capability in {"item", "planned"}
 
     def _complete_action(self, text: str) -> None:
         self._last_completed_action = text
@@ -3330,11 +3338,18 @@ class MainWindow(QMainWindow):
                 f"  |  Copied: {self._format_bytes(model.completed_bytes)}"
                 f" of {self._format_bytes(model.total_bytes)}"
             )
-        size_text = (
-            f"Current file size: {self._format_bytes(model.current_file_bytes)}"
-            if model.current_file_bytes
-            else "Current file size: unknown"
-        )
+        metadata_move = str(model.operation or "").lower() == "moving" and str(model.progress_capability or "").lower() in {
+            "item",
+            "planned",
+        }
+        if metadata_move:
+            size_text = "Move progress: same-filesystem rename; tracking completed items"
+        else:
+            size_text = (
+                f"Current file size: {self._format_bytes(model.current_file_bytes)}"
+                if model.current_file_bytes
+                else "Current file size: unknown"
+            )
         stalled_text = ""
         if stalled_seconds >= 10:
             stalled_text = (
@@ -3353,7 +3368,11 @@ class MainWindow(QMainWindow):
         self.apply_elapsed_label.setText(
             f"Elapsed: {self._format_elapsed(model.elapsed_seconds)}{report}"
         )
-        if model.speed_mbps is not None:
+        if metadata_move:
+            self.apply_throughput_label.setText(
+                f"Telemetry: item-level move progress  |  Workers: {model.parallel_workers}"
+            )
+        elif model.speed_mbps is not None:
             eta = f"  |  ETA: {self._format_elapsed(model.eta_seconds)}" if model.eta_seconds is not None else ""
             self.apply_throughput_label.setText(
                 f"Throughput: {model.speed_mbps:.1f} MB/s{eta}  |  "
@@ -3363,7 +3382,10 @@ class MainWindow(QMainWindow):
             self.apply_throughput_label.setText(
                 f"Telemetry: {model.progress_capability or 'waiting for byte progress'}  |  Workers: {model.parallel_workers}"
             )
-        if model.current_file_bytes:
+        if metadata_move:
+            self.apply_current_progress_bar.setRange(0, 100)
+            self.apply_current_progress_bar.setValue(0 if model.phase != "completed-item" else 100)
+        elif model.current_file_bytes:
             self.apply_current_progress_bar.setRange(0, 100)
             self.apply_current_progress_bar.setValue(
                 int(100 * min(model.current_file_bytes_copied, model.current_file_bytes) / model.current_file_bytes)
@@ -5684,6 +5706,9 @@ class MainWindow(QMainWindow):
         selected_title = getattr(selected_candidate, "title", "") or ""
         if not selected_title:
             return False
+        reason = self._local_auto_accept_block_reason(item)
+        if reason:
+            return True
         source_tokens = self._title_tokens(Path(getattr(getattr(item, "item", None), "path", Path())).stem)
         selected_tokens = self._title_tokens(str(selected_title))
         if not source_tokens or not selected_tokens:
@@ -5691,9 +5716,37 @@ class MainWindow(QMainWindow):
         overlap = source_tokens & selected_tokens
         return len(overlap) == 0 and len(source_tokens) >= 2 and len(selected_tokens) >= 2
 
+    def _local_auto_accept_block_reason(self, item: object) -> str | None:
+        inner = getattr(item, "item", None)
+        if str(getattr(inner, "media_type", "") or "") != "movie":
+            return None
+        selected_candidate = getattr(item, "selected_candidate", None)
+        candidate_title = str(getattr(selected_candidate, "title", "") or "").strip()
+        if not candidate_title:
+            candidates = list(getattr(item, "candidates", []) or [])
+            candidate_title = str(getattr(candidates[0], "title", "") or "").strip() if candidates else ""
+        if not candidate_title:
+            return None
+        source_path = Path(getattr(inner, "path", Path()))
+        title = str(getattr(inner, "title", "") or source_path.stem).strip()
+        lookup_title = str(getattr(item, "lookup_title", "") or title).strip()
+        source_text = f"{title} {lookup_title}"
+        source_tokens = self._title_tokens(source_text)
+        candidate_tokens = self._title_tokens(candidate_title)
+        if len(source_tokens) >= 3 and candidate_tokens and source_tokens - candidate_tokens:
+            return "source title has significant words missing from selected movie title"
+        if self._looks_episodic_source(source_path, title):
+            return "movie source looks episodic"
+        return None
+
+    @staticmethod
+    def _looks_episodic_source(path: Path, title: str = "") -> bool:
+        haystack = f"{path.stem} {title}"
+        return bool(re.search(r"(?:^|[\s_.-])\d{1,3}[\s_.-]+[A-Za-z][A-Za-z0-9']+", haystack, flags=re.IGNORECASE))
+
     @staticmethod
     def _title_tokens(text: str) -> set[str]:
-        stop = {"the", "a", "an", "of", "and", "in", "on", "to", "s", "e", "series", "season", "episode", "original"}
+        stop = {"the", "a", "an", "of", "and", "in", "on", "to", "with", "s", "e", "series", "season", "episode", "original"}
         return {
             token
             for token in re.findall(r"[a-z0-9]+", text.lower())
@@ -6085,7 +6138,17 @@ class MainWindow(QMainWindow):
             return 0
         accepted = 0
         for idx, item in enumerate(self.controller.items):
-            if item.resolved or not item.auto_selectable or not item.candidates:
+            if getattr(item, "resolved", False) or not item.auto_selectable or not item.candidates:
+                continue
+            reason = self._local_auto_accept_block_reason(item)
+            if reason:
+                setattr(item, "auto_accept_block_reason", reason)
+                self._diagnostics.record_event(
+                    "auto_accept_blocked",
+                    item=idx + 1,
+                    source=str(getattr(getattr(item, "item", None), "path", "")),
+                    reason=reason,
+                )
                 continue
             self.controller.accept_candidate(idx, 0)
             accepted += 1
@@ -6097,7 +6160,7 @@ class MainWindow(QMainWindow):
         if self.controller is None:
             return counts
         for item in self.controller.items:
-            if item.resolved:
+            if getattr(item, "resolved", False):
                 counts["already resolved"] += 1
             elif not item.candidates:
                 status = str(getattr(item, "lookup_status", "") or "")
@@ -6107,6 +6170,8 @@ class MainWindow(QMainWindow):
                     counts["no candidates"] += 1
             elif not item.auto_selectable:
                 counts["below confidence or ambiguous"] += 1
+            elif self._local_auto_accept_block_reason(item):
+                counts["suspicious movie match"] += 1
         return counts
 
     @staticmethod
@@ -6351,6 +6416,9 @@ class MainWindow(QMainWindow):
             filename_title = self._tv_filename_group_title(path)
             if filename_title:
                 return (filename_title, media_type)
+            parent_title = self._tv_parent_group_title(path)
+            if parent_title:
+                return (parent_title, media_type)
         title = str(getattr(getattr(item, "item", None), "title", "") or "").strip().casefold()
         if not title:
             return None
@@ -6372,6 +6440,15 @@ class MainWindow(QMainWindow):
                 return title
         return None
 
+    @staticmethod
+    def _tv_parent_group_title(path: Path) -> str | None:
+        for parent in (path.parent, *path.parents):
+            if re.fullmatch(r"(?:Series|Season)[\s_.-]*\d{1,3}", parent.name, flags=re.IGNORECASE):
+                show_dir = parent.parent.name
+                title = re.sub(r"[\s_.-]+", " ", show_dir).strip().casefold()
+                return title or None
+        return None
+
     def _bulk_mismatch_rows(self, affected_indexes: list[int], selected_title: str, group_key: str | None) -> list[tuple[int, str]]:
         if self.controller is None:
             return []
@@ -6383,7 +6460,14 @@ class MainWindow(QMainWindow):
             if group_key and item_group and item_group != group_key:
                 mismatches.append((idx, f"filename group '{item_group}' differs from '{group_key}'"))
                 continue
-            if selected_tokens and not (self._title_tokens(item.item.path.stem) & selected_tokens):
+            media_type = str(getattr(getattr(item, "item", None), "media_type", "") or "")
+            path = Path(getattr(getattr(item, "item", None), "path", Path()))
+            title_text = path.stem
+            if media_type == "tv":
+                parent_title = self._tv_parent_group_title(path)
+                if parent_title:
+                    title_text = f"{title_text} {parent_title}"
+            if selected_tokens and not (self._title_tokens(title_text) & selected_tokens):
                 mismatches.append((idx, "selected title has no token overlap with filename"))
         return mismatches
 
@@ -6568,6 +6652,9 @@ class MainWindow(QMainWindow):
                 lines.append(f"Manual matches: {manual}")
             if suspicious:
                 lines.append(f"Suspicious matches needing attention: {suspicious}")
+        suspicious_groups = self._suspicious_destination_groups()
+        if suspicious_groups:
+            lines.append(f"Suspicious destination groups: {len(suspicious_groups)}")
         if self.copy_mode.isChecked():
             estimates = self._organisation_space_estimates(total_bytes)
             lines.append(f"Estimated destination space required: {self._format_bytes(estimates['copy_bytes'])}")
@@ -6590,7 +6677,64 @@ class MainWindow(QMainWindow):
                 f"{index}. {plan.source.name} -> {plan.destination.name} "
                 f"({self._format_bytes(size)}, {destination_state})"
             )
+        if suspicious_groups:
+            lines.append("")
+            lines.append("Suspicious groups:")
+            for group in suspicious_groups:
+                lines.append(f"- {group['destination']}: {group['reason']}")
+                for row in group["rows"]:
+                    lines.append(f"  {row['index']}. {row['source']} -> {row['destination']}")
         return lines
+
+    def _suspicious_destination_groups(self) -> list[dict[str, object]]:
+        if self.preview_state is None:
+            return []
+        items_by_source = {
+            Path(getattr(getattr(item, "item", None), "path", Path())): item
+            for item in list(getattr(self.controller, "items", []) or [])
+        }
+        grouped: dict[tuple[Path, str], list[tuple[int, object, object | None]]] = {}
+        for index, plan in enumerate(self.preview_state.plans, start=1):
+            key = (plan.destination.parent, self._destination_collision_base(plan.destination))
+            grouped.setdefault(key, []).append((index, plan, items_by_source.get(plan.source)))
+        suspicious: list[dict[str, object]] = []
+        for (_parent, _base), entries in grouped.items():
+            if len(entries) < 2:
+                continue
+            movie_entries = [
+                (index, plan, item)
+                for index, plan, item in entries
+                if str(getattr(getattr(item, "item", None), "media_type", "") or "") == "movie"
+            ]
+            if len(movie_entries) < 2:
+                continue
+            episodic = [
+                (index, plan, item)
+                for index, plan, item in movie_entries
+                if self._looks_episodic_source(plan.source, str(getattr(getattr(item, "item", None), "title", "") or ""))
+            ]
+            if not episodic:
+                continue
+            first_plan = movie_entries[0][1]
+            suspicious.append(
+                {
+                    "destination": str(first_plan.destination.parent),
+                    "reason": "multiple episodic-looking sources resolve to the same movie destination",
+                    "rows": [
+                        {
+                            "index": index,
+                            "source": plan.source.name,
+                            "destination": plan.destination.name,
+                        }
+                        for index, plan, _item in movie_entries
+                    ],
+                }
+            )
+        return suspicious
+
+    @staticmethod
+    def _destination_collision_base(path: Path) -> str:
+        return re.sub(r"\s+\((?!\d{4}\)$)\d+\)$", "", path.stem).casefold()
 
     def _organisation_space_estimates(self, copy_bytes: int) -> dict[str, int]:
         compression_headroom = 0
